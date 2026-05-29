@@ -101,7 +101,6 @@ cat > "${PKG_ROOT}/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist" <<PLIST
   <array>
     <string>/usr/local/bin/kmsync</string>
     <string>core-service</string>
-    <string>/usr/local/share/kmsync/configs/daemon.example.json</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -134,6 +133,7 @@ set -euo pipefail
 
 echo "KMSync installed to /usr/local/bin/kmsync"
 echo "LaunchAgent installed to /Library/LaunchAgents/com.kmsync.mvp.plist for login startup"
+echo "Runtime config is created in ~/Library/Application Support/KMSync/daemon.example.json"
 echo "Permission guide installed to /usr/local/share/kmsync/docs/USER_GUIDE.md"
 echo "Uninstall cleanup script installed to /usr/local/share/kmsync/uninstall-macos.sh"
 echo "Run: /usr/local/bin/kmsync info"

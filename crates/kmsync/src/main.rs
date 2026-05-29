@@ -42,6 +42,7 @@ const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_FILE_TRANSFER_CHUNK_BYTES: usize = 1024;
 const MAX_FILE_TRANSFER_CHUNK_BYTES: usize = 1024;
 const DEFAULT_DAEMON_CONFIG_FILE: &str = "daemon.example.json";
+const DEFAULT_DAEMON_CONFIG_TEMPLATE: &str = include_str!("../../../configs/daemon.example.json");
 const WINDOWS_SERVICE_NAME: &str = "KMSyncCoreService";
 const WINDOWS_SERVICE_DISPLAY_NAME: &str = "KMSync Core Service";
 
@@ -353,6 +354,7 @@ fn run_with_args(args: impl Iterator<Item = String>) -> Result<(), DaemonError> 
 }
 
 fn run_desktop(config_path: &Path, output_path: Option<&Path>) -> Result<(), String> {
+    ensure_daemon_config_file(config_path)?;
     match desktop_launch_mode(output_path) {
         DesktopLaunchMode::NativeWindow => return native_desktop::run_native_desktop(config_path),
         DesktopLaunchMode::HtmlExport(output_path) => {
@@ -379,8 +381,12 @@ fn desktop_launch_mode(output_path: Option<&Path>) -> DesktopLaunchMode {
 }
 
 fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopState, String> {
+    ensure_daemon_config_file(config_path)?;
     let client_config = client::ClientConfig::load(config_path)?;
     let desktop_config = desktop_config::DesktopConfig::load(config_path).unwrap_or_default();
+    let (server_state, server_error) = desktop_server_probe_result_to_state(
+        client::probe_server_reachable(&client_config.server_url),
+    );
     let local_lan_ips = client::discover_local_lan_ips()
         .into_iter()
         .map(|ip| ip.to_string())
@@ -397,11 +403,39 @@ fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopS
             desktop_config: &desktop_config,
             devices: &[],
             permissions: &permissions,
-            server_state: kmsync_core::DesktopConnectionState::Connecting,
-            server_error: None,
+            server_state,
+            server_error,
             master_error: None,
         },
     ))
+}
+
+fn desktop_server_probe_result_to_state(
+    result: Result<(), String>,
+) -> (kmsync_core::DesktopConnectionState, Option<String>) {
+    match result {
+        Ok(()) => (kmsync_core::DesktopConnectionState::Connected, None),
+        Err(error) => (
+            kmsync_core::DesktopConnectionState::Disconnected,
+            Some(error),
+        ),
+    }
+}
+
+fn ensure_daemon_config_file(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, DEFAULT_DAEMON_CONFIG_TEMPLATE).map_err(|error| {
+        format!(
+            "failed to create default config {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn write_desktop_page(path: &Path, html: &str) -> Result<(), String> {
@@ -659,6 +693,7 @@ fn core_service_action_for_worker_result(
 }
 
 fn run_core_service(config_path: &Path) -> Result<(), String> {
+    ensure_daemon_config_file(config_path)?;
     let config = client::ClientConfig::load(config_path)?;
     let plan = CoreServicePlan::from_config(config_path.to_path_buf(), &config);
     println!(
@@ -3065,10 +3100,29 @@ impl Args {
 fn default_daemon_config_path() -> PathBuf {
     let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("kmsync"));
-    default_daemon_config_path_from(&current_dir, &exe_path)
+    let home_dir = env::var_os("HOME").map(PathBuf::from);
+    let appdata_dir = env::var_os("APPDATA").map(PathBuf::from);
+    default_daemon_config_path_from_env(
+        &current_dir,
+        &exe_path,
+        home_dir.as_deref(),
+        appdata_dir.as_deref(),
+        env::consts::OS,
+    )
 }
 
+#[cfg(test)]
 fn default_daemon_config_path_from(current_dir: &Path, exe_path: &Path) -> PathBuf {
+    default_daemon_config_path_from_env(current_dir, exe_path, None, None, env::consts::OS)
+}
+
+fn default_daemon_config_path_from_env(
+    current_dir: &Path,
+    exe_path: &Path,
+    home_dir: Option<&Path>,
+    appdata_dir: Option<&Path>,
+    os: &str,
+) -> PathBuf {
     let mut candidates = vec![
         current_dir.join("configs").join(DEFAULT_DAEMON_CONFIG_FILE),
         current_dir.join("config").join(DEFAULT_DAEMON_CONFIG_FILE),
@@ -3083,10 +3137,35 @@ fn default_daemon_config_path_from(current_dir: &Path, exe_path: &Path) -> PathB
         }
     }
 
-    candidates
-        .into_iter()
-        .find(|path| path.exists())
+    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+        return path;
+    }
+
+    default_user_daemon_config_path(home_dir, appdata_dir, os)
         .unwrap_or_else(|| PathBuf::from("configs").join(DEFAULT_DAEMON_CONFIG_FILE))
+}
+
+fn default_user_daemon_config_path(
+    home_dir: Option<&Path>,
+    appdata_dir: Option<&Path>,
+    os: &str,
+) -> Option<PathBuf> {
+    match os {
+        "macos" => home_dir.map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join("KMSync")
+                .join(DEFAULT_DAEMON_CONFIG_FILE)
+        }),
+        "windows" => {
+            appdata_dir.map(|appdata| appdata.join("KMSync").join(DEFAULT_DAEMON_CONFIG_FILE))
+        }
+        _ => home_dir.map(|home| {
+            home.join(".config")
+                .join("kmsync")
+                .join(DEFAULT_DAEMON_CONFIG_FILE)
+        }),
+    }
 }
 
 fn parse_addr_arg(value: Option<String>, missing: &str) -> Result<SocketAddr, String> {
@@ -4225,11 +4304,15 @@ mod tests {
 
     #[test]
     fn args_parse_accepts_core_service_command() {
-        let default_args = Args::parse(["core-service"].into_iter().map(String::from))
-            .expect("parse default core service");
+        let default_config = PathBuf::from("configs/daemon.example.json");
+        let default_args = Args::parse_with_default_config(
+            ["core-service"].into_iter().map(String::from),
+            default_config.clone(),
+        )
+        .expect("parse default core service");
         match default_args.command {
             Command::CoreService { config_path } => {
-                assert_eq!(config_path, PathBuf::from("configs/daemon.example.json"));
+                assert_eq!(config_path, default_config);
             }
             _ => panic!("expected core service command"),
         }
@@ -4342,6 +4425,49 @@ mod tests {
     }
 
     #[test]
+    fn default_daemon_config_path_uses_macos_user_config_when_no_portable_config_exists() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("kmsync-macos-user-config-{suffix}"));
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("create home dir");
+
+        let config_path = default_daemon_config_path_from_env(
+            Path::new("/"),
+            Path::new("/usr/local/bin/kmsync"),
+            Some(home.as_path()),
+            None,
+            "macos",
+        );
+
+        assert_eq!(
+            config_path,
+            home.join("Library")
+                .join("Application Support")
+                .join("KMSync")
+                .join("daemon.example.json")
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup temp package");
+    }
+
+    #[test]
+    fn desktop_server_probe_result_sets_terminal_statuses() {
+        assert_eq!(
+            desktop_server_probe_result_to_state(Ok(())),
+            (kmsync_core::DesktopConnectionState::Connected, None)
+        );
+
+        let (state, error) =
+            desktop_server_probe_result_to_state(Err("request failed".to_string()));
+
+        assert_eq!(state, kmsync_core::DesktopConnectionState::Disconnected);
+        assert_eq!(error.as_deref(), Some("request failed"));
+    }
+
+    #[test]
     fn core_service_plan_binds_data_plane_and_keeps_input_off_local_ipc() {
         let config = client::ClientConfig {
             server_url: "http://127.0.0.1:24888".to_string(),
@@ -4401,17 +4527,24 @@ mod tests {
             .expect("read Windows packaging script");
 
         assert!(macos.contains("<string>core-service</string>"));
+        assert!(
+            !macos.contains("<string>/usr/local/share/kmsync/configs/daemon.example.json</string>")
+        );
         assert!(macos.contains("<key>KeepAlive</key>\n  <true/>"));
         assert!(windows.contains("\"$INSTDIR\\${APP_EXE}\" core-service"));
     }
 
     #[test]
     fn args_parse_accepts_windows_service_command() {
-        let default_args = Args::parse(["windows-service"].into_iter().map(String::from))
-            .expect("parse default windows service");
+        let default_config = PathBuf::from("configs/daemon.example.json");
+        let default_args = Args::parse_with_default_config(
+            ["windows-service"].into_iter().map(String::from),
+            default_config.clone(),
+        )
+        .expect("parse default windows service");
         match default_args.command {
             Command::WindowsService { config_path } => {
-                assert_eq!(config_path, PathBuf::from("configs/daemon.example.json"));
+                assert_eq!(config_path, default_config);
             }
             _ => panic!("expected windows service command"),
         }
@@ -4580,8 +4713,9 @@ mod tests {
                 assert_eq!(state.device.name, "Development Mac");
                 assert_eq!(
                     state.server_state,
-                    kmsync_core::DesktopConnectionState::Connecting
+                    kmsync_core::DesktopConnectionState::Disconnected
                 );
+                assert!(state.server_error.is_some());
             }
             _ => panic!("expected desktop state"),
         }

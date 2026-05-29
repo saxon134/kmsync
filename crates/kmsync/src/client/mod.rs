@@ -46,8 +46,14 @@ impl ClientConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = fs::read_to_string(path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-        serde_json::from_str(&text)
-            .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+        let mut config: Self = serde_json::from_str(&text)
+            .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        if config.identity_path.is_relative() {
+            if let Some(parent) = path.parent() {
+                config.identity_path = parent.join(&config.identity_path);
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -324,9 +330,13 @@ pub struct ControlClient {
 impl ControlClient {
     #[must_use]
     pub fn new(server_url: String) -> Self {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
+            .into();
         Self {
             server_url: server_url.trim_end_matches('/').to_string(),
-            agent: ureq::Agent::new_with_defaults(),
+            agent,
         }
     }
 
@@ -431,6 +441,12 @@ impl ControlClient {
     ) -> Result<ReleaseCheckResponse, String> {
         get_json_without_auth(&self.agent, &release_check_url(&self.server_url, request))
     }
+}
+
+pub fn probe_server_reachable(server_url: &str) -> Result<(), String> {
+    let client = ControlClient::new(server_url.to_string());
+    let request = ReleaseCheckRequest::current(None, None, None, None);
+    client.check_release(&request).map(|_| ())
 }
 
 #[derive(Debug, Serialize)]
@@ -1247,12 +1263,6 @@ fn email_login_code(config: &ClientConfig) -> Option<String> {
         .map(str::trim)
         .filter(|code| !code.is_empty())
         .map(ToString::to_string)
-        .or_else(|| {
-            std::env::var("KMSYNC_EMAIL_LOGIN_CODE")
-                .ok()
-                .map(|code| code.trim().to_string())
-                .filter(|code| !code.is_empty())
-        })
 }
 
 fn missing_email_login_code_error(
@@ -1265,7 +1275,7 @@ fn missing_email_login_code_error(
         &challenge.email
     };
     format!(
-        "email login challenge started for {} and expires_at={}; retrieve the code delivered by /v1/auth/email/start, then set email_login_code in the daemon config or KMSYNC_EMAIL_LOGIN_CODE",
+        "email login challenge started for {} and expires_at={}; retrieve the code delivered by /v1/auth/email/start, then set email_login_code in the daemon config",
         email,
         challenge.expires_at
     )
@@ -2007,7 +2017,45 @@ mod tests {
     }
 
     #[test]
-    fn email_login_code_prefers_config_then_environment() {
+    fn client_config_resolves_identity_path_relative_to_config_file() {
+        let root = std::env::temp_dir().join(format!(
+            "kmsync-client-config-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config_dir = root
+            .join("Library")
+            .join("Application Support")
+            .join("KMSync");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config_path = config_dir.join("daemon.example.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "server_url": "http://127.0.0.1:24888",
+                "email": "dev@example.com",
+                "device_name": "Development Mac",
+                "identity_path": "kmsync-device-identity.json",
+                "listen_port": 24800,
+                "heartbeat_interval_seconds": 15
+            }"#,
+        )
+        .expect("write config");
+
+        let config = ClientConfig::load(&config_path).expect("load config");
+
+        assert_eq!(
+            config.identity_path,
+            config_dir.join("kmsync-device-identity.json")
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn email_login_code_uses_config_file_only() {
         let mut config = ClientConfig {
             server_url: "http://127.0.0.1:24888".to_string(),
             email: "dev@example.com".to_string(),
@@ -2023,7 +2071,7 @@ mod tests {
 
         config.email_login_code = None;
         std::env::set_var("KMSYNC_EMAIL_LOGIN_CODE", "ENV12345");
-        assert_eq!(email_login_code(&config).as_deref(), Some("ENV12345"));
+        assert_eq!(email_login_code(&config), None);
         std::env::remove_var("KMSYNC_EMAIL_LOGIN_CODE");
     }
 
@@ -2050,7 +2098,7 @@ mod tests {
 
         assert!(error.contains("/v1/auth/email/start"));
         assert!(error.contains("expires_at=123"));
-        assert!(error.contains("KMSYNC_EMAIL_LOGIN_CODE"));
+        assert!(!error.contains("KMSYNC_EMAIL_LOGIN_CODE"));
         assert!(!error.contains("dev-login"));
     }
 
