@@ -5,6 +5,7 @@ mod desktop_config;
 mod desktop_state;
 #[allow(dead_code)]
 mod local_config;
+mod native_desktop;
 mod platform;
 mod transport;
 #[cfg(windows)]
@@ -352,19 +353,29 @@ fn run_with_args(args: impl Iterator<Item = String>) -> Result<(), DaemonError> 
 }
 
 fn run_desktop(config_path: &Path, output_path: Option<&Path>) -> Result<(), String> {
-    let state = build_local_desktop_state(config_path)?;
-    let html = kmsync_ui::desktop_panel::render_desktop_panel(&state)?;
-    let should_open = output_path.is_none();
-    let output_path = match output_path {
-        Some(path) => path.to_path_buf(),
-        None => default_desktop_page_path(),
-    };
-    write_desktop_page(&output_path, &html)?;
-    if should_open && output_path.is_file() {
-        open_desktop_page(&output_path)?;
+    match desktop_launch_mode(output_path) {
+        DesktopLaunchMode::NativeWindow => return native_desktop::run_native_desktop(config_path),
+        DesktopLaunchMode::HtmlExport(output_path) => {
+            let state = build_local_desktop_state(config_path)?;
+            let html = kmsync_ui::desktop_panel::render_desktop_panel(&state)?;
+            write_desktop_page(&output_path, &html)?;
+            println!("desktop_page={}", output_path.display());
+            return Ok(());
+        }
     }
-    println!("desktop_page={}", output_path.display());
-    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DesktopLaunchMode {
+    NativeWindow,
+    HtmlExport(PathBuf),
+}
+
+fn desktop_launch_mode(output_path: Option<&Path>) -> DesktopLaunchMode {
+    let Some(output_path) = output_path else {
+        return DesktopLaunchMode::NativeWindow;
+    };
+    DesktopLaunchMode::HtmlExport(output_path.to_path_buf())
 }
 
 fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopState, String> {
@@ -379,6 +390,7 @@ fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopS
         desktop_state::DesktopStateBuildInput {
             config_path,
             device_name: &client_config.device_name,
+            server_url: &client_config.server_url,
             listen_port: client_config.listen_port,
             current_device_id: None,
             local_lan_ips,
@@ -401,46 +413,6 @@ fn write_desktop_page(path: &Path, html: &str) -> Result<(), String> {
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     }
     fs::write(path, html).map_err(|error| format!("failed to write {}: {error}", path.display()))
-}
-
-fn default_desktop_page_path() -> PathBuf {
-    env::temp_dir().join("kmsync").join("kmsync-desktop.html")
-}
-
-fn open_desktop_page(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("rundll32.exe")
-            .arg("url.dll,FileProtocolHandler")
-            .arg(path)
-            .spawn()
-            .map_err(|error| format!("failed to open desktop page {}: {error}", path.display()))?;
-        return Ok(());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(path)
-            .spawn()
-            .map_err(|error| format!("failed to open desktop page {}: {error}", path.display()))?;
-        return Ok(());
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(path)
-            .spawn()
-            .map_err(|error| format!("failed to open desktop page {}: {error}", path.display()))?;
-        return Ok(());
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
-    {
-        let _ = path;
-        Ok(())
-    }
 }
 
 fn print_info() -> Result<(), String> {
@@ -567,6 +539,20 @@ fn handle_local_ipc_request_with_config_path(
                 };
             }
             if let Err(error) = desktop_config::set_layout_in_config_file(config_path, &layout) {
+                return local_ipc::LocalIpcResponse::Error {
+                    code: "desktop_config_write_failed".to_string(),
+                    message: error,
+                };
+            }
+            desktop_state_response(Some(config_path), true)
+        }
+        local_ipc::LocalIpcRequest::SetServerEndpoint { host, port } => {
+            let Some(config_path) = config_path else {
+                return desktop_state_unavailable();
+            };
+            if let Err(error) =
+                desktop_config::set_server_endpoint_in_config_file(config_path, &host, port)
+            {
                 return local_ipc::LocalIpcResponse::Error {
                     code: "desktop_config_write_failed".to_string(),
                     message: error,
@@ -4276,8 +4262,21 @@ mod tests {
                 assert_eq!(config_path, default_config);
                 assert_eq!(output_path, None);
             }
-            _ => panic!("expected default desktop launch to open desktop page"),
+            _ => panic!("expected default desktop launch to open native desktop window"),
         }
+    }
+
+    #[test]
+    fn desktop_launch_without_output_uses_native_window() {
+        assert_eq!(desktop_launch_mode(None), DesktopLaunchMode::NativeWindow);
+    }
+
+    #[test]
+    fn desktop_launch_with_output_keeps_html_export() {
+        assert_eq!(
+            desktop_launch_mode(Some(Path::new("target/kmsync-desktop.html"))),
+            DesktopLaunchMode::HtmlExport(PathBuf::from("target/kmsync-desktop.html"))
+        );
     }
 
     #[test]
@@ -4349,6 +4348,7 @@ mod tests {
             email: "dev@example.com".to_string(),
             email_login_code: None,
             device_name: "devbox".to_string(),
+            role: kmsync_core::DesktopRole::Client,
             listen_port: 24_800,
             heartbeat_interval_seconds: 15,
             identity_path: PathBuf::from("identity.json"),
@@ -4608,6 +4608,28 @@ mod tests {
         let text = std::fs::read_to_string(&config_path).expect("read updated config");
         assert!(text.contains("\"left\": \"left-device\""));
         assert!(text.contains("\"bottom\": \"bottom-device\""));
+
+        let response = handle_local_ipc_request_with_config_path(
+            local_ipc::LocalIpcRequest::SetServerEndpoint {
+                host: "203.0.113.10".to_string(),
+                port: 24_889,
+            },
+            Some(&config_path),
+        );
+        match response {
+            local_ipc::LocalIpcResponse::ConfigApplied { state } => {
+                assert_eq!(
+                    state.network.server_url.as_deref(),
+                    Some("http://203.0.113.10:24889")
+                );
+                assert_eq!(state.network.server_host.as_deref(), Some("203.0.113.10"));
+                assert_eq!(state.network.server_port, Some(24_889));
+            }
+            _ => panic!("expected config applied"),
+        }
+
+        let text = std::fs::read_to_string(&config_path).expect("read updated config");
+        assert!(text.contains("\"server_url\": \"http://203.0.113.10:24889\""));
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

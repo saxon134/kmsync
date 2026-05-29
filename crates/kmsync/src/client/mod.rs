@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use kmsync_core::{CompiledProfile, Profile};
+use kmsync_core::{CompiledProfile, DesktopLayout, DesktopRole, Profile};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +34,8 @@ pub struct ClientConfig {
     #[serde(default)]
     pub email_login_code: Option<String>,
     pub device_name: String,
+    #[serde(default)]
+    pub role: DesktopRole,
     pub listen_port: u16,
     pub heartbeat_interval_seconds: u64,
     #[serde(default = "default_identity_path")]
@@ -55,6 +57,7 @@ fn default_identity_path() -> PathBuf {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceIdentity {
+    pub device_id: String,
     pub public_key: String,
     pub private_key: String,
 }
@@ -80,13 +83,19 @@ impl DeviceIdentity {
         let identity = Self::generate();
         let private_key_ref = DeviceIdentitySecretRef::for_public_key(&identity.public_key);
         secret_store.store_private_key(&private_key_ref, &identity.private_key)?;
-        write_device_identity_file(path, &identity.public_key, private_key_ref)?;
+        write_device_identity_file(
+            path,
+            &identity.device_id,
+            &identity.public_key,
+            private_key_ref,
+        )?;
         Ok(identity)
     }
 
     fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut OsRng);
         Self {
+            device_id: generate_device_id(),
             public_key: format!(
                 "ed25519:{}",
                 hex_encode(&signing_key.verifying_key().to_bytes())
@@ -94,6 +103,10 @@ impl DeviceIdentity {
             private_key: format!("ed25519:{}", hex_encode(&signing_key.to_bytes())),
         }
     }
+}
+
+fn generate_device_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +140,8 @@ fn sanitize_secret_account(value: &str) -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeviceIdentityFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
     public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     private_key: Option<String>,
@@ -139,9 +154,17 @@ impl DeviceIdentityFile {
     where
         S: DeviceIdentitySecretStore,
     {
+        let (device_id, missing_device_id) = match self.device_id {
+            Some(device_id) => (device_id, false),
+            None => (generate_device_id(), true),
+        };
         if let Some(private_key_ref) = self.private_key_ref {
             let private_key = secret_store.load_private_key(&private_key_ref)?;
+            if missing_device_id {
+                write_device_identity_file(path, &device_id, &self.public_key, private_key_ref)?;
+            }
             return Ok(DeviceIdentity {
+                device_id,
                 public_key: self.public_key,
                 private_key,
             });
@@ -150,8 +173,9 @@ impl DeviceIdentityFile {
         if let Some(private_key) = self.private_key {
             let private_key_ref = DeviceIdentitySecretRef::for_public_key(&self.public_key);
             secret_store.store_private_key(&private_key_ref, &private_key)?;
-            write_device_identity_file(path, &self.public_key, private_key_ref)?;
+            write_device_identity_file(path, &device_id, &self.public_key, private_key_ref)?;
             return Ok(DeviceIdentity {
+                device_id,
                 public_key: self.public_key,
                 private_key,
             });
@@ -166,10 +190,12 @@ impl DeviceIdentityFile {
 
 fn write_device_identity_file(
     path: &Path,
+    device_id: &str,
     public_key: &str,
     private_key_ref: DeviceIdentitySecretRef,
 ) -> Result<(), String> {
     let stored = DeviceIdentityFile {
+        device_id: Some(device_id.to_string()),
         public_key: public_key.to_string(),
         private_key: None,
         private_key_ref: Some(private_key_ref),
@@ -385,6 +411,20 @@ impl ControlClient {
         )
     }
 
+    #[allow(dead_code)]
+    pub fn issue_relay_token(
+        &self,
+        access_token: &str,
+        request: &RelayTokenRequest,
+    ) -> Result<RelayTokenResponse, String> {
+        post_json(
+            &self.agent,
+            &format!("{}/v1/relay/token", self.server_url),
+            Some(access_token),
+            request,
+        )
+    }
+
     pub fn check_release(
         &self,
         request: &ReleaseCheckRequest,
@@ -459,7 +499,9 @@ pub struct ReleaseCheckResponse {
 
 #[derive(Debug, Serialize)]
 pub struct RegisterDeviceRequest {
+    pub device_id: String,
     pub name: String,
+    pub role: DesktopRole,
     pub os_type: String,
     pub os_version: String,
     pub app_version: String,
@@ -482,6 +524,8 @@ pub struct HeartbeatRequest {
 pub struct HeartbeatResponse {
     pub online: bool,
     pub last_seen_at: u64,
+    #[serde(default)]
+    pub presence_version: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -583,6 +627,21 @@ pub struct DiscoveredLanDevice<'a> {
 pub struct DirectConnectionAttempt {
     pub candidate: ConnectionCandidate,
     pub address: SocketAddr,
+    pub failed_attempts: Vec<DirectConnectionFailure>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionEndpoint {
+    Direct(SocketAddr),
+    Relay(String),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionAttempt {
+    pub candidate: ConnectionCandidate,
+    pub endpoint: ConnectionEndpoint,
     pub failed_attempts: Vec<DirectConnectionFailure>,
 }
 
@@ -692,6 +751,40 @@ pub struct NatTraversalCandidate {
 pub struct RelayCandidate {
     pub device_id: String,
     pub relay_url: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+pub struct RelayTokenRequest {
+    pub source_device_id: String,
+    pub target_device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_region: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct RelayTokenResponse {
+    pub relay_token: String,
+    pub relay_url: String,
+    pub region: String,
+    pub expires_at: u64,
+}
+
+#[allow(dead_code)]
+impl RelayTokenResponse {
+    #[must_use]
+    pub fn to_candidate(&self, target_device_id: &str) -> RelayCandidate {
+        let separator = if self.relay_url.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        RelayCandidate {
+            device_id: target_device_id.to_string(),
+            relay_url: format!("{}{}token={}", self.relay_url, separator, self.relay_token),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -897,6 +990,103 @@ where
     } else {
         Err("no direct LAN candidates available for target device".to_string())
     }
+}
+
+#[allow(dead_code)]
+pub fn try_connection_with_relay_fallback<F, R>(
+    candidates: &[ConnectionCandidate],
+    mut direct_connector: F,
+    mut relay_connector: R,
+) -> Result<ConnectionAttempt, String>
+where
+    F: FnMut(&ConnectionCandidate, SocketAddr) -> Result<(), String>,
+    R: FnMut(&ConnectionCandidate, &str) -> Result<(), String>,
+{
+    let mut failed_attempts = Vec::new();
+
+    for candidate in candidates.iter().filter(|candidate| {
+        matches!(
+            candidate.kind,
+            ConnectionCandidateKind::MdnsLan | ConnectionCandidateKind::BackendLan
+        )
+    }) {
+        let address = match candidate.address.parse::<SocketAddr>() {
+            Ok(address) => address,
+            Err(error) => {
+                failed_attempts.push(DirectConnectionFailure {
+                    candidate: candidate.clone(),
+                    error: format!("invalid LAN socket address: {error}"),
+                });
+                continue;
+            }
+        };
+
+        match direct_connector(candidate, address) {
+            Ok(()) => {
+                return Ok(ConnectionAttempt {
+                    candidate: candidate.clone(),
+                    endpoint: ConnectionEndpoint::Direct(address),
+                    failed_attempts,
+                });
+            }
+            Err(error) => failed_attempts.push(DirectConnectionFailure {
+                candidate: candidate.clone(),
+                error,
+            }),
+        }
+    }
+
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.kind == ConnectionCandidateKind::Relay)
+        .filter(|candidate| !candidate.address.trim().is_empty())
+    {
+        match relay_connector(candidate, &candidate.address) {
+            Ok(()) => {
+                return Ok(ConnectionAttempt {
+                    candidate: candidate.clone(),
+                    endpoint: ConnectionEndpoint::Relay(candidate.address.clone()),
+                    failed_attempts,
+                });
+            }
+            Err(error) => failed_attempts.push(DirectConnectionFailure {
+                candidate: candidate.clone(),
+                error,
+            }),
+        }
+    }
+
+    if failed_attempts.is_empty() {
+        Err("no connection candidates available for target device".to_string())
+    } else {
+        Err(format_direct_connection_failures(&failed_attempts))
+    }
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub fn master_connection_targets(
+    current_device_id: &str,
+    layout: &DesktopLayout,
+    devices: &[DeviceWithPresence],
+) -> Vec<String> {
+    let known_devices = devices
+        .iter()
+        .map(|item| (item.device.id.as_str(), &item.device))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    layout
+        .target_device_ids()
+        .into_iter()
+        .filter(|device_id| *device_id != current_device_id)
+        .filter(|device_id| seen.insert((*device_id).to_string()))
+        .filter(|device_id| {
+            known_devices
+                .get(*device_id)
+                .is_some_and(|device| !device.disabled)
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn refresh_target_direct_lan_connection(
@@ -1188,8 +1378,8 @@ pub fn run_heartbeat_loop(config: ClientConfig) -> Result<(), String> {
         };
         let response = client.heartbeat(&login.access_token, &device.device_id, &request)?;
         println!(
-            "heartbeat ok: online={} last_seen_at={}",
-            response.online, response.last_seen_at
+            "heartbeat ok: online={} last_seen_at={} presence_version={}",
+            response.online, response.last_seen_at, response.presence_version
         );
         thread::sleep(Duration::from_secs(
             config.heartbeat_interval_seconds.max(5),
@@ -1202,7 +1392,9 @@ fn build_register_device_request(
     identity: &DeviceIdentity,
 ) -> RegisterDeviceRequest {
     RegisterDeviceRequest {
+        device_id: identity.device_id.clone(),
         name: config.device_name.clone(),
+        role: config.role.clone(),
         os_type: std::env::consts::OS.to_string(),
         os_version: "unknown".to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1777,7 +1969,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmsync_core::{InputEvent, Key, KeyEvent, KeyState, Modifiers};
+    use kmsync_core::{DesktopLayout, DesktopRole, InputEvent, Key, KeyEvent, KeyState, Modifiers};
 
     #[test]
     fn mdns_query_requests_kmsync_ptr_records() {
@@ -1821,6 +2013,7 @@ mod tests {
             email: "dev@example.com".to_string(),
             email_login_code: Some("CONFIG1".to_string()),
             device_name: "Development Mac".to_string(),
+            role: DesktopRole::Client,
             listen_port: 24_800,
             heartbeat_interval_seconds: 15,
             identity_path: PathBuf::from("identity.json"),
@@ -1841,6 +2034,7 @@ mod tests {
             email: "dev@example.com".to_string(),
             email_login_code: None,
             device_name: "Development Mac".to_string(),
+            role: DesktopRole::Client,
             listen_port: 24_800,
             heartbeat_interval_seconds: 15,
             identity_path: PathBuf::from("identity.json"),
@@ -2488,6 +2682,21 @@ mod tests {
         }
     }
 
+    fn device_with_presence(device_id: &str, disabled: bool) -> DeviceWithPresence {
+        DeviceWithPresence {
+            device: Device {
+                id: device_id.to_string(),
+                name: device_id.to_string(),
+                os_type: "windows".to_string(),
+                os_version: "11".to_string(),
+                app_version: "0.1.0".to_string(),
+                public_key: valid_test_public_key(),
+                disabled,
+            },
+            presence: None,
+        }
+    }
+
     fn valid_test_public_key() -> String {
         format!("ed25519:{}", "a".repeat(64))
     }
@@ -2535,6 +2744,7 @@ mod tests {
         let first =
             DeviceIdentity::load_or_generate_with_store(&path, &store).expect("generate identity");
 
+        assert!(!first.device_id.is_empty());
         assert!(first.public_key.starts_with("ed25519:"));
         assert!(first.private_key.starts_with("ed25519:"));
         assert_ne!(first.public_key, "dev-public-key-placeholder");
@@ -2555,6 +2765,7 @@ mod tests {
             DeviceIdentity::load_or_generate_with_store(&path, &store).expect("generate identity");
         let text = fs::read_to_string(&path).expect("identity file");
 
+        assert!(text.contains("\"device_id\""));
         assert!(first.private_key.starts_with("ed25519:"));
         assert!(!text.contains(&first.private_key));
         assert!(!text.contains("\"private_key\""));
@@ -2572,6 +2783,7 @@ mod tests {
     fn device_identity_migrates_legacy_private_key_file_to_secret_store() {
         let path = temp_identity_path();
         let legacy = DeviceIdentity {
+            device_id: "33333333-3333-4333-8333-333333333333".to_string(),
             public_key: "ed25519:legacy-public".to_string(),
             private_key: "ed25519:legacy-private".to_string(),
         };
@@ -2620,19 +2832,133 @@ mod tests {
             email: "dev@example.com".to_string(),
             email_login_code: None,
             device_name: "Desktop".to_string(),
+            role: DesktopRole::Master,
             listen_port: 24800,
             heartbeat_interval_seconds: 15,
             identity_path: temp_identity_path(),
         };
         let identity = DeviceIdentity {
+            device_id: "44444444-4444-4444-8444-444444444444".to_string(),
             public_key: "ed25519:test-public".to_string(),
             private_key: "ed25519:test-private".to_string(),
         };
 
         let request = build_register_device_request(&config, &identity);
 
+        assert_eq!(request.device_id, "44444444-4444-4444-8444-444444444444");
         assert_eq!(request.public_key, "ed25519:test-public");
         assert_eq!(request.name, "Desktop");
+        assert_eq!(request.role, DesktopRole::Master);
+    }
+
+    #[test]
+    fn legacy_identity_without_device_id_is_migrated_to_stable_device_id() {
+        let path = temp_identity_path();
+        fs::write(
+            &path,
+            serde_json::json!({
+                "public_key": "ed25519:legacy-public",
+                "private_key": "ed25519:legacy-private"
+            })
+            .to_string(),
+        )
+        .expect("write legacy identity file");
+        let store = RecordingDeviceIdentitySecretStore::default();
+
+        let loaded =
+            DeviceIdentity::load_or_generate_with_store(&path, &store).expect("load identity");
+        let reloaded =
+            DeviceIdentity::load_or_generate_with_store(&path, &store).expect("reload identity");
+        let rewritten = fs::read_to_string(&path).expect("rewritten identity file");
+
+        assert!(!loaded.device_id.is_empty());
+        assert_eq!(reloaded.device_id, loaded.device_id);
+        assert!(rewritten.contains("\"device_id\""));
+        assert!(!rewritten.contains("legacy-private"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn relay_candidate_is_used_after_direct_candidates_fail() {
+        let candidates = vec![
+            connection_candidate(
+                "target",
+                ConnectionCandidateKind::BackendLan,
+                "10.0.0.8:24800",
+            ),
+            connection_candidate(
+                "target",
+                ConnectionCandidateKind::Relay,
+                "relay://relay.kmsync.local:443",
+            ),
+        ];
+
+        let attempt = try_connection_with_relay_fallback(
+            &candidates,
+            |_candidate, _address| Err("connection refused".to_string()),
+            |_candidate, relay_url| {
+                assert_eq!(relay_url, "relay://relay.kmsync.local:443");
+                Ok(())
+            },
+        )
+        .expect("relay fallback");
+
+        assert_eq!(attempt.candidate.kind, ConnectionCandidateKind::Relay);
+        assert_eq!(
+            attempt.endpoint,
+            ConnectionEndpoint::Relay("relay://relay.kmsync.local:443".to_string())
+        );
+        assert_eq!(attempt.failed_attempts.len(), 1);
+    }
+
+    #[test]
+    fn relay_token_response_builds_target_candidate() {
+        let _method: fn(
+            &ControlClient,
+            &str,
+            &RelayTokenRequest,
+        ) -> Result<RelayTokenResponse, String> = ControlClient::issue_relay_token;
+        let _request = RelayTokenRequest {
+            source_device_id: "source-device".to_string(),
+            target_device_id: "target-device".to_string(),
+            preferred_region: Some("us-west".to_string()),
+        };
+        let response = RelayTokenResponse {
+            relay_token: "relay-token".to_string(),
+            relay_url: "relay://relay.kmsync.local:443".to_string(),
+            region: "us-west".to_string(),
+            expires_at: 1234,
+        };
+
+        let candidate = response.to_candidate("target-device");
+
+        assert_eq!(response.region, "us-west");
+        assert_eq!(response.expires_at, 1234);
+        assert_eq!(candidate.device_id, "target-device");
+        assert_eq!(
+            candidate.relay_url,
+            "relay://relay.kmsync.local:443?token=relay-token"
+        );
+    }
+
+    #[test]
+    fn master_connection_targets_follow_layout_and_skip_disabled_or_self_devices() {
+        let layout = DesktopLayout {
+            left: Some("left-device".to_string()),
+            right: Some("disabled-device".to_string()),
+            top: Some("missing-device".to_string()),
+            bottom: Some("self-device".to_string()),
+        };
+        let devices = vec![
+            device_with_presence("left-device", false),
+            device_with_presence("disabled-device", true),
+            device_with_presence("self-device", false),
+        ];
+
+        let targets = master_connection_targets("self-device", &layout, &devices);
+
+        assert_eq!(targets, vec!["left-device".to_string()]);
     }
 
     fn temp_identity_path() -> std::path::PathBuf {

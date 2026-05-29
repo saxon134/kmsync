@@ -75,6 +75,17 @@ pub(crate) fn set_layout_in_config_file(path: &Path, layout: &DesktopLayout) -> 
     local_config::write_text_atomic(path, &updated)
 }
 
+pub(crate) fn set_server_endpoint_in_config_file(
+    path: &Path,
+    host: &str,
+    port: u16,
+) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let updated = set_server_endpoint_in_config_text(&text, host, port)?;
+    local_config::write_text_atomic(path, &updated)
+}
+
 fn set_role_in_config_text(
     text: &str,
     role: DesktopRole,
@@ -111,6 +122,17 @@ pub(crate) fn set_layout_in_config_text(
     serialize_config_object(object)
 }
 
+pub(crate) fn set_server_endpoint_in_config_text(
+    text: &str,
+    host: &str,
+    port: u16,
+) -> Result<String, String> {
+    let mut object = parse_config_object(text)?;
+    let server_url = build_server_url(object.get("server_url"), host, port)?;
+    object.insert("server_url".to_string(), Value::String(server_url));
+    serialize_config_object(object)
+}
+
 fn parse_config_object(text: &str) -> Result<Map<String, Value>, String> {
     let value: Value =
         serde_json::from_str(text).map_err(|error| format!("failed to parse config: {error}"))?;
@@ -118,6 +140,43 @@ fn parse_config_object(text: &str) -> Result<Map<String, Value>, String> {
         .as_object()
         .cloned()
         .ok_or_else(|| "desktop config must be a JSON object".to_string())
+}
+
+fn build_server_url(
+    existing_server_url: Option<&Value>,
+    host: &str,
+    port: u16,
+) -> Result<String, String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("server host must not be empty".to_string());
+    }
+    if host.contains("://") || host.contains('/') {
+        return Err(
+            "server host must be an IP address or domain without scheme or path".to_string(),
+        );
+    }
+    if port == 0 {
+        return Err("server port must be between 1 and 65535".to_string());
+    }
+    let scheme = existing_server_url
+        .and_then(Value::as_str)
+        .and_then(server_url_scheme)
+        .unwrap_or("http");
+    Ok(format!("{scheme}://{host}:{port}"))
+}
+
+fn server_url_scheme(server_url: &str) -> Option<&str> {
+    let (scheme, _) = server_url.split_once("://")?;
+    if !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    {
+        Some(scheme)
+    } else {
+        None
+    }
 }
 
 fn serialize_config_object(object: Map<String, Value>) -> Result<String, String> {
@@ -213,5 +272,41 @@ mod tests {
         assert_eq!(json["layout"]["left"], "left-device");
         assert_eq!(json["layout"]["bottom"], "bottom-device");
         assert!(json["layout"].get("right").is_none());
+    }
+
+    #[test]
+    fn applying_server_endpoint_updates_server_url_and_preserves_other_fields() {
+        let updated = set_server_endpoint_in_config_text(
+            r#"{
+                "server_url": "https://old.example.com:24888",
+                "email": "dev@example.com",
+                "device_name": "Development Mac",
+                "listen_port": 24800,
+                "heartbeat_interval_seconds": 15,
+                "role": "master"
+            }"#,
+            "203.0.113.10",
+            24_889,
+        )
+        .expect("set server endpoint");
+        let json: serde_json::Value = serde_json::from_str(&updated).expect("valid json");
+
+        assert_eq!(json["server_url"], "https://203.0.113.10:24889");
+        assert_eq!(json["email"], "dev@example.com");
+        assert_eq!(json["role"], "master");
+    }
+
+    #[test]
+    fn applying_server_endpoint_rejects_empty_host() {
+        let error = set_server_endpoint_in_config_text(
+            r#"{
+                "server_url": "http://127.0.0.1:24888"
+            }"#,
+            "  ",
+            24_889,
+        )
+        .expect_err("empty host is invalid");
+
+        assert!(error.contains("server host"));
     }
 }

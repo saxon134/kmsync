@@ -86,6 +86,12 @@ impl Default for DesktopConnectionState {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DesktopNetworkState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_port: Option<u16>,
     #[serde(default)]
     pub lan_ips: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

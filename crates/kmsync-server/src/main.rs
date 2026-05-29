@@ -77,6 +77,7 @@ fn build_app(state: AppState) -> Router {
         .route("/v1/events/ws", get(events_ws))
         .route("/v1/devices/register", post(register_device))
         .route("/v1/devices", get(list_devices))
+        .route("/v1/topology", get(get_topology).put(upsert_topology))
         .route(
             "/v1/devices/{device_id}",
             patch(update_device).delete(delete_device),
@@ -111,6 +112,8 @@ struct Store {
     signal_sessions: HashMap<Uuid, SignalSession>,
     devices: HashMap<Uuid, Device>,
     presence: HashMap<Uuid, Presence>,
+    #[serde(default)]
+    topologies: HashMap<Uuid, Topology>,
     profiles: HashMap<String, DeviceProfile>,
     profile_history: HashMap<String, Vec<DeviceProfile>>,
     profile_revision: u64,
@@ -129,11 +132,25 @@ struct EmailLoginChallenge {
     expires_at: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeviceRole {
+    Master,
+    #[default]
+    Client,
+}
+
+const fn default_version() -> u64 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Device {
     id: Uuid,
     user_id: Uuid,
     name: String,
+    #[serde(default)]
+    role: DeviceRole,
     os_type: String,
     os_version: String,
     app_version: String,
@@ -141,6 +158,12 @@ struct Device {
     #[serde(default)]
     disabled: bool,
     created_at: u64,
+    #[serde(default)]
+    updated_at: u64,
+    #[serde(default = "default_version")]
+    device_version: u64,
+    #[serde(default = "default_version")]
+    name_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +176,39 @@ struct Presence {
     listen_port: u16,
     nat_type: String,
     last_seen_at: u64,
+    #[serde(default)]
+    expires_at: u64,
+    #[serde(default = "default_version")]
+    presence_version: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct TopologyLayout {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    left: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    right: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    top: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bottom: Option<Uuid>,
+}
+
+impl TopologyLayout {
+    fn device_ids(&self) -> impl Iterator<Item = Uuid> {
+        [self.left, self.right, self.top, self.bottom]
+            .into_iter()
+            .flatten()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Topology {
+    user_id: Uuid,
+    master_device_id: Option<Uuid>,
+    layout: TopologyLayout,
+    topology_version: u64,
+    updated_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,6 +232,19 @@ enum ServerEvent {
         user_id: Uuid,
         device_id: Uuid,
         online: bool,
+        presence_version: u64,
+    },
+    DeviceChanged {
+        #[serde(skip_serializing)]
+        user_id: Uuid,
+        device_id: Uuid,
+        device_version: u64,
+        name_version: u64,
+    },
+    TopologyChanged {
+        #[serde(skip_serializing)]
+        user_id: Uuid,
+        topology_version: u64,
     },
     ProfileChanged {
         #[serde(skip_serializing)]
@@ -193,6 +262,8 @@ impl ServerEvent {
     const fn user_id(&self) -> Uuid {
         match self {
             Self::DevicePresenceChanged { user_id, .. } => *user_id,
+            Self::DeviceChanged { user_id, .. } => *user_id,
+            Self::TopologyChanged { user_id, .. } => *user_id,
             Self::ProfileChanged { user_id, .. } => *user_id,
             Self::SignalSessionChanged { user_id, .. } => *user_id,
         }
@@ -784,7 +855,9 @@ async fn stream_events(
 
 #[derive(Debug, Deserialize)]
 struct RegisterDeviceRequest {
+    device_id: Option<Uuid>,
     name: String,
+    role: Option<DeviceRole>,
     os_type: String,
     os_version: String,
     app_version: String,
@@ -806,21 +879,50 @@ async fn register_device(
         return Err(ApiError::bad_request("device name is required"));
     }
 
-    let device_id = Uuid::new_v4();
-    let device = Device {
-        id: device_id,
-        user_id,
-        name: request.name,
-        os_type: request.os_type,
-        os_version: request.os_version,
-        app_version: request.app_version,
-        public_key: request.public_key,
-        disabled: false,
-        created_at: now_seconds(),
-    };
-
     let mut store = state.lock()?;
-    store.devices.insert(device_id, device);
+    let now = now_seconds();
+    let device_id = request.device_id.unwrap_or_else(Uuid::new_v4);
+    if let Some(device) = store.devices.get_mut(&device_id) {
+        if device.user_id != user_id {
+            return Err(ApiError::conflict(
+                "device id already belongs to another user",
+            ));
+        }
+        if device.public_key != request.public_key {
+            return Err(ApiError::conflict("device public key mismatch"));
+        }
+
+        let role = request.role.unwrap_or_else(|| device.role.clone());
+        let changed = device.role != role
+            || device.os_type != request.os_type
+            || device.os_version != request.os_version
+            || device.app_version != request.app_version;
+        device.role = role;
+        device.os_type = request.os_type;
+        device.os_version = request.os_version;
+        device.app_version = request.app_version;
+        if changed {
+            device.updated_at = now;
+            device.device_version = device.device_version.saturating_add(1);
+        }
+    } else {
+        let device = Device {
+            id: device_id,
+            user_id,
+            name: request.name,
+            role: request.role.unwrap_or_default(),
+            os_type: request.os_type,
+            os_version: request.os_version,
+            app_version: request.app_version,
+            public_key: request.public_key,
+            disabled: false,
+            created_at: now,
+            updated_at: now,
+            device_version: 1,
+            name_version: 1,
+        };
+        store.devices.insert(device_id, device);
+    }
     state.save_locked(&store)?;
     Ok(Json(RegisterDeviceResponse { device_id }))
 }
@@ -870,17 +972,40 @@ async fn update_device(
         return Err(ApiError::not_found("device not found"));
     }
 
+    let mut changed = false;
+    let mut publish_device_changed = false;
     if let Some(name) = request.name {
         if name.trim().is_empty() {
             return Err(ApiError::bad_request("device name is required"));
         }
-        device.name = name;
+        if device.name != name {
+            device.name = name;
+            device.name_version = device.name_version.saturating_add(1);
+            changed = true;
+            publish_device_changed = true;
+        }
     }
     if let Some(disabled) = request.disabled {
-        device.disabled = disabled;
+        if device.disabled != disabled {
+            device.disabled = disabled;
+            changed = true;
+            publish_device_changed = true;
+        }
+    }
+    if changed {
+        device.updated_at = now_seconds();
+        device.device_version = device.device_version.saturating_add(1);
     }
     let device = device.clone();
     state.save_locked(&store)?;
+    if publish_device_changed {
+        state.publish_event(ServerEvent::DeviceChanged {
+            user_id,
+            device_id,
+            device_version: device.device_version,
+            name_version: device.name_version,
+        });
+    }
     Ok(Json(device))
 }
 
@@ -910,8 +1035,16 @@ async fn reauthorize_device(
 
     device.public_key = request.public_key;
     device.disabled = false;
+    device.updated_at = now_seconds();
+    device.device_version = device.device_version.saturating_add(1);
     let device = device.clone();
     state.save_locked(&store)?;
+    state.publish_event(ServerEvent::DeviceChanged {
+        user_id,
+        device_id,
+        device_version: device.device_version,
+        name_version: device.name_version,
+    });
     Ok(Json(device))
 }
 
@@ -928,8 +1061,31 @@ async fn delete_device(
     let user_id = authorize(&state, &headers)?;
     let mut store = state.lock()?;
     assert_device_owner(&store, user_id, device_id)?;
+    let presence_version = store
+        .presence
+        .get(&device_id)
+        .map_or(1, |presence| presence.presence_version.saturating_add(1));
     store.devices.remove(&device_id);
     store.presence.remove(&device_id);
+    store.topologies.values_mut().for_each(|topology| {
+        if topology.master_device_id == Some(device_id) {
+            topology.master_device_id = None;
+            topology.topology_version = topology.topology_version.saturating_add(1);
+            topology.updated_at = now_seconds();
+        }
+        if topology.layout.left == Some(device_id) {
+            topology.layout.left = None;
+        }
+        if topology.layout.right == Some(device_id) {
+            topology.layout.right = None;
+        }
+        if topology.layout.top == Some(device_id) {
+            topology.layout.top = None;
+        }
+        if topology.layout.bottom == Some(device_id) {
+            topology.layout.bottom = None;
+        }
+    });
     store.profiles.retain(|_, profile| {
         profile.source_device_id != device_id && profile.target_device_id != device_id
     });
@@ -938,6 +1094,7 @@ async fn delete_device(
         user_id,
         device_id,
         online: false,
+        presence_version,
     });
     Ok(Json(DeleteDeviceResponse { deleted: true }))
 }
@@ -953,6 +1110,7 @@ struct HeartbeatRequest {
 struct HeartbeatResponse {
     online: bool,
     last_seen_at: u64,
+    presence_version: u64,
 }
 
 async fn heartbeat(
@@ -975,6 +1133,24 @@ async fn heartbeat(
     }
 
     let last_seen_at = now_seconds();
+    let nat_type = request.nat_type.unwrap_or_else(|| "unknown".to_string());
+    let presence_version = store.presence.get(&device_id).map_or(1, |presence| {
+        if presence.online
+            && presence.lan_ips == request.lan_ips
+            && presence.listen_port == request.listen_port
+            && presence.nat_type == nat_type
+        {
+            presence.presence_version
+        } else {
+            presence.presence_version.saturating_add(1)
+        }
+    });
+    let should_publish = store.presence.get(&device_id).is_none_or(|presence| {
+        !presence.online
+            || presence.lan_ips != request.lan_ips
+            || presence.listen_port != request.listen_port
+            || presence.nat_type != nat_type
+    });
     let presence = Presence {
         device_id,
         user_id,
@@ -982,21 +1158,90 @@ async fn heartbeat(
         lan_ips: request.lan_ips,
         public_ip: addr.ip().to_string(),
         listen_port: request.listen_port,
-        nat_type: request.nat_type.unwrap_or_else(|| "unknown".to_string()),
+        nat_type,
         last_seen_at,
+        expires_at: last_seen_at.saturating_add(60),
+        presence_version,
     };
     store.presence.insert(device_id, presence);
     state.save_locked(&store)?;
-    state.publish_event(ServerEvent::DevicePresenceChanged {
-        user_id,
-        device_id,
-        online: true,
-    });
+    if should_publish {
+        state.publish_event(ServerEvent::DevicePresenceChanged {
+            user_id,
+            device_id,
+            online: true,
+            presence_version,
+        });
+    }
 
     Ok(Json(HeartbeatResponse {
         online: true,
         last_seen_at,
+        presence_version,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertTopologyRequest {
+    master_device_id: Option<Uuid>,
+    #[serde(default)]
+    layout: TopologyLayout,
+}
+
+async fn get_topology(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Topology>, ApiError> {
+    let user_id = authorize(&state, &headers)?;
+    let store = state.lock()?;
+    Ok(Json(
+        store
+            .topologies
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_else(|| Topology {
+                user_id,
+                master_device_id: None,
+                layout: TopologyLayout::default(),
+                topology_version: 0,
+                updated_at: 0,
+            }),
+    ))
+}
+
+async fn upsert_topology(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpsertTopologyRequest>,
+) -> Result<Json<Topology>, ApiError> {
+    let user_id = authorize(&state, &headers)?;
+    let mut store = state.lock()?;
+    if let Some(master_device_id) = request.master_device_id {
+        assert_device_owner(&store, user_id, master_device_id)?;
+    }
+    for device_id in request.layout.device_ids() {
+        assert_device_owner(&store, user_id, device_id)?;
+    }
+
+    let now = now_seconds();
+    let topology_version = store
+        .topologies
+        .get(&user_id)
+        .map_or(1, |topology| topology.topology_version.saturating_add(1));
+    let topology = Topology {
+        user_id,
+        master_device_id: request.master_device_id,
+        layout: request.layout,
+        topology_version,
+        updated_at: now,
+    };
+    store.topologies.insert(user_id, topology.clone());
+    state.save_locked(&store)?;
+    state.publish_event(ServerEvent::TopologyChanged {
+        user_id,
+        topology_version,
+    });
+    Ok(Json(topology))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1496,6 +1741,282 @@ mod tests {
         body["device_id"].as_str().expect("device id").to_string()
     }
 
+    async fn send_heartbeat(
+        app: Router,
+        token: &str,
+        device_id: &str,
+        lan_ips: Vec<&str>,
+        listen_port: u16,
+        nat_type: &str,
+        remote_addr: &str,
+    ) -> (StatusCode, Value) {
+        let mut heartbeat = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/devices/{device_id}/heartbeat"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                json!({
+                    "lan_ips": lan_ips,
+                    "listen_port": listen_port,
+                    "nat_type": nat_type
+                })
+                .to_string(),
+            ))
+            .expect("heartbeat request");
+        heartbeat.extensions_mut().insert(ConnectInfo(
+            remote_addr.parse::<SocketAddr>().expect("remote addr"),
+        ));
+        let response = app.oneshot(heartbeat).await.expect("heartbeat response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("heartbeat bytes");
+        let body = serde_json::from_slice(&bytes).expect("heartbeat body");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn stable_device_registration_is_idempotent() {
+        let app = test_app();
+        let token = login(app.clone()).await;
+        let device_id = "11111111-1111-4111-8111-111111111111";
+
+        let (first_status, first_body) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": device_id,
+                "name": "first-name",
+                "role": "master",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:first"
+            }),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(first_body["device_id"], device_id);
+
+        let (second_status, second_body) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": device_id,
+                "name": "local-name-should-not-overwrite-server-name",
+                "role": "master",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.2.0",
+                "public_key": "ed25519:first"
+            }),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(second_body["device_id"], device_id);
+
+        let (list_status, devices) = json_request(
+            app,
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(devices.as_array().expect("devices").len(), 1);
+        assert_eq!(devices[0]["device"]["id"], device_id);
+        assert_eq!(devices[0]["device"]["name"], "first-name");
+        assert_eq!(devices[0]["device"]["app_version"], "0.2.0");
+        assert_eq!(devices[0]["device"]["role"], "master");
+    }
+
+    #[tokio::test]
+    async fn stable_device_registration_rejects_public_key_mismatch() {
+        let app = test_app();
+        let token = login(app.clone()).await;
+        let device_id = "22222222-2222-4222-8222-222222222222";
+
+        let (first_status, _) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": device_id,
+                "name": "desktop",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:original"
+            }),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK);
+
+        let (conflict_status, conflict) = json_request(
+            app,
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": device_id,
+                "name": "desktop",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:changed"
+            }),
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::CONFLICT);
+        assert_eq!(conflict["error"], "device public key mismatch");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_versions_only_change_when_candidates_change() {
+        let app = test_app();
+        let token = login(app.clone()).await;
+        let device_id = register_device(app.clone(), &token, "desktop").await;
+
+        let (first_status, first) = send_heartbeat(
+            app.clone(),
+            &token,
+            &device_id,
+            vec!["192.168.1.10"],
+            24_800,
+            "open",
+            "127.0.0.1:40000",
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(first["presence_version"], 1);
+
+        let (second_status, second) = send_heartbeat(
+            app.clone(),
+            &token,
+            &device_id,
+            vec!["192.168.1.10"],
+            24_800,
+            "open",
+            "127.0.0.1:40001",
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(second["presence_version"], 1);
+
+        let (third_status, third) = send_heartbeat(
+            app,
+            &token,
+            &device_id,
+            vec!["10.0.0.8", "192.168.50.20"],
+            24_999,
+            "symmetric",
+            "203.0.113.44:41000",
+        )
+        .await;
+        assert_eq!(third_status, StatusCode::OK);
+        assert_eq!(third["presence_version"], 2);
+    }
+
+    #[tokio::test]
+    async fn renaming_device_pushes_device_changed_event() {
+        let state = AppState::load(None).expect("in-memory state");
+        let app = build_app(state.clone());
+        let login = login_with_body(app.clone()).await;
+        let token = login["access_token"].as_str().expect("token").to_string();
+        let user_id = Uuid::parse_str(login["user_id"].as_str().expect("user id")).expect("uuid");
+        let device_id = register_device(app.clone(), &token, "desktop").await;
+        let device_uuid = Uuid::parse_str(&device_id).expect("device uuid");
+        let mut events = state.subscribe_events();
+
+        let (rename_status, renamed) = json_request(
+            app,
+            Method::PATCH,
+            format!("/v1/devices/{device_id}"),
+            Some(&token),
+            json!({ "name": "desk-mini" }),
+        )
+        .await;
+        assert_eq!(rename_status, StatusCode::OK);
+        assert_eq!(renamed["name"], "desk-mini");
+        assert_eq!(renamed["name_version"], 2);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("device changed event")
+            .expect("event");
+        assert_eq!(
+            event,
+            ServerEvent::DeviceChanged {
+                user_id,
+                device_id: device_uuid,
+                device_version: 2,
+                name_version: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn topology_api_persists_master_layout_and_publishes_change() {
+        let state = AppState::load(None).expect("in-memory state");
+        let app = build_app(state.clone());
+        let login = login_with_body(app.clone()).await;
+        let token = login["access_token"].as_str().expect("token").to_string();
+        let user_id = Uuid::parse_str(login["user_id"].as_str().expect("user id")).expect("uuid");
+        let master_id = register_device(app.clone(), &token, "master").await;
+        let right_id = register_device(app.clone(), &token, "right").await;
+        let mut events = state.subscribe_events();
+
+        let (put_status, topology) = json_request(
+            app.clone(),
+            Method::PUT,
+            "/v1/topology".to_string(),
+            Some(&token),
+            json!({
+                "master_device_id": master_id,
+                "layout": {
+                    "right": right_id
+                }
+            }),
+        )
+        .await;
+        assert_eq!(put_status, StatusCode::OK);
+        assert_eq!(topology["master_device_id"], master_id);
+        assert_eq!(topology["layout"]["right"], right_id);
+        assert_eq!(topology["topology_version"], 1);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("topology event")
+            .expect("event");
+        assert_eq!(
+            event,
+            ServerEvent::TopologyChanged {
+                user_id,
+                topology_version: 1,
+            }
+        );
+
+        let (get_status, saved) = json_request(
+            app,
+            Method::GET,
+            "/v1/topology".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(saved["master_device_id"], master_id);
+        assert_eq!(saved["layout"]["right"], right_id);
+        assert_eq!(saved["topology_version"], 1);
+    }
+
     #[tokio::test]
     async fn device_api_flow_registers_heartbeat_and_lists_presence() {
         let app = test_app();
@@ -1718,6 +2239,7 @@ mod tests {
                 user_id,
                 device_id: device_uuid,
                 online: true,
+                presence_version: 1,
             }
         );
 
@@ -1741,6 +2263,7 @@ mod tests {
                 user_id,
                 device_id: device_uuid,
                 online: false,
+                presence_version: 2,
             }
         );
     }

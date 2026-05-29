@@ -53,6 +53,10 @@ pub enum LocalIpcRequest {
     SetLayout {
         layout: DesktopLayout,
     },
+    SetServerEndpoint {
+        host: String,
+        port: u16,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -613,6 +617,18 @@ mod tests {
         assert_eq!(
             read_request_frame(&mut Cursor::new(request_bytes)).expect("read set layout"),
             set_layout
+        );
+
+        let set_server_endpoint = LocalIpcRequest::SetServerEndpoint {
+            host: "203.0.113.10".to_string(),
+            port: 24_888,
+        };
+        let mut request_bytes = Vec::new();
+        write_request_frame(&mut request_bytes, &set_server_endpoint)
+            .expect("write set server endpoint");
+        assert_eq!(
+            read_request_frame(&mut Cursor::new(request_bytes)).expect("read set server endpoint"),
+            set_server_endpoint
         );
 
         let state = DesktopState {

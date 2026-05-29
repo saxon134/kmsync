@@ -148,7 +148,7 @@ body {{
 .local {{ grid-column: 2; grid-row: 2; border: 1px solid var(--accent); border-radius: 8px; padding: 10px; background: #eef4ff; display: grid; gap: 7px; }}
 .right {{ grid-column: 3; grid-row: 2; }}
 .bottom {{ grid-column: 2; grid-row: 3; }}
-select, button {{
+select, input, button {{
   min-height: 34px;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -156,6 +156,15 @@ select, button {{
   color: var(--ink);
   padding: 0 9px;
   font: inherit;
+}}
+input {{ width: 100%; }}
+.field {{
+  display: grid;
+  gap: 6px;
+}}
+.field span {{
+  color: var(--muted);
+  font-size: 12px;
 }}
 button.primary {{
   background: var(--accent);
@@ -199,6 +208,14 @@ button.primary {{
   <main class="content">
     <section class="grid">
       <section class="panel">
+        <h2>Linux 服务器</h2>
+        <div class="body">
+          <label class="field"><span>服务器 IP/域名</span><input id="serverHost" name="server_host" value="{server_host}" placeholder="1.2.3.4"></label>
+          <label class="field"><span>服务器端口</span><input id="serverPort" name="server_port" type="number" min="1" max="65535" value="{server_port}" placeholder="24888"></label>
+          <div class="fact"><span>完整地址</span><strong id="serverUrlPreview" data-scheme="{server_scheme}">{server_url}</strong></div>
+        </div>
+      </section>
+      <section class="panel">
         <h2>网络状态</h2>
         <div class="body facts">
           <div class="fact"><span>内网 IP</span><strong>{lan_ips}</strong></div>
@@ -238,6 +255,19 @@ button.primary {{
   </main>
 </div>
 <script type="application/json" id="kmsync-devices">{devices_json}</script>
+<script>
+const serverHostInput = document.getElementById("serverHost");
+const serverPortInput = document.getElementById("serverPort");
+const serverUrlPreview = document.getElementById("serverUrlPreview");
+function updateServerUrlPreview() {{
+  const scheme = serverUrlPreview.dataset.scheme || "http";
+  const host = serverHostInput.value.trim();
+  const port = serverPortInput.value.trim();
+  serverUrlPreview.textContent = host && port ? `${{scheme}}://${{host}}:${{port}}` : "-";
+}}
+serverHostInput.addEventListener("input", updateServerUrlPreview);
+serverPortInput.addEventListener("input", updateServerUrlPreview);
+</script>
 </body>
 </html>
 "#,
@@ -247,6 +277,15 @@ button.primary {{
         server_state = connection_state_label(&state.server_state),
         master_state_key = connection_state_key(&state.master_state),
         master_state = connection_state_label(&state.master_state),
+        server_host = escape_html(state.network.server_host.as_deref().unwrap_or("")),
+        server_port = state
+            .network
+            .server_port
+            .map_or_else(String::new, |port| port.to_string()),
+        server_url = escape_html(state.network.server_url.as_deref().unwrap_or("-")),
+        server_scheme = escape_html(&server_url_scheme(
+            state.network.server_url.as_deref().unwrap_or("http://")
+        )),
         lan_ips = escape_html(&empty_dash(&state.network.lan_ips.join(", "))),
         public_ip = escape_html(state.network.public_ip.as_deref().unwrap_or("-")),
         listen_port = state
@@ -364,6 +403,13 @@ fn role_label(role: &DesktopRole) -> &'static str {
     }
 }
 
+fn server_url_scheme(server_url: &str) -> String {
+    server_url
+        .split_once("://")
+        .map_or("http", |(scheme, _)| scheme)
+        .to_string()
+}
+
 fn empty_dash(value: &str) -> String {
     if value.trim().is_empty() {
         "-".to_string()
@@ -406,6 +452,9 @@ mod tests {
                 role: DesktopRole::Master,
             },
             network: DesktopNetworkState {
+                server_url: Some("http://203.0.113.10:24888".to_string()),
+                server_host: Some("203.0.113.10".to_string()),
+                server_port: Some(24_888),
                 lan_ips: vec!["192.168.1.20".to_string()],
                 public_ip: Some("203.0.113.10".to_string()),
                 listen_port: Some(24_800),
@@ -434,6 +483,12 @@ mod tests {
 
         let html = render_desktop_panel(&state).expect("render desktop panel");
 
+        assert!(html.contains("Linux 服务器"));
+        assert!(html.contains("服务器 IP/域名"));
+        assert!(html.contains("服务器端口"));
+        assert!(html.contains("serverHost"));
+        assert!(html.contains("serverPort"));
+        assert!(html.contains("http://203.0.113.10:24888"));
         assert!(html.contains("内网 IP"));
         assert!(html.contains("公网 IP"));
         assert!(html.contains("连接中"));

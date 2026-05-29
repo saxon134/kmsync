@@ -12,6 +12,7 @@ use crate::platform::PlatformPermissionCheck;
 pub(crate) struct DesktopStateBuildInput<'a> {
     pub(crate) config_path: &'a Path,
     pub(crate) device_name: &'a str,
+    pub(crate) server_url: &'a str,
     pub(crate) listen_port: u16,
     pub(crate) current_device_id: Option<&'a str>,
     pub(crate) local_lan_ips: Vec<String>,
@@ -34,7 +35,11 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
         })
         .and_then(|item| item.presence.as_ref());
 
+    let (server_host, server_port) = server_endpoint_parts(input.server_url);
     let network = DesktopNetworkState {
+        server_url: Some(input.server_url.to_string()),
+        server_host,
+        server_port,
         lan_ips: current_presence
             .map(|presence| presence.lan_ips.clone())
             .filter(|ips| !ips.is_empty())
@@ -86,6 +91,36 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
             })
             .collect(),
     }
+}
+
+fn server_endpoint_parts(server_url: &str) -> (Option<String>, Option<u16>) {
+    let authority = server_url
+        .split_once("://")
+        .map_or(server_url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if authority.is_empty() {
+        return (None, None);
+    }
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        if let Some((host, rest)) = after_bracket.split_once(']') {
+            let port = rest.strip_prefix(':').and_then(parse_port);
+            return (Some(host.to_string()), port);
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => (Some(host.to_string()), parse_port(port)),
+        _ => (Some(authority.to_string()), None),
+    }
+}
+
+fn parse_port(port: &str) -> Option<u16> {
+    port.parse::<u16>().ok().filter(|port| *port > 0)
 }
 
 fn master_connection_state(
@@ -194,6 +229,7 @@ mod tests {
         let state = build_desktop_state(DesktopStateBuildInput {
             config_path: Path::new("configs/daemon.example.json"),
             device_name: "This PC",
+            server_url: "https://203.0.113.10:24888",
             listen_port: 24_800,
             current_device_id: Some("current-device"),
             local_lan_ips: vec!["192.168.1.20".to_string()],
@@ -226,6 +262,12 @@ mod tests {
         assert_eq!(state.master_state, DesktopConnectionState::SelfDevice);
         assert_eq!(state.network.lan_ips, vec!["192.168.1.20"]);
         assert_eq!(state.network.public_ip.as_deref(), Some("203.0.113.10"));
+        assert_eq!(
+            state.network.server_url.as_deref(),
+            Some("https://203.0.113.10:24888")
+        );
+        assert_eq!(state.network.server_host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(state.network.server_port, Some(24_888));
         assert_eq!(state.layout.right.as_deref(), Some("right-device"));
         assert_eq!(state.devices.len(), 1);
         assert!(!state.devices[0].online);
@@ -244,6 +286,7 @@ mod tests {
         let state = build_desktop_state(DesktopStateBuildInput {
             config_path: Path::new("configs/daemon.example.json"),
             device_name: "Client PC",
+            server_url: "http://kmsync.example.com:24888",
             listen_port: 24_800,
             current_device_id: Some("client-device"),
             local_lan_ips: vec!["10.0.0.5".to_string()],
