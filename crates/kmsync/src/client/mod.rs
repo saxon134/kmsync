@@ -431,6 +431,16 @@ impl ControlClient {
         get_json_without_auth(&self.agent, &format!("{}/v1/devices", self.server_url))
     }
 
+    pub fn update_device_name(&self, device_id: &str, name: &str) -> Result<Device, String> {
+        patch_json(
+            &self.agent,
+            &format!("{}/v1/devices/{}", self.server_url, device_id),
+            &UpdateDeviceNameRequest {
+                name: name.to_string(),
+            },
+        )
+    }
+
     pub fn list_profiles(&self) -> Result<Vec<DeviceProfile>, String> {
         get_json_without_auth(&self.agent, &format!("{}/v1/profiles", self.server_url))
     }
@@ -524,6 +534,11 @@ pub struct RegisterDeviceRequest {
 #[derive(Debug, Deserialize)]
 pub struct RegisterDeviceResponse {
     pub device_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateDeviceNameRequest {
+    name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1413,6 +1428,24 @@ pub fn load_desktop_device_inventory(
     load_desktop_device_inventory_with_identity(config, &identity, local_lan_ips)
 }
 
+pub fn sync_current_device_name(config: &ClientConfig) -> Result<Device, String> {
+    let identity = DeviceIdentity::load_or_generate(&config.identity_path)?;
+    sync_current_device_name_with_identity(config, &identity)
+}
+
+fn sync_current_device_name_with_identity(
+    config: &ClientConfig,
+    identity: &DeviceIdentity,
+) -> Result<Device, String> {
+    let name = config.device_name.trim();
+    if name.is_empty() {
+        return Err("device name must not be empty".to_string());
+    }
+    let client = ControlClient::new(config.server_url.clone());
+    let registered = client.register_device(&build_register_device_request(config, identity))?;
+    client.update_device_name(&registered.device_id, name)
+}
+
 fn load_desktop_device_inventory_with_identity(
     config: &ClientConfig,
     identity: &DeviceIdentity,
@@ -2229,6 +2262,48 @@ mod tests {
         assert!(!requests
             .iter()
             .any(|request| request.to_ascii_lowercase().contains("authorization:")));
+    }
+
+    #[test]
+    fn syncing_current_device_name_registers_then_patches_server_device() {
+        let current_device_id = "44444444-4444-4444-8444-444444444444";
+        let server = MockJsonServer::spawn([
+            r#"{"device_id":"44444444-4444-4444-8444-444444444444"}"#,
+            r#"{
+                "id": "44444444-4444-4444-8444-444444444444",
+                "name": "Renamed PC",
+                "os_type": "windows",
+                "os_version": "unknown",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:current",
+                "disabled": false
+            }"#,
+        ]);
+        let config = ClientConfig {
+            server_url: server.url(),
+            device_name: "Renamed PC".to_string(),
+            role: DesktopRole::Master,
+            listen_port: 24_800,
+            heartbeat_interval_seconds: 15,
+            identity_path: PathBuf::from("identity.json"),
+        };
+        let identity = DeviceIdentity {
+            device_id: current_device_id.to_string(),
+            public_key: "ed25519:current".to_string(),
+            private_key: "ed25519:private".to_string(),
+        };
+
+        let device =
+            sync_current_device_name_with_identity(&config, &identity).expect("sync device name");
+
+        assert_eq!(device.id, current_device_id);
+        assert_eq!(device.name, "Renamed PC");
+        let requests = server.finish();
+        assert!(requests[0].starts_with("POST /v1/devices/register "));
+        assert!(requests[1].starts_with("PATCH /v1/devices/44444444-4444-4444-8444-444444444444 "));
+        let patch_body: serde_json::Value =
+            serde_json::from_str(http_body(&requests[1])).expect("patch json");
+        assert_eq!(patch_body["name"], "Renamed PC");
     }
 
     #[test]
@@ -3423,6 +3498,22 @@ where
 {
     let mut response = agent
         .put(url)
+        .header("content-type", "application/json")
+        .send_json(request)
+        .map_err(|error| format!("request failed: {error}"))?;
+    response
+        .body_mut()
+        .read_json()
+        .map_err(|error| format!("invalid json response: {error}"))
+}
+
+fn patch_json<T, R>(agent: &ureq::Agent, url: &str, request: &T) -> Result<R, String>
+where
+    T: Serialize,
+    R: for<'de> Deserialize<'de>,
+{
+    let mut response = agent
+        .patch(url)
         .header("content-type", "application/json")
         .send_json(request)
         .map_err(|error| format!("request failed: {error}"))?;

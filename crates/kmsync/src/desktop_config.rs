@@ -86,12 +86,58 @@ pub(crate) fn set_server_endpoint_in_config_file(
     local_config::write_text_atomic(path, &updated)
 }
 
+pub(crate) fn set_current_device_config_in_config_file(
+    path: &Path,
+    device_name: &str,
+    role: DesktopRole,
+    master_device_id: Option<&str>,
+) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let updated =
+        set_current_device_config_in_config_text(&text, device_name, role, master_device_id)?;
+    local_config::write_text_atomic(path, &updated)
+}
+
 fn set_role_in_config_text(
     text: &str,
     role: DesktopRole,
     master_device_id: Option<&str>,
 ) -> Result<String, String> {
     let mut object = parse_config_object(text)?;
+    object.insert(
+        "role".to_string(),
+        serde_json::to_value(role).map_err(|error| error.to_string())?,
+    );
+    match master_device_id {
+        Some(master_device_id) => {
+            object.insert(
+                "master_device_id".to_string(),
+                Value::String(master_device_id.to_string()),
+            );
+        }
+        None => {
+            object.insert("master_device_id".to_string(), Value::Null);
+        }
+    }
+    serialize_config_object(object)
+}
+
+fn set_current_device_config_in_config_text(
+    text: &str,
+    device_name: &str,
+    role: DesktopRole,
+    master_device_id: Option<&str>,
+) -> Result<String, String> {
+    let mut object = parse_config_object(text)?;
+    let device_name = device_name.trim();
+    if device_name.is_empty() {
+        return Err("device name must not be empty".to_string());
+    }
+    object.insert(
+        "device_name".to_string(),
+        Value::String(device_name.to_string()),
+    );
     object.insert(
         "role".to_string(),
         serde_json::to_value(role).map_err(|error| error.to_string())?,
@@ -304,5 +350,45 @@ mod tests {
         .expect_err("empty host is invalid");
 
         assert!(error.contains("server host"));
+    }
+
+    #[test]
+    fn applying_current_device_config_updates_name_role_and_preserves_server() {
+        let updated = set_current_device_config_in_config_text(
+            r#"{
+                "server_url": "http://127.0.0.1:24888",
+                "device_name": "Old Name",
+                "listen_port": 24800,
+                "heartbeat_interval_seconds": 15,
+                "role": "client",
+                "master_device_id": "master-device"
+            }"#,
+            "  New Name  ",
+            DesktopRole::Master,
+            None,
+        )
+        .expect("set current device config");
+        let json: serde_json::Value = serde_json::from_str(&updated).expect("valid json");
+
+        assert_eq!(json["server_url"], "http://127.0.0.1:24888");
+        assert_eq!(json["device_name"], "New Name");
+        assert_eq!(json["role"], "master");
+        assert!(json["master_device_id"].is_null());
+    }
+
+    #[test]
+    fn applying_current_device_config_rejects_empty_name() {
+        let error = set_current_device_config_in_config_text(
+            r#"{
+                "server_url": "http://127.0.0.1:24888",
+                "device_name": "Old Name"
+            }"#,
+            "   ",
+            DesktopRole::Client,
+            None,
+        )
+        .expect_err("empty device name is invalid");
+
+        assert!(error.contains("device name"));
     }
 }

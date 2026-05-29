@@ -5,11 +5,11 @@ use eframe::egui;
 use kmsync_core::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopState};
 
 const NATIVE_CJK_FONT_NAME: &str = "kmsync_cjk";
-const NATIVE_WINDOW_SIZE: [f32; 2] = [1120.0, 820.0];
-const NATIVE_WINDOW_MIN_SIZE: [f32; 2] = [900.0, 640.0];
+const NATIVE_WINDOW_SIZE: [f32; 2] = [1120.0, 880.0];
+const NATIVE_WINDOW_MIN_SIZE: [f32; 2] = [900.0, 700.0];
 const NATIVE_TOP_PANEL_MIN_HEIGHT: f32 = 210.0;
-const NATIVE_LAYOUT_PANEL_MIN_HEIGHT: f32 = 180.0;
-const NATIVE_DEVICES_PANEL_MIN_HEIGHT: f32 = 220.0;
+const NATIVE_LAYOUT_PANEL_MIN_HEIGHT: f32 = 280.0;
+const NATIVE_DEVICES_PANEL_MIN_HEIGHT: f32 = 280.0;
 const NATIVE_LAYOUT_GRID_MIN_COL_WIDTH: f32 = 96.0;
 const NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING: f32 = 12.0;
 const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 92.0;
@@ -20,6 +20,7 @@ const NATIVE_ACTION_BUTTON_HEIGHT: f32 = 34.0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeDesktopViewModel {
     pub(crate) title: String,
+    pub(crate) device_name: String,
     pub(crate) server_host: String,
     pub(crate) server_port: String,
     pub(crate) server_url: String,
@@ -52,6 +53,7 @@ impl NativeDesktopViewModel {
     pub(crate) fn from_state(state: &DesktopState) -> Self {
         Self {
             title: "KMSync".to_string(),
+            device_name: state.device.name.clone(),
             server_host: state.network.server_host.clone().unwrap_or_default(),
             server_port: state
                 .network
@@ -151,9 +153,24 @@ struct NativeDesktopApp {
     state: DesktopState,
     server_host: String,
     server_port: String,
+    device_name: String,
     is_master: bool,
     layout: DesktopLayout,
     status_message: String,
+    lan_ip_popup: Option<NativeLanIpPopup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeLanIpPopup {
+    device_name: String,
+    lan_ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeLanIpSummary {
+    primary: String,
+    has_more: bool,
+    total_count: usize,
 }
 
 impl NativeDesktopApp {
@@ -166,9 +183,11 @@ impl NativeDesktopApp {
             state,
             server_host: view_model.server_host,
             server_port: view_model.server_port,
+            device_name: view_model.device_name,
             is_master: view_model.is_master,
             layout: view_model.layout,
             status_message,
+            lan_ip_popup: None,
         })
     }
 
@@ -180,6 +199,7 @@ impl NativeDesktopApp {
                 self.state = state;
                 self.server_host = view_model.server_host;
                 self.server_port = view_model.server_port;
+                self.device_name = view_model.device_name;
                 self.is_master = view_model.is_master;
                 self.layout = view_model.layout;
                 self.status_message = status_message;
@@ -212,7 +232,12 @@ impl NativeDesktopApp {
         }
     }
 
-    fn save_role(&mut self) {
+    fn save_current_device_config(&mut self) {
+        let device_name = self.device_name.trim().to_string();
+        if device_name.is_empty() {
+            self.status_message = "设备名称不能为空".to_string();
+            return;
+        }
         let role = if self.is_master {
             DesktopRole::Master
         } else {
@@ -223,13 +248,25 @@ impl NativeDesktopApp {
         } else {
             self.state.master_device_id.as_deref()
         };
-        match crate::desktop_config::set_role_in_config_file(
+        match crate::desktop_config::set_current_device_config_in_config_file(
             &self.config_path,
+            &device_name,
             role,
             master_device_id,
         ) {
             Ok(()) => {
-                self.reload_state("当前电脑配置已保存");
+                match crate::client::ClientConfig::load(&self.config_path)
+                    .and_then(|config| crate::client::sync_current_device_name(&config))
+                {
+                    Ok(_) => {
+                        self.reload_state("当前电脑配置已保存并同步");
+                    }
+                    Err(error) => {
+                        self.reload_state("当前电脑配置已保存");
+                        self.status_message =
+                            format!("当前电脑配置已保存，设备名称同步失败：{error}");
+                    }
+                }
             }
             Err(error) => {
                 self.status_message = format!("当前电脑配置保存失败：{error}");
@@ -312,6 +349,7 @@ impl eframe::App for NativeDesktopApp {
                 });
             });
         });
+        self.lan_ip_popup_window(ctx);
     }
 }
 
@@ -331,7 +369,8 @@ impl NativeDesktopApp {
     fn current_device_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("当前电脑");
         ui.checkbox(&mut self.is_master, "将当前电脑作为主电脑");
-        ui.label(format!("设备名称：{}", self.state.device.name));
+        ui.label("设备名称");
+        ui.text_edit_singleline(&mut self.device_name);
         ui.label(format!(
             "设备 ID：{}",
             self.state.device.id.as_deref().unwrap_or("-")
@@ -364,7 +403,7 @@ impl NativeDesktopApp {
                 self.reload_state("状态已刷新");
             }
             if native_action_button(ui, "保存当前电脑配置").clicked() {
-                self.save_role();
+                self.save_current_device_config();
             }
         });
     }
@@ -372,12 +411,7 @@ impl NativeDesktopApp {
     fn layout_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("设备位置");
         ui.set_min_height(NATIVE_LAYOUT_PANEL_MIN_HEIGHT);
-        let devices = self
-            .state
-            .devices
-            .iter()
-            .map(|device| (device.id.clone(), device.name.clone()))
-            .collect::<Vec<_>>();
+        let devices = native_layout_device_options(&self.state);
         let combo_width = native_layout_combo_width(ui.available_width());
         egui::Grid::new("native_layout_grid")
             .num_columns(3)
@@ -418,7 +452,7 @@ impl NativeDesktopApp {
     fn devices_section(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.heading("设备列表");
-            if native_action_button(ui, "刷新当前设备").clicked() {
+            if native_action_button(ui, "刷新").clicked() {
                 self.reload_state("设备列表已刷新");
             }
         });
@@ -428,6 +462,7 @@ impl NativeDesktopApp {
             return;
         }
         let min_col_width = native_devices_grid_column_width(ui.available_width());
+        let mut next_lan_ip_popup = None;
         egui::Grid::new("native_devices_grid")
             .striped(true)
             .spacing([native_devices_grid_horizontal_spacing(), 8.0])
@@ -445,7 +480,12 @@ impl NativeDesktopApp {
                         if device.online { "在线" } else { "离线" },
                         min_col_width,
                     );
-                    native_grid_label(ui, &empty_dash(&device.lan_ips.join(", ")), min_col_width);
+                    if native_grid_lan_ips(ui, &device.lan_ips, min_col_width) {
+                        next_lan_ip_popup = Some(NativeLanIpPopup {
+                            device_name: device.name.clone(),
+                            lan_ips: device.lan_ips.clone(),
+                        });
+                    }
                     native_grid_label(
                         ui,
                         device.public_ip.as_deref().unwrap_or("-"),
@@ -454,6 +494,34 @@ impl NativeDesktopApp {
                     ui.end_row();
                 }
             });
+        if next_lan_ip_popup.is_some() {
+            self.lan_ip_popup = next_lan_ip_popup;
+        }
+    }
+
+    fn lan_ip_popup_window(&mut self, ctx: &egui::Context) {
+        let Some(popup) = self.lan_ip_popup.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut close_clicked = false;
+        egui::Window::new(format!("{} 的内网 IP", popup.device_name))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(260.0);
+                for ip in &popup.lan_ips {
+                    ui.monospace(ip);
+                }
+                ui.add_space(8.0);
+                if native_action_button(ui, "关闭").clicked() {
+                    close_clicked = true;
+                }
+            });
+        if !open || close_clicked {
+            self.lan_ip_popup = None;
+        }
     }
 }
 
@@ -490,6 +558,16 @@ fn device_combo(
                 });
         },
     );
+}
+
+fn native_layout_device_options(state: &DesktopState) -> Vec<(String, String)> {
+    let current_device_id = state.device.id.as_deref();
+    state
+        .devices
+        .iter()
+        .filter(|device| Some(device.id.as_str()) != current_device_id)
+        .map(|device| (device.id.clone(), device.name.clone()))
+        .collect()
 }
 
 fn master_device_cell(ui: &mut egui::Ui, device_name: &str, is_master: bool, width: f32) {
@@ -568,6 +646,37 @@ fn native_grid_strong(ui: &mut egui::Ui, label: &str, width: f32) {
     );
 }
 
+fn native_grid_lan_ips(ui: &mut egui::Ui, lan_ips: &[String], width: f32) -> bool {
+    let summary = native_lan_ip_summary(lan_ips);
+    let mut open_popup = false;
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 22.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let button_width = if summary.has_more { 48.0 } else { 0.0 };
+            let label_width = (width - button_width).max(1.0);
+            ui.add_sized(
+                egui::vec2(label_width, 18.0),
+                egui::Label::new(summary.primary).wrap(),
+            );
+            if summary.has_more && ui.small_button("更多").clicked() {
+                open_popup = true;
+            }
+        },
+    );
+    open_popup
+}
+
+fn native_lan_ip_summary(lan_ips: &[String]) -> NativeLanIpSummary {
+    NativeLanIpSummary {
+        primary: lan_ips
+            .first()
+            .map_or_else(|| "-".to_string(), ToString::to_string),
+        has_more: lan_ips.len() > 1,
+        total_count: lan_ips.len(),
+    }
+}
+
 fn native_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add_sized(
         native_action_button_size(),
@@ -594,7 +703,7 @@ fn native_action_button_labels() -> [&'static str; 5] {
         "保存服务器配置",
         "刷新状态",
         "保存当前电脑配置",
-        "刷新当前设备",
+        "刷新",
         "保存设备位置",
     ]
 }
@@ -710,6 +819,7 @@ mod tests {
         let view_model = NativeDesktopViewModel::from_state(&state);
 
         assert_eq!(view_model.title, "KMSync");
+        assert_eq!(view_model.device_name, "This PC");
         assert_eq!(view_model.server_host, "203.0.113.10");
         assert_eq!(view_model.server_port, "24888");
         assert_eq!(view_model.server_url, "http://203.0.113.10:24888");
@@ -722,12 +832,15 @@ mod tests {
     fn native_desktop_layout_uses_wide_full_width_panels() {
         let metrics = native_desktop_layout_metrics();
 
-        assert_eq!(metrics.window_size, [1120.0, 820.0]);
-        assert_eq!(metrics.min_window_size, [900.0, 640.0]);
+        assert_eq!(metrics.window_size, [1120.0, 880.0]);
+        assert_eq!(metrics.min_window_size, [900.0, 700.0]);
         assert!(metrics.top_panel_min_height <= 220.0);
         assert_eq!(metrics.lower_panel_columns, 2);
-        assert!(metrics.layout_panel_min_height >= 180.0);
-        assert!(metrics.devices_panel_min_height >= 220.0);
+        assert_eq!(
+            metrics.layout_panel_min_height,
+            metrics.devices_panel_min_height
+        );
+        assert!(metrics.layout_panel_min_height >= 280.0);
         assert!(metrics.devices_grid_min_col_width <= 96.0);
     }
 
@@ -763,6 +876,49 @@ mod tests {
     }
 
     #[test]
+    fn native_layout_options_exclude_current_device() {
+        let state = DesktopState {
+            device: DesktopDeviceState {
+                id: Some("current".to_string()),
+                name: "This PC".to_string(),
+                os: "windows".to_string(),
+                app_version: "0.1.0".to_string(),
+                role: DesktopRole::Master,
+            },
+            devices: vec![
+                DesktopPeerState {
+                    id: "current".to_string(),
+                    name: "This PC".to_string(),
+                    os: "windows".to_string(),
+                    online: true,
+                    lan_ips: vec![],
+                    public_ip: None,
+                    listen_port: None,
+                    last_seen_at: None,
+                },
+                DesktopPeerState {
+                    id: "right-device".to_string(),
+                    name: "Right PC".to_string(),
+                    os: "macos".to_string(),
+                    online: true,
+                    lan_ips: vec![],
+                    public_ip: None,
+                    listen_port: None,
+                    last_seen_at: None,
+                },
+            ],
+            ..DesktopState::default()
+        };
+
+        let options = native_layout_device_options(&state);
+
+        assert_eq!(
+            options,
+            vec![("right-device".to_string(), "Right PC".to_string())]
+        );
+    }
+
+    #[test]
     fn native_desktop_connection_status_uses_semantic_colors() {
         assert_eq!(
             connection_state_tone(&DesktopConnectionState::Connected),
@@ -786,11 +942,39 @@ mod tests {
                 "保存服务器配置",
                 "刷新状态",
                 "保存当前电脑配置",
-                "刷新当前设备",
+                "刷新",
                 "保存设备位置"
             ]
         );
         assert_eq!(native_action_button_size(), egui::vec2(150.0, 34.0));
+    }
+
+    #[test]
+    fn native_lan_ip_summary_shows_one_address_and_more_state() {
+        assert_eq!(
+            native_lan_ip_summary(&[]),
+            NativeLanIpSummary {
+                primary: "-".to_string(),
+                has_more: false,
+                total_count: 0
+            }
+        );
+        assert_eq!(
+            native_lan_ip_summary(&["192.168.1.21".to_string()]),
+            NativeLanIpSummary {
+                primary: "192.168.1.21".to_string(),
+                has_more: false,
+                total_count: 1
+            }
+        );
+        assert_eq!(
+            native_lan_ip_summary(&["192.168.1.21".to_string(), "10.0.0.8".to_string()]),
+            NativeLanIpSummary {
+                primary: "192.168.1.21".to_string(),
+                has_more: true,
+                total_count: 2
+            }
+        );
     }
 
     #[cfg(target_os = "windows")]

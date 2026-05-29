@@ -330,7 +330,12 @@ fn render_layout_slots(layout: &DesktopLayout, state: &DesktopState) -> String {
 
 fn render_device_options(state: &DesktopState, selected: Option<&str>) -> String {
     let mut options = String::from(r#"<option value="">未配置</option>"#);
-    for device in &state.devices {
+    let current_device_id = state.device.id.as_deref();
+    for device in state
+        .devices
+        .iter()
+        .filter(|device| Some(device.id.as_str()) != current_device_id)
+    {
         let selected_attr = if Some(device.id.as_str()) == selected {
             " selected"
         } else {
@@ -518,5 +523,46 @@ mod tests {
         assert!(html.contains(".secondary-grid {"));
         assert!(html.contains("grid-template-columns: minmax(420px, 1fr) minmax(420px, 1fr);"));
         assert!(html.contains("@media (max-width: 920px)"));
+    }
+
+    #[test]
+    fn desktop_panel_layout_options_exclude_current_device() {
+        let state = DesktopState {
+            device: DesktopDeviceState {
+                id: Some("current-device".to_string()),
+                name: "This PC".to_string(),
+                os: "windows".to_string(),
+                app_version: "0.1.0".to_string(),
+                role: DesktopRole::Master,
+            },
+            devices: vec![
+                DesktopPeerState {
+                    id: "current-device".to_string(),
+                    name: "This PC".to_string(),
+                    os: "windows".to_string(),
+                    online: true,
+                    lan_ips: vec![],
+                    public_ip: None,
+                    listen_port: None,
+                    last_seen_at: None,
+                },
+                DesktopPeerState {
+                    id: "right-device".to_string(),
+                    name: "Right PC".to_string(),
+                    os: "macos".to_string(),
+                    online: true,
+                    lan_ips: vec![],
+                    public_ip: None,
+                    listen_port: None,
+                    last_seen_at: None,
+                },
+            ],
+            ..DesktopState::default()
+        };
+
+        let options = render_device_options(&state, None);
+
+        assert!(!options.contains("current-device"));
+        assert!(options.contains("right-device"));
     }
 }
