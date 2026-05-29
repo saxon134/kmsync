@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eframe::egui;
 use kmsync_core::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopState};
+
+const NATIVE_CJK_FONT_NAME: &str = "kmsync_cjk";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeDesktopViewModel {
@@ -44,8 +47,59 @@ pub(crate) fn run_native_desktop(config_path: &Path) -> Result<(), String> {
             .with_min_inner_size([760.0, 560.0]),
         ..Default::default()
     };
-    eframe::run_native("KMSync", options, Box::new(move |_cc| Ok(Box::new(app))))
-        .map_err(|error| format!("native desktop window failed: {error}"))
+    eframe::run_native(
+        "KMSync",
+        options,
+        Box::new(move |cc| {
+            install_native_text_fonts(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|error| format!("native desktop window failed: {error}"))
+}
+
+fn install_native_text_fonts(ctx: &egui::Context) {
+    if let Ok(fonts) = native_font_definitions_from_candidates(&native_cjk_font_candidates()) {
+        ctx.set_fonts(fonts);
+    }
+}
+
+fn native_cjk_font_candidates() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(r"C:\Windows\Fonts\Deng.ttf"),
+        PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
+        PathBuf::from(r"C:\Windows\Fonts\simsunb.ttf"),
+        PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
+        PathBuf::from(r"C:\Windows\Fonts\NotoSansSC-VF.ttf"),
+        PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+        PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
+        PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+        PathBuf::from("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
+    ]
+}
+
+fn native_font_definitions_from_candidates(
+    candidates: &[PathBuf],
+) -> Result<egui::FontDefinitions, String> {
+    let Some(path) = candidates.iter().find(|path| path.exists()) else {
+        return Err("no native CJK font found".to_string());
+    };
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("failed to read native CJK font {}: {error}", path.display()))?;
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        NATIVE_CJK_FONT_NAME.to_string(),
+        Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, NATIVE_CJK_FONT_NAME.to_string());
+    }
+    Ok(fonts)
 }
 
 struct NativeDesktopApp {
@@ -392,5 +446,27 @@ mod tests {
         assert!(view_model.is_master);
         assert_eq!(view_model.layout.left.as_deref(), Some("left-device"));
         assert!(view_model.device_names.contains(&"Right PC".to_string()));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_font_definitions_prefer_windows_cjk_font_for_chinese_text() {
+        let candidate = native_cjk_font_candidates()
+            .into_iter()
+            .find(|path| path.exists())
+            .expect("Windows CJK font should exist");
+
+        let fonts = native_font_definitions_from_candidates(&[candidate])
+            .expect("load native CJK font definitions");
+
+        assert!(fonts.font_data.contains_key(NATIVE_CJK_FONT_NAME));
+        assert_eq!(
+            fonts
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .and_then(|family| family.first())
+                .map(String::as_str),
+            Some(NATIVE_CJK_FONT_NAME)
+        );
     }
 }
