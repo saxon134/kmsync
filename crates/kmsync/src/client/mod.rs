@@ -445,6 +445,18 @@ impl ControlClient {
         get_json_without_auth(&self.agent, &format!("{}/v1/profiles", self.server_url))
     }
 
+    pub fn get_topology(&self) -> Result<Topology, String> {
+        get_json_without_auth(&self.agent, &format!("{}/v1/topology", self.server_url))
+    }
+
+    pub fn upsert_topology(&self, request: &UpsertTopologyRequest) -> Result<Topology, String> {
+        put_json(
+            &self.agent,
+            &format!("{}/v1/topology", self.server_url),
+            request,
+        )
+    }
+
     pub fn upsert_profile(&self, request: &UpsertProfileRequest) -> Result<DeviceProfile, String> {
         put_json(
             &self.agent,
@@ -589,6 +601,22 @@ pub struct Presence {
     pub listen_port: u16,
     pub nat_type: String,
     pub last_seen_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Topology {
+    #[serde(default)]
+    pub master_device_id: Option<String>,
+    #[serde(default)]
+    pub layout: DesktopLayout,
+    pub topology_version: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpsertTopologyRequest {
+    pub master_device_id: Option<String>,
+    pub layout: DesktopLayout,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2262,6 +2290,70 @@ mod tests {
         assert!(!requests
             .iter()
             .any(|request| request.to_ascii_lowercase().contains("authorization:")));
+    }
+
+    #[test]
+    fn topology_api_gets_and_upserts_master_layout_without_auth() {
+        let server = MockJsonServer::spawn([
+            r#"{
+                "user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "master_device_id": null,
+                "layout": {},
+                "topology_version": 0,
+                "updated_at": 0
+            }"#,
+            r#"{
+                "user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "master_device_id": "11111111-1111-4111-8111-111111111111",
+                "layout": {
+                    "right": "22222222-2222-4222-8222-222222222222"
+                },
+                "topology_version": 1,
+                "updated_at": 456
+            }"#,
+        ]);
+        let client = ControlClient::new(server.url());
+
+        let topology = client.get_topology().expect("get topology");
+        assert_eq!(topology.master_device_id, None);
+        assert_eq!(topology.layout, DesktopLayout::default());
+
+        let saved = client
+            .upsert_topology(&UpsertTopologyRequest {
+                master_device_id: Some("11111111-1111-4111-8111-111111111111".to_string()),
+                layout: DesktopLayout {
+                    right: Some("22222222-2222-4222-8222-222222222222".to_string()),
+                    ..DesktopLayout::default()
+                },
+            })
+            .expect("upsert topology");
+
+        assert_eq!(
+            saved.master_device_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(
+            saved.layout.right.as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        assert_eq!(saved.topology_version, 1);
+
+        let requests = server.finish();
+        assert!(requests[0].starts_with("GET /v1/topology "));
+        assert!(requests[1].starts_with("PUT /v1/topology "));
+        assert!(!requests
+            .iter()
+            .any(|request| request.to_ascii_lowercase().contains("authorization:")));
+        let upsert_body: serde_json::Value =
+            serde_json::from_str(http_body(&requests[1])).expect("topology json");
+        assert_eq!(
+            upsert_body["master_device_id"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(
+            upsert_body["layout"]["right"],
+            "22222222-2222-4222-8222-222222222222"
+        );
     }
 
     #[test]

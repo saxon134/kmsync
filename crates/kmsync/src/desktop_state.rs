@@ -51,16 +51,21 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
         last_seen_at: current_presence.map(|presence| presence.last_seen_at),
     };
 
+    let effective_role = effective_desktop_role(
+        input.current_device_id,
+        input.desktop_config.master_device_id.as_deref(),
+    );
+
     let device = DesktopDeviceState {
         id: input.current_device_id.map(str::to_string),
         name: input.device_name.to_string(),
         os: std::env::consts::OS.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
-        role: input.desktop_config.role.clone(),
+        role: effective_role,
     };
 
     let master_state = master_connection_state(
-        input.desktop_config.role.clone(),
+        input.current_device_id,
         input.desktop_config.master_device_id.as_deref(),
         input.devices,
     );
@@ -123,18 +128,25 @@ fn parse_port(port: &str) -> Option<u16> {
     port.parse::<u16>().ok().filter(|port| *port > 0)
 }
 
+fn effective_desktop_role(
+    current_device_id: Option<&str>,
+    master_device_id: Option<&str>,
+) -> DesktopRole {
+    crate::desktop_config::role_for_topology(current_device_id, master_device_id)
+}
+
 fn master_connection_state(
-    role: DesktopRole,
+    current_device_id: Option<&str>,
     master_device_id: Option<&str>,
     devices: &[DeviceWithPresence],
 ) -> DesktopConnectionState {
-    if role == DesktopRole::Master {
-        return DesktopConnectionState::SelfDevice;
-    }
-
     let Some(master_device_id) = master_device_id else {
         return DesktopConnectionState::Disconnected;
     };
+
+    if current_device_id == Some(master_device_id) {
+        return DesktopConnectionState::SelfDevice;
+    }
 
     devices
         .iter()
@@ -212,7 +224,7 @@ mod tests {
     fn desktop_state_uses_current_presence_for_public_ip_and_connecting_status() {
         let config = DesktopConfig {
             role: DesktopRole::Master,
-            master_device_id: None,
+            master_device_id: Some("current-device".to_string()),
             layout: DesktopLayout {
                 right: Some("right-device".to_string()),
                 ..DesktopLayout::default()
@@ -306,5 +318,63 @@ mod tests {
 
         assert_eq!(state.master_device_id.as_deref(), Some("master-device"));
         assert_eq!(state.master_state, DesktopConnectionState::Connecting);
+    }
+
+    #[test]
+    fn desktop_state_does_not_promote_legacy_master_role_without_master_id() {
+        let config = DesktopConfig {
+            role: DesktopRole::Master,
+            master_device_id: None,
+            layout: DesktopLayout::default(),
+            profile_path: None,
+        };
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "Client PC",
+            server_url: "http://kmsync.example.com:24888",
+            listen_port: 24_800,
+            current_device_id: Some("client-device"),
+            local_lan_ips: vec!["10.0.0.5".to_string()],
+            desktop_config: &config,
+            devices: &[],
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert_eq!(state.device.role, DesktopRole::Client);
+        assert_eq!(state.master_device_id, None);
+        assert_eq!(state.master_state, DesktopConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn desktop_state_marks_current_device_as_master_only_when_topology_points_to_it() {
+        let config = DesktopConfig {
+            role: DesktopRole::Master,
+            master_device_id: Some("current-device".to_string()),
+            layout: DesktopLayout::default(),
+            profile_path: None,
+        };
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "Master PC",
+            server_url: "http://kmsync.example.com:24888",
+            listen_port: 24_800,
+            current_device_id: Some("current-device"),
+            local_lan_ips: vec!["10.0.0.4".to_string()],
+            desktop_config: &config,
+            devices: &[],
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert_eq!(state.device.role, DesktopRole::Master);
+        assert_eq!(state.master_device_id.as_deref(), Some("current-device"));
+        assert_eq!(state.master_state, DesktopConnectionState::SelfDevice);
     }
 }

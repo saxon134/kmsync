@@ -75,6 +75,18 @@ pub(crate) fn set_layout_in_config_file(path: &Path, layout: &DesktopLayout) -> 
     local_config::write_text_atomic(path, &updated)
 }
 
+pub(crate) fn set_topology_in_config_file(
+    path: &Path,
+    role: DesktopRole,
+    master_device_id: Option<&str>,
+    layout: &DesktopLayout,
+) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let updated = set_topology_in_config_text(&text, role, master_device_id, layout)?;
+    local_config::write_text_atomic(path, &updated)
+}
+
 pub(crate) fn set_server_endpoint_in_config_file(
     path: &Path,
     host: &str,
@@ -168,6 +180,35 @@ pub(crate) fn set_layout_in_config_text(
     serialize_config_object(object)
 }
 
+pub(crate) fn set_topology_in_config_text(
+    text: &str,
+    role: DesktopRole,
+    master_device_id: Option<&str>,
+    layout: &DesktopLayout,
+) -> Result<String, String> {
+    let mut object = parse_config_object(text)?;
+    object.insert(
+        "role".to_string(),
+        serde_json::to_value(role).map_err(|error| error.to_string())?,
+    );
+    match master_device_id {
+        Some(master_device_id) => {
+            object.insert(
+                "master_device_id".to_string(),
+                Value::String(master_device_id.to_string()),
+            );
+        }
+        None => {
+            object.insert("master_device_id".to_string(), Value::Null);
+        }
+    }
+    object.insert(
+        "layout".to_string(),
+        serde_json::to_value(layout).map_err(|error| error.to_string())?,
+    );
+    serialize_config_object(object)
+}
+
 pub(crate) fn set_server_endpoint_in_config_text(
     text: &str,
     host: &str,
@@ -222,6 +263,20 @@ fn server_url_scheme(server_url: &str) -> Option<&str> {
         Some(scheme)
     } else {
         None
+    }
+}
+
+pub(crate) fn role_for_topology(
+    current_device_id: Option<&str>,
+    master_device_id: Option<&str>,
+) -> DesktopRole {
+    match (current_device_id, master_device_id) {
+        (Some(current_device_id), Some(master_device_id))
+            if current_device_id == master_device_id =>
+        {
+            DesktopRole::Master
+        }
+        _ => DesktopRole::Client,
     }
 }
 
@@ -315,6 +370,37 @@ mod tests {
         assert_eq!(json["layout"]["left"], "left-device");
         assert_eq!(json["layout"]["bottom"], "bottom-device");
         assert!(json["layout"].get("right").is_none());
+    }
+
+    #[test]
+    fn applying_topology_updates_role_master_id_and_layout_cache() {
+        let updated = set_topology_in_config_text(
+            r#"{
+                "server_url": "http://127.0.0.1:24888",
+                "device_name": "Development Mac",
+                "listen_port": 24800,
+                "heartbeat_interval_seconds": 15,
+                "role": "master",
+                "master_device_id": null,
+                "layout": {
+                    "left": "old-left"
+                }
+            }"#,
+            DesktopRole::Client,
+            Some("master-device"),
+            &DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..DesktopLayout::default()
+            },
+        )
+        .expect("set topology");
+        let json: serde_json::Value = serde_json::from_str(&updated).expect("valid json");
+
+        assert_eq!(json["server_url"], "http://127.0.0.1:24888");
+        assert_eq!(json["role"], "client");
+        assert_eq!(json["master_device_id"], "master-device");
+        assert!(json["layout"].get("left").is_none());
+        assert_eq!(json["layout"]["right"], "right-device");
     }
 
     #[test]

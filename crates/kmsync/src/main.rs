@@ -383,7 +383,7 @@ fn desktop_launch_mode(output_path: Option<&Path>) -> DesktopLaunchMode {
 fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopState, String> {
     ensure_daemon_config_file(config_path)?;
     let client_config = client::ClientConfig::load(config_path)?;
-    let desktop_config = desktop_config::DesktopConfig::load(config_path).unwrap_or_default();
+    let mut desktop_config = desktop_config::DesktopConfig::load(config_path).unwrap_or_default();
     let (server_state, mut server_error) = desktop_server_probe_result_to_state(
         client::probe_server_reachable(&client_config.server_url),
     );
@@ -399,6 +399,19 @@ fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopS
             Ok(inventory) => {
                 current_device_id = Some(inventory.current_device_id);
                 devices = inventory.devices;
+                match load_and_cache_server_topology(
+                    config_path,
+                    &client_config,
+                    current_device_id.as_deref(),
+                    desktop_config.profile_path.clone(),
+                ) {
+                    Ok(config) => {
+                        desktop_config = config;
+                    }
+                    Err(error) => {
+                        master_error = Some(format!("拓扑刷新失败：{error}"));
+                    }
+                }
             }
             Err(error) => {
                 master_error = Some(format!("设备列表刷新失败：{error}"));
@@ -424,6 +437,29 @@ fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopS
             master_error,
         },
     ))
+}
+
+fn load_and_cache_server_topology(
+    config_path: &Path,
+    client_config: &client::ClientConfig,
+    current_device_id: Option<&str>,
+    profile_path: Option<PathBuf>,
+) -> Result<desktop_config::DesktopConfig, String> {
+    let topology = client::ControlClient::new(client_config.server_url.clone()).get_topology()?;
+    let role =
+        desktop_config::role_for_topology(current_device_id, topology.master_device_id.as_deref());
+    desktop_config::set_topology_in_config_file(
+        config_path,
+        role.clone(),
+        topology.master_device_id.as_deref(),
+        &topology.layout,
+    )?;
+    Ok(desktop_config::DesktopConfig {
+        role,
+        master_device_id: topology.master_device_id,
+        layout: topology.layout,
+        profile_path,
+    })
 }
 
 fn desktop_server_probe_result_to_state(
@@ -658,10 +694,284 @@ impl CoreServicePlan {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DesktopCapturePlan {
+    targets: Vec<DesktopCaptureTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesktopCaptureTarget {
+    edge: Edge,
+    target_device_id: String,
+    profile_name: ProfileName,
+}
+
+struct DesktopCaptureRouteResult {
+    target_device_id: Option<String>,
+    profile_name: Option<ProfileName>,
+    route: RouteResult,
+}
+
+struct DesktopCaptureRouter {
+    plan: DesktopCapturePlan,
+    display_layout: DisplayLayout,
+    active: Option<DesktopCaptureTarget>,
+    cooldown_until: Option<Instant>,
+    local_restore_position: Option<PointerPosition>,
+}
+
+impl DesktopCaptureRouter {
+    fn with_display_layout(plan: DesktopCapturePlan, display_layout: DisplayLayout) -> Self {
+        Self {
+            plan,
+            display_layout,
+            active: None,
+            cooldown_until: None,
+            local_restore_position: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn route(&mut self, captured: CapturedInput) -> DesktopCaptureRouteResult {
+        self.route_at(captured, Instant::now())
+    }
+
+    #[cfg(test)]
+    fn route_at(&mut self, captured: CapturedInput, now: Instant) -> DesktopCaptureRouteResult {
+        self.route_at_with_application(captured, None, now)
+    }
+
+    fn route_at_with_application(
+        &mut self,
+        captured: CapturedInput,
+        application_id: Option<&str>,
+        now: Instant,
+    ) -> DesktopCaptureRouteResult {
+        if is_system_reserved_shortcut(captured.event)
+            || ApplicationExceptionRules::default().matches(application_id)
+        {
+            return DesktopCaptureRouteResult::local(CaptureDecision::Continue);
+        }
+
+        if self.is_release_hotkey(captured, Hotkey::default_release()) {
+            let local_pointer_action =
+                self.active
+                    .is_some()
+                    .then_some(LocalPointerAction::Restore {
+                        position: self.local_restore_position,
+                    });
+            self.active = None;
+            self.local_restore_position = None;
+            self.cooldown_until = cooldown_deadline(now, default_edge_cooldown());
+            return DesktopCaptureRouteResult::local(CaptureDecision::Continue)
+                .with_pointer_action(local_pointer_action);
+        }
+
+        let mut entry_position = None;
+        let mut local_pointer_action = None;
+        if self.active.is_none() && !self.cooldown_active(now) {
+            if let Some(target) = self
+                .plan
+                .targets
+                .iter()
+                .find(|target| self.at_edge(captured.pointer, target.edge))
+                .cloned()
+            {
+                self.local_restore_position = captured.pointer;
+                entry_position = self.entry_position(captured.pointer, target.edge);
+                local_pointer_action = Some(LocalPointerAction::Hide);
+                self.active = Some(target);
+            }
+        }
+
+        if let Some(active) = self.active.clone() {
+            DesktopCaptureRouteResult::remote(
+                active,
+                CaptureDecision::Suppress,
+                entry_position,
+                local_pointer_action,
+            )
+        } else {
+            DesktopCaptureRouteResult::local(CaptureDecision::Continue)
+        }
+    }
+
+    fn cooldown_active(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.cooldown_until else {
+            return false;
+        };
+        if now < deadline {
+            true
+        } else {
+            self.cooldown_until = None;
+            false
+        }
+    }
+
+    fn at_edge(&self, pointer: Option<PointerPosition>, edge: Edge) -> bool {
+        let (Some(pointer), Some(bounds)) = (pointer, self.display_layout.virtual_bounds()) else {
+            return false;
+        };
+        let threshold = 8.0;
+        match edge {
+            Edge::Left => pointer.x <= bounds.x + threshold,
+            Edge::Right => pointer.x >= bounds.x + bounds.width - threshold,
+            Edge::Top => pointer.y <= bounds.y + threshold,
+            Edge::Bottom => pointer.y >= bounds.y + bounds.height - threshold,
+            Edge::TopLeft => pointer.x <= bounds.x + threshold && pointer.y <= bounds.y + threshold,
+            Edge::TopRight => {
+                pointer.x >= bounds.x + bounds.width - threshold
+                    && pointer.y <= bounds.y + threshold
+            }
+            Edge::BottomLeft => {
+                pointer.x <= bounds.x + threshold
+                    && pointer.y >= bounds.y + bounds.height - threshold
+            }
+            Edge::BottomRight => {
+                pointer.x >= bounds.x + bounds.width - threshold
+                    && pointer.y >= bounds.y + bounds.height - threshold
+            }
+        }
+    }
+
+    fn entry_position(
+        &self,
+        pointer: Option<PointerPosition>,
+        edge: Edge,
+    ) -> Option<PointerEntryPosition> {
+        let (Some(pointer), Some(bounds)) = (pointer, self.display_layout.virtual_bounds()) else {
+            return None;
+        };
+        if bounds.width <= 0.0 || bounds.height <= 0.0 {
+            return None;
+        }
+        let x_ratio = ((pointer.x - bounds.x) / bounds.width).clamp(0.0, 1.0) as f32;
+        let y_ratio = ((pointer.y - bounds.y) / bounds.height).clamp(0.0, 1.0) as f32;
+        Some(match edge {
+            Edge::Left => PointerEntryPosition {
+                x_ratio: 1.0,
+                y_ratio,
+            },
+            Edge::Right => PointerEntryPosition {
+                x_ratio: 0.0,
+                y_ratio,
+            },
+            Edge::Top => PointerEntryPosition {
+                x_ratio,
+                y_ratio: 1.0,
+            },
+            Edge::Bottom => PointerEntryPosition {
+                x_ratio,
+                y_ratio: 0.0,
+            },
+            Edge::TopLeft => PointerEntryPosition {
+                x_ratio: 1.0,
+                y_ratio: 1.0,
+            },
+            Edge::TopRight => PointerEntryPosition {
+                x_ratio: 0.0,
+                y_ratio: 1.0,
+            },
+            Edge::BottomLeft => PointerEntryPosition {
+                x_ratio: 1.0,
+                y_ratio: 0.0,
+            },
+            Edge::BottomRight => PointerEntryPosition {
+                x_ratio: 0.0,
+                y_ratio: 0.0,
+            },
+        })
+    }
+
+    fn is_release_hotkey(&self, captured: CapturedInput, release_hotkey: Hotkey) -> bool {
+        let InputEvent::Key(event) = captured.event else {
+            return false;
+        };
+        release_hotkey.matches(event)
+    }
+}
+
+impl DesktopCaptureRouteResult {
+    const fn local(decision: CaptureDecision) -> Self {
+        Self {
+            target_device_id: None,
+            profile_name: None,
+            route: RouteResult::local(decision),
+        }
+    }
+
+    fn remote(
+        target: DesktopCaptureTarget,
+        decision: CaptureDecision,
+        entry_position: Option<PointerEntryPosition>,
+        local_pointer_action: Option<LocalPointerAction>,
+    ) -> Self {
+        Self {
+            target_device_id: Some(target.target_device_id),
+            profile_name: Some(target.profile_name),
+            route: RouteResult::remote_with_entry_and_pointer_action(
+                decision,
+                entry_position,
+                local_pointer_action,
+            ),
+        }
+    }
+
+    const fn with_pointer_action(mut self, action: Option<LocalPointerAction>) -> Self {
+        self.route = self.route.with_pointer_action(action);
+        self
+    }
+}
+
+fn desktop_capture_plan_from_state(state: &kmsync_core::DesktopState) -> DesktopCapturePlan {
+    if state.device.role != kmsync_core::DesktopRole::Master {
+        return DesktopCapturePlan::default();
+    }
+
+    let mut targets = Vec::new();
+    for (edge, target_device_id) in desktop_layout_edge_targets(&state.layout) {
+        let Some(peer) = state
+            .devices
+            .iter()
+            .find(|device| device.id == target_device_id && device.online)
+        else {
+            continue;
+        };
+        targets.push(DesktopCaptureTarget {
+            edge,
+            target_device_id: target_device_id.to_string(),
+            profile_name: profile_name_for_desktop_pair(&state.device.os, &peer.os),
+        });
+    }
+    DesktopCapturePlan { targets }
+}
+
+fn desktop_layout_edge_targets(layout: &kmsync_core::DesktopLayout) -> Vec<(Edge, &str)> {
+    [
+        (Edge::Left, layout.left.as_deref()),
+        (Edge::Right, layout.right.as_deref()),
+        (Edge::Top, layout.top.as_deref()),
+        (Edge::Bottom, layout.bottom.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(edge, device_id)| device_id.map(|device_id| (edge, device_id)))
+    .collect()
+}
+
+fn profile_name_for_desktop_pair(source_os: &str, target_os: &str) -> ProfileName {
+    match (source_os, target_os) {
+        ("macos", "windows" | "linux") => ProfileName::MacToWindows,
+        ("windows" | "linux", "macos") => ProfileName::WindowsToMac,
+        ("macos", _) => ProfileName::MacToWindows,
+        _ => ProfileName::WindowsToMac,
+    }
+}
+
 enum CoreServiceThreadResult {
     DataPlane(Result<(), String>),
     Heartbeat(Result<(), String>),
     LocalIpc(Result<(), String>),
+    DesktopCapture(Result<(), String>),
 }
 
 impl CoreServiceThreadResult {
@@ -670,12 +980,16 @@ impl CoreServiceThreadResult {
             Self::DataPlane(_) => "data_plane",
             Self::Heartbeat(_) => "heartbeat",
             Self::LocalIpc(_) => "local_ipc",
+            Self::DesktopCapture(_) => "desktop_capture",
         }
     }
 
     fn into_result(self) -> Result<(), String> {
         match self {
-            Self::DataPlane(result) | Self::Heartbeat(result) | Self::LocalIpc(result) => result,
+            Self::DataPlane(result)
+            | Self::Heartbeat(result)
+            | Self::LocalIpc(result)
+            | Self::DesktopCapture(result) => result,
         }
     }
 }
@@ -695,11 +1009,19 @@ fn core_service_action_for_worker_result(
             eprintln!("core service heartbeat stopped unexpectedly; retrying");
             CoreServiceWorkerAction::Continue
         }
+        Ok(()) if component == "desktop_capture" => {
+            eprintln!("core service desktop capture stopped unexpectedly; retrying");
+            CoreServiceWorkerAction::Continue
+        }
         Ok(()) => CoreServiceWorkerAction::Stop(Err(format!(
             "core service {component} stopped unexpectedly"
         ))),
         Err(error) if component == "heartbeat" => {
             eprintln!("core service heartbeat failed: {error}; retrying");
+            CoreServiceWorkerAction::Continue
+        }
+        Err(error) if component == "desktop_capture" => {
+            eprintln!("core service desktop capture failed: {error}; retrying");
             CoreServiceWorkerAction::Continue
         }
         Err(error) => {
@@ -740,13 +1062,61 @@ fn run_core_service(config_path: &Path) -> Result<(), String> {
 
     let ipc_endpoint = plan.ipc_endpoint.clone();
     let ipc_config_path = plan.config_path.clone();
+    let ipc_result_tx = result_tx.clone();
     thread::spawn(move || {
-        let _ = result_tx.send(CoreServiceThreadResult::LocalIpc(
+        let _ = ipc_result_tx.send(CoreServiceThreadResult::LocalIpc(
             run_local_ipc_serve_forever(&ipc_endpoint, &ipc_config_path),
         ));
     });
 
+    let capture_config_path = plan.config_path.clone();
+    let capture_result_tx = result_tx.clone();
+    thread::spawn(move || loop {
+        let result = run_desktop_capture_supervisor(&capture_config_path);
+        let _ = capture_result_tx.send(CoreServiceThreadResult::DesktopCapture(result));
+        thread::sleep(Duration::from_secs(2));
+    });
+
     wait_core_service_results(result_rx)
+}
+
+fn run_desktop_capture_supervisor(config_path: &Path) -> Result<(), String> {
+    loop {
+        let state = build_local_desktop_state(config_path)?;
+        let plan = desktop_capture_plan_from_state(&state);
+        if plan.targets.is_empty() {
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        return run_desktop_capture_plan(config_path, plan);
+    }
+}
+
+fn run_desktop_capture_plan(config_path: &Path, plan: DesktopCapturePlan) -> Result<(), String> {
+    let mut platform = platform::current_platform();
+    let display_layout = platform.display_layout();
+    let mut router = DesktopCaptureRouter::with_display_layout(plan, display_layout);
+    let (tx, rx) = sync_channel(1024);
+    let queue_stats = CaptureQueueStats::default();
+    let local_pointer_hidden = Arc::new(AtomicBool::new(false));
+    let tx_queue_stats = queue_stats.clone();
+    let tx_config_path = config_path.to_path_buf();
+    thread::spawn(move || {
+        transmit_desktop_capture_events(rx, tx_config_path, tx_queue_stats);
+    });
+
+    let capture_local_pointer_hidden = Arc::clone(&local_pointer_hidden);
+    let capture_result = platform.capture_loop(move |captured| {
+        let route = router.route_at_with_application(captured, None, Instant::now());
+        enqueue_desktop_capture(&tx, &queue_stats, &route, captured);
+        apply_local_pointer_action(
+            route.route.local_pointer_action,
+            &capture_local_pointer_hidden,
+        );
+        route.route.decision
+    });
+    restore_local_pointer_if_hidden(&local_pointer_hidden, None);
+    capture_result
 }
 
 fn run_windows_service(config_path: &Path) -> Result<(), String> {
@@ -2380,6 +2750,25 @@ impl QueuedInputEvent {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TargetedQueuedInputEvent {
+    target_device_id: String,
+    profile_name: ProfileName,
+    event: InputEvent,
+    captured_at: Instant,
+}
+
+impl TargetedQueuedInputEvent {
+    fn new(target_device_id: String, profile_name: ProfileName, event: InputEvent) -> Self {
+        Self {
+            target_device_id,
+            profile_name,
+            event,
+            captured_at: Instant::now(),
+        }
+    }
+}
+
 #[cfg(test)]
 fn enqueue_routed_capture(
     tx: &SyncSender<QueuedInputEvent>,
@@ -2414,6 +2803,41 @@ fn enqueue_routed_capture_with_application(
     route
 }
 
+fn enqueue_desktop_capture(
+    tx: &SyncSender<TargetedQueuedInputEvent>,
+    stats: &CaptureQueueStats,
+    route: &DesktopCaptureRouteResult,
+    captured: CapturedInput,
+) {
+    if !route.route.send_remote {
+        return;
+    }
+    let (Some(target_device_id), Some(profile_name)) =
+        (route.target_device_id.as_ref(), route.profile_name)
+    else {
+        return;
+    };
+    if let Some(entry_position) = route.route.entry_position {
+        enqueue_targeted_input_event(
+            tx,
+            stats,
+            target_device_id.clone(),
+            profile_name,
+            InputEvent::Mouse(kmsync_core::MouseEvent::Position {
+                x_ratio: entry_position.x_ratio,
+                y_ratio: entry_position.y_ratio,
+            }),
+        );
+    }
+    enqueue_targeted_input_event(
+        tx,
+        stats,
+        target_device_id.clone(),
+        profile_name,
+        captured.event,
+    );
+}
+
 fn enqueue_input_event(
     tx: &SyncSender<QueuedInputEvent>,
     stats: &CaptureQueueStats,
@@ -2445,6 +2869,31 @@ fn enqueue_input_event(
     }
 }
 
+fn enqueue_targeted_input_event(
+    tx: &SyncSender<TargetedQueuedInputEvent>,
+    stats: &CaptureQueueStats,
+    target_device_id: String,
+    profile_name: ProfileName,
+    event: InputEvent,
+) {
+    stats.record_enqueue_reserved();
+    match tx.try_send(TargetedQueuedInputEvent::new(
+        target_device_id,
+        profile_name,
+        event,
+    )) {
+        Ok(()) => stats.record_enqueue_committed(),
+        Err(TrySendError::Full(_)) => {
+            stats.record_enqueue_canceled();
+            stats.record_dropped_full();
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            stats.record_enqueue_canceled();
+            stats.record_dropped_disconnected();
+        }
+    }
+}
+
 fn transmit_captured_events(
     rx: Receiver<QueuedInputEvent>,
     sender: &mut impl ProtocolEventSender,
@@ -2464,6 +2913,69 @@ fn transmit_captured_events(
         sequence = sequence.saturating_add(1);
     }
     Ok(())
+}
+
+struct DesktopTargetSender {
+    sender: QuicEventSender,
+    compiled: CompiledProfile,
+    sequence: u64,
+}
+
+fn transmit_desktop_capture_events(
+    rx: Receiver<TargetedQueuedInputEvent>,
+    config_path: PathBuf,
+    stats: CaptureQueueStats,
+) {
+    let mut senders = BTreeMap::new();
+    for queued in rx {
+        stats.record_capture_to_send_latency(queued.captured_at.elapsed());
+        if let Err(error) = transmit_desktop_capture_event(&config_path, &mut senders, queued) {
+            eprintln!("desktop capture transmit failed: {error}");
+        }
+    }
+}
+
+fn transmit_desktop_capture_event(
+    config_path: &Path,
+    senders: &mut BTreeMap<String, DesktopTargetSender>,
+    queued: TargetedQueuedInputEvent,
+) -> Result<(), String> {
+    if !senders.contains_key(&queued.target_device_id) {
+        let config = client::ClientConfig::load(config_path)?;
+        let connection =
+            client::resolve_target_direct_lan_connection(config, &queued.target_device_id)?;
+        let profile = queued.profile_name.profile();
+        let compiled = CompiledProfile::compile(&profile).map_err(|error| format!("{error:?}"))?;
+        senders.insert(
+            queued.target_device_id.clone(),
+            DesktopTargetSender {
+                sender: QuicEventSender::connect(connection.address)?,
+                compiled,
+                sequence: 1,
+            },
+        );
+    }
+
+    let target_id = queued.target_device_id.clone();
+    let target = senders
+        .get_mut(&queued.target_device_id)
+        .ok_or_else(|| "desktop capture sender missing after connect".to_string())?;
+    let mapped = target.compiled.transform(queued.event);
+    let result = target.sender.send(ProtocolEvent {
+        sequence: target.sequence,
+        timestamp_micros: now_micros()?,
+        event: mapped,
+    });
+    match result {
+        Ok(()) => {
+            target.sequence = target.sequence.saturating_add(1);
+            Ok(())
+        }
+        Err(error) => {
+            senders.remove(&target_id);
+            Err(error)
+        }
+    }
 }
 
 fn next_transmit_event(
@@ -2718,7 +3230,7 @@ fn now_micros() -> Result<u64, String> {
     u64::try_from(duration.as_micros()).map_err(|_| "timestamp overflow".to_string())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProfileName {
     MacToWindows,
     WindowsToMac,
@@ -3589,7 +4101,7 @@ fn parse_hotkey_key(value: &str) -> Option<Key> {
     Key::from_name(value)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Edge {
     Left,
     Right,
@@ -4743,6 +5255,114 @@ mod tests {
         assert_eq!(plan.ipc_endpoint, local_ipc::default_local_ipc_endpoint());
         assert_eq!(plan.input_hot_path, "daemon_data_plane");
         assert_eq!(plan.control_plane, "local_ipc_and_heartbeat");
+    }
+
+    #[test]
+    fn desktop_capture_plan_routes_master_layout_edges_to_online_peers() {
+        let state = kmsync_core::DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                id: Some("master-device".to_string()),
+                name: "Master".to_string(),
+                os: "windows".to_string(),
+                app_version: "0.1.0".to_string(),
+                role: kmsync_core::DesktopRole::Master,
+            },
+            layout: kmsync_core::DesktopLayout {
+                left: Some("offline-device".to_string()),
+                right: Some("right-device".to_string()),
+                top: None,
+                bottom: None,
+            },
+            devices: vec![
+                kmsync_core::DesktopPeerState {
+                    id: "right-device".to_string(),
+                    name: "Right".to_string(),
+                    os: "macos".to_string(),
+                    online: true,
+                    lan_ips: vec!["192.168.1.20".to_string()],
+                    public_ip: None,
+                    listen_port: Some(24_800),
+                    last_seen_at: Some(123),
+                },
+                kmsync_core::DesktopPeerState {
+                    id: "offline-device".to_string(),
+                    name: "Offline".to_string(),
+                    os: "linux".to_string(),
+                    online: false,
+                    lan_ips: vec!["192.168.1.21".to_string()],
+                    public_ip: None,
+                    listen_port: Some(24_800),
+                    last_seen_at: Some(100),
+                },
+            ],
+            ..kmsync_core::DesktopState::default()
+        };
+
+        let plan = desktop_capture_plan_from_state(&state);
+
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].edge, Edge::Right);
+        assert_eq!(plan.targets[0].target_device_id, "right-device");
+        assert_eq!(plan.targets[0].profile_name, ProfileName::WindowsToMac);
+    }
+
+    #[test]
+    fn desktop_capture_plan_is_empty_for_unconfigured_clients() {
+        let state = kmsync_core::DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                id: Some("client-device".to_string()),
+                name: "Client".to_string(),
+                os: "windows".to_string(),
+                app_version: "0.1.0".to_string(),
+                role: kmsync_core::DesktopRole::Client,
+            },
+            layout: kmsync_core::DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..kmsync_core::DesktopLayout::default()
+            },
+            ..kmsync_core::DesktopState::default()
+        };
+
+        assert!(desktop_capture_plan_from_state(&state).targets.is_empty());
+    }
+
+    #[test]
+    fn desktop_capture_router_routes_each_configured_edge_to_its_target() {
+        let plan = DesktopCapturePlan {
+            targets: vec![
+                DesktopCaptureTarget {
+                    edge: Edge::Left,
+                    target_device_id: "left-device".to_string(),
+                    profile_name: ProfileName::WindowsToMac,
+                },
+                DesktopCaptureTarget {
+                    edge: Edge::Right,
+                    target_device_id: "right-device".to_string(),
+                    profile_name: ProfileName::WindowsToMac,
+                },
+            ],
+        };
+        let mut router = DesktopCaptureRouter::with_display_layout(
+            plan,
+            DisplayLayout::from_primary(Some(BOUNDS)),
+        );
+
+        let left = router.route(captured_move(0.0, 50.0));
+        assert_eq!(left.target_device_id.as_deref(), Some("left-device"));
+        assert_eq!(left.route.decision, CaptureDecision::Suppress);
+
+        let release = router.route(captured_key(
+            Key::Escape,
+            Modifiers::CONTROL.with(Modifiers::ALT),
+        ));
+        assert_eq!(release.route.decision, CaptureDecision::Continue);
+
+        let right = router.route_at(
+            captured_move(110.0, 50.0),
+            Instant::now() + Duration::from_millis(300),
+        );
+        assert_eq!(right.target_device_id.as_deref(), Some("right-device"));
+        assert_eq!(right.route.decision, CaptureDecision::Suppress);
     }
 
     #[test]

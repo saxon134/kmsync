@@ -276,20 +276,21 @@ impl NativeDesktopApp {
             DesktopRole::Client
         };
         let master_device_id = if self.is_master {
-            None
+            self.state.device.id.clone()
         } else {
-            self.state.master_device_id.as_deref()
+            self.state.master_device_id.clone()
         };
         match crate::desktop_config::set_current_device_config_in_config_file(
             &self.config_path,
             &device_name,
             role,
-            master_device_id,
+            master_device_id.as_deref(),
         ) {
             Ok(()) => {
-                match crate::client::ClientConfig::load(&self.config_path)
-                    .and_then(|config| crate::client::sync_current_device_name(&config))
-                {
+                match crate::client::ClientConfig::load(&self.config_path).and_then(|config| {
+                    crate::client::sync_current_device_name(&config)?;
+                    self.sync_topology_to_server(master_device_id.clone())
+                }) {
                     Ok(_) => {
                         self.reload_state("当前电脑配置已保存并同步");
                     }
@@ -307,18 +308,47 @@ impl NativeDesktopApp {
     }
 
     fn save_layout(&mut self) {
-        if let Err(error) = self.layout.validate(None) {
+        if let Err(error) = self.layout.validate(self.state.device.id.as_deref()) {
             self.status_message = format!("设备位置无效：{error:?}");
             return;
         }
-        match crate::desktop_config::set_layout_in_config_file(&self.config_path, &self.layout) {
-            Ok(()) => {
-                self.reload_state("设备位置已保存");
-            }
+        let master_device_id = if self.is_master {
+            self.state.device.id.clone()
+        } else {
+            self.state.master_device_id.clone()
+        };
+        match crate::desktop_config::set_topology_in_config_file(
+            &self.config_path,
+            if self.is_master {
+                DesktopRole::Master
+            } else {
+                DesktopRole::Client
+            },
+            master_device_id.as_deref(),
+            &self.layout,
+        ) {
+            Ok(()) => match self.sync_topology_to_server(master_device_id) {
+                Ok(()) => self.reload_state("设备位置已保存并同步"),
+                Err(error) => {
+                    self.reload_state("设备位置已保存");
+                    self.status_message = format!("设备位置已保存，同步失败：{error}");
+                }
+            },
             Err(error) => {
                 self.status_message = format!("设备位置保存失败：{error}");
             }
         }
+    }
+
+    fn sync_topology_to_server(&self, master_device_id: Option<String>) -> Result<(), String> {
+        let config = crate::client::ClientConfig::load(&self.config_path)?;
+        let client = crate::client::ControlClient::new(config.server_url);
+        client
+            .upsert_topology(&crate::client::UpsertTopologyRequest {
+                master_device_id,
+                layout: self.layout.clone(),
+            })
+            .map(|_| ())
     }
 
     fn server_url_preview(&self) -> String {
@@ -344,9 +374,11 @@ impl eframe::App for NativeDesktopApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("KMSync");
             ui.horizontal_wrapped(|ui| {
-                connection_state_status(ui, "服务器", &self.state.server_state);
-                ui.separator();
-                connection_state_status(ui, "主电脑", &self.state.master_state);
+                connection_state_status(
+                    ui,
+                    native_top_status_labels()[0],
+                    &self.state.server_state,
+                );
                 ui.separator();
                 ui.label(format!("状态：{}", self.status_message));
             });
@@ -408,6 +440,7 @@ impl NativeDesktopApp {
             self.state.device.id.as_deref().unwrap_or("-")
         ));
         ui.label(format!("系统：{}", self.state.device.os));
+        ui.label(native_master_assignment_text(&self.state));
         ui.separator();
         ui.label(format!(
             "{}：{}",
@@ -446,16 +479,36 @@ impl NativeDesktopApp {
         let devices = native_layout_device_options(&self.state);
         let center_device_name = native_layout_center_device_name(&self.state, &self.device_name);
         let combo_width = native_layout_combo_width(ui.available_width());
+        let top_status = native_layout_slot_status_text(&self.state, self.layout.top.as_deref());
+        let left_status = native_layout_slot_status_text(&self.state, self.layout.left.as_deref());
+        let right_status =
+            native_layout_slot_status_text(&self.state, self.layout.right.as_deref());
+        let bottom_status =
+            native_layout_slot_status_text(&self.state, self.layout.bottom.as_deref());
         egui::Grid::new("native_layout_grid")
             .num_columns(3)
             .spacing([native_layout_grid_horizontal_spacing(), 10.0])
             .min_col_width(combo_width)
             .show(ui, |ui| {
                 ui.label("");
-                device_combo(ui, "上方电脑", &mut self.layout.top, &devices, combo_width);
+                device_combo(
+                    ui,
+                    "上方电脑",
+                    &mut self.layout.top,
+                    &devices,
+                    combo_width,
+                    &top_status,
+                );
                 ui.label("");
                 ui.end_row();
-                device_combo(ui, "左边电脑", &mut self.layout.left, &devices, combo_width);
+                device_combo(
+                    ui,
+                    "左边电脑",
+                    &mut self.layout.left,
+                    &devices,
+                    combo_width,
+                    &left_status,
+                );
                 master_device_cell(ui, &center_device_name, self.is_master, combo_width);
                 device_combo(
                     ui,
@@ -463,6 +516,7 @@ impl NativeDesktopApp {
                     &mut self.layout.right,
                     &devices,
                     combo_width,
+                    &right_status,
                 );
                 ui.end_row();
                 ui.label("");
@@ -472,6 +526,7 @@ impl NativeDesktopApp {
                     &mut self.layout.bottom,
                     &devices,
                     combo_width,
+                    &bottom_status,
                 );
                 ui.label("");
                 ui.end_row();
@@ -560,6 +615,7 @@ fn device_combo(
     selected: &mut Option<String>,
     devices: &[(String, String)],
     width: f32,
+    status_text: &str,
 ) {
     let selected_text = selected
         .as_deref()
@@ -571,7 +627,7 @@ fn device_combo(
         })
         .unwrap_or("未配置");
     ui.allocate_ui_with_layout(
-        egui::vec2(width, 58.0),
+        egui::vec2(width, 76.0),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
             ui.set_width(width);
@@ -585,6 +641,7 @@ fn device_combo(
                         ui.selectable_value(selected, Some(id.clone()), name);
                     }
                 });
+            ui.label(status_text);
         },
     );
 }
@@ -605,6 +662,48 @@ fn native_layout_center_device_name(state: &DesktopState, edited_device_name: &s
         state.device.name.clone()
     } else {
         edited_device_name.to_string()
+    }
+}
+
+fn native_master_assignment_text(state: &DesktopState) -> String {
+    let Some(master_device_id) = state.master_device_id.as_deref() else {
+        return "当前未配置主电脑".to_string();
+    };
+    if state.device.id.as_deref() == Some(master_device_id) {
+        return "当前电脑是主电脑".to_string();
+    }
+    match state
+        .devices
+        .iter()
+        .find(|device| device.id == master_device_id)
+    {
+        Some(device) => format!(
+            "主电脑：{}（{}）",
+            device.name,
+            if device.online { "在线" } else { "离线" }
+        ),
+        None => format!("主电脑：{master_device_id}（未知）"),
+    }
+}
+
+fn native_layout_slot_status_text(
+    state: &DesktopState,
+    selected_device_id: Option<&str>,
+) -> String {
+    let Some(selected_device_id) = selected_device_id else {
+        return "未配置".to_string();
+    };
+    match state
+        .devices
+        .iter()
+        .find(|device| device.id == selected_device_id)
+    {
+        Some(device) => format!(
+            "{}：{}",
+            device.name,
+            if device.online { "在线" } else { "离线" }
+        ),
+        None => format!("{selected_device_id}：未知"),
     }
 }
 
@@ -817,6 +916,10 @@ fn native_current_device_fact_labels() -> [&'static str; 3] {
     ["内网 IP", "监听端口", "最近心跳"]
 }
 
+fn native_top_status_labels() -> [&'static str; 1] {
+    ["服务器"]
+}
+
 fn connection_state_status(ui: &mut egui::Ui, label: &str, state: &DesktopConnectionState) {
     ui.horizontal(|ui| {
         ui.label(format!("{label}："));
@@ -987,6 +1090,80 @@ mod tests {
             native_current_device_fact_labels(),
             ["内网 IP", "监听端口", "最近心跳"]
         );
+    }
+
+    #[test]
+    fn native_top_status_labels_exclude_master_connection_status() {
+        assert_eq!(native_top_status_labels(), ["服务器"]);
+    }
+
+    #[test]
+    fn native_master_assignment_text_distinguishes_unconfigured_and_offline_master() {
+        let unconfigured = DesktopState {
+            device: DesktopDeviceState {
+                id: Some("client".to_string()),
+                name: "Client PC".to_string(),
+                os: "windows".to_string(),
+                app_version: "0.1.0".to_string(),
+                role: DesktopRole::Client,
+            },
+            master_device_id: None,
+            ..DesktopState::default()
+        };
+        assert_eq!(
+            native_master_assignment_text(&unconfigured),
+            "当前未配置主电脑"
+        );
+
+        let offline = DesktopState {
+            device: DesktopDeviceState {
+                id: Some("client".to_string()),
+                name: "Client PC".to_string(),
+                os: "windows".to_string(),
+                app_version: "0.1.0".to_string(),
+                role: DesktopRole::Client,
+            },
+            master_device_id: Some("master".to_string()),
+            devices: vec![DesktopPeerState {
+                id: "master".to_string(),
+                name: "Master PC".to_string(),
+                os: "macos".to_string(),
+                online: false,
+                lan_ips: vec![],
+                public_ip: None,
+                listen_port: None,
+                last_seen_at: None,
+            }],
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_master_assignment_text(&offline),
+            "主电脑：Master PC（离线）"
+        );
+    }
+
+    #[test]
+    fn native_layout_slot_status_reports_configured_peer_presence() {
+        let state = DesktopState {
+            devices: vec![DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                os: "windows".to_string(),
+                online: true,
+                lan_ips: vec![],
+                public_ip: None,
+                listen_port: None,
+                last_seen_at: None,
+            }],
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_slot_status_text(&state, Some("right-device")),
+            "Right PC：在线"
+        );
+        assert_eq!(native_layout_slot_status_text(&state, None), "未配置");
     }
 
     #[test]
