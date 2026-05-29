@@ -1,4 +1,8 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod client;
+mod desktop_config;
+mod desktop_state;
 #[allow(dead_code)]
 mod local_config;
 mod platform;
@@ -9,6 +13,7 @@ mod windows_service;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -113,7 +118,7 @@ impl From<&str> for DaemonError {
 const PERMISSION_NEXT_STEPS: &[&str] = &[
     "Grant Accessibility permission to KMSync so it can inject input.",
     "Grant Input Monitoring permission so KMSync can capture keyboard and mouse events.",
-    "Restart kmsync-daemon after changing macOS privacy permissions.",
+    "Restart kmsync after changing macOS privacy permissions.",
 ];
 
 const CONNECTION_NEXT_STEPS: &[&str] = &[
@@ -130,7 +135,7 @@ const INJECTION_NEXT_STEPS: &[&str] = &[
 
 const UNKNOWN_NEXT_STEPS: &[&str] = &[
     "Review the error details above and rerun the command with the same arguments.",
-    "Run `kmsync-daemon info` to inspect platform capabilities and permission hints.",
+    "Run `kmsync info` to inspect platform capabilities and permission hints.",
 ];
 
 fn diagnostic_for_error(error: &str) -> UserDiagnostic {
@@ -217,7 +222,7 @@ const fn diagnostic_for_kind(kind: DiagnosticKind) -> UserDiagnostic {
 
 fn format_user_diagnostic(error: &DaemonError) -> String {
     let diagnostic = error.diagnostic();
-    let mut output = format!("kmsync-daemon: {}\n", diagnostic.title);
+    let mut output = format!("kmsync: {}\n", diagnostic.title);
     let _ = writeln!(output, "  details: {error}");
     output.push_str("  next steps:");
     for (index, step) in diagnostic.next_steps.iter().enumerate() {
@@ -249,6 +254,10 @@ fn run_with_args(args: impl Iterator<Item = String>) -> Result<(), DaemonError> 
     let args = Args::parse(args).map_err(DaemonError::from)?;
 
     let result = match args.command {
+        Command::Desktop {
+            config_path,
+            output_path,
+        } => run_desktop(&config_path, output_path.as_deref()),
         Command::Info => print_info(),
         Command::SelfTest { profile } => run_self_test(profile),
         Command::Listen { bind } => run_listener(bind),
@@ -342,9 +351,101 @@ fn run_with_args(args: impl Iterator<Item = String>) -> Result<(), DaemonError> 
     result.map_err(DaemonError::from)
 }
 
+fn run_desktop(config_path: &Path, output_path: Option<&Path>) -> Result<(), String> {
+    let state = build_local_desktop_state(config_path)?;
+    let html = kmsync_ui::desktop_panel::render_desktop_panel(&state)?;
+    let should_open = output_path.is_none();
+    let output_path = match output_path {
+        Some(path) => path.to_path_buf(),
+        None => default_desktop_page_path(),
+    };
+    write_desktop_page(&output_path, &html)?;
+    if should_open && output_path.is_file() {
+        open_desktop_page(&output_path)?;
+    }
+    println!("desktop_page={}", output_path.display());
+    Ok(())
+}
+
+fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopState, String> {
+    let client_config = client::ClientConfig::load(config_path)?;
+    let desktop_config = desktop_config::DesktopConfig::load(config_path).unwrap_or_default();
+    let local_lan_ips = client::discover_local_lan_ips()
+        .into_iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>();
+    let permissions = platform::current_platform().permission_checks();
+    Ok(desktop_state::build_desktop_state(
+        desktop_state::DesktopStateBuildInput {
+            config_path,
+            device_name: &client_config.device_name,
+            listen_port: client_config.listen_port,
+            current_device_id: None,
+            local_lan_ips,
+            desktop_config: &desktop_config,
+            devices: &[],
+            permissions: &permissions,
+            server_state: kmsync_core::DesktopConnectionState::Connecting,
+            server_error: None,
+            master_error: None,
+        },
+    ))
+}
+
+fn write_desktop_page(path: &Path, html: &str) -> Result<(), String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, html).map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn default_desktop_page_path() -> PathBuf {
+    env::temp_dir().join("kmsync").join("kmsync-desktop.html")
+}
+
+fn open_desktop_page(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(path)
+            .spawn()
+            .map_err(|error| format!("failed to open desktop page {}: {error}", path.display()))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|error| format!("failed to open desktop page {}: {error}", path.display()))?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|error| format!("failed to open desktop page {}: {error}", path.display()))?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 fn print_info() -> Result<(), String> {
     let adapter = platform::current_platform();
-    println!("KMSync daemon");
+    println!("KMSync");
     println!("  os: {:?}", adapter.os_kind());
     println!("  input capture: {}", adapter.capabilities().input_capture);
     println!(
@@ -417,17 +518,86 @@ fn run_local_ipc_ping(endpoint: &local_ipc::LocalIpcEndpoint) -> Result<(), Stri
 }
 
 fn handle_local_ipc_request(request: local_ipc::LocalIpcRequest) -> local_ipc::LocalIpcResponse {
+    handle_local_ipc_request_with_config_path(request, None)
+}
+
+fn handle_local_ipc_request_with_config_path(
+    request: local_ipc::LocalIpcRequest,
+    config_path: Option<&Path>,
+) -> local_ipc::LocalIpcResponse {
     match request {
         local_ipc::LocalIpcRequest::Ping { nonce } => local_ipc::LocalIpcResponse::Pong { nonce },
         local_ipc::LocalIpcRequest::Status => {
             let endpoint = local_ipc::default_local_ipc_endpoint();
             local_ipc::LocalIpcResponse::Status {
-                service: "kmsync-daemon".to_string(),
+                service: "kmsync".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 input_hot_path: "not_on_local_ipc".to_string(),
                 platform_transport: endpoint.transport.as_str().to_string(),
             }
         }
+        local_ipc::LocalIpcRequest::GetDesktopState => desktop_state_response(config_path, false),
+        local_ipc::LocalIpcRequest::SetDeviceRole {
+            role,
+            master_device_id,
+        } => {
+            let Some(config_path) = config_path else {
+                return desktop_state_unavailable();
+            };
+            if let Err(error) = desktop_config::set_role_in_config_file(
+                config_path,
+                role,
+                master_device_id.as_deref(),
+            ) {
+                return local_ipc::LocalIpcResponse::Error {
+                    code: "desktop_config_write_failed".to_string(),
+                    message: error,
+                };
+            }
+            desktop_state_response(Some(config_path), true)
+        }
+        local_ipc::LocalIpcRequest::SetLayout { layout } => {
+            let Some(config_path) = config_path else {
+                return desktop_state_unavailable();
+            };
+            if let Err(error) = layout.validate(None) {
+                return local_ipc::LocalIpcResponse::Error {
+                    code: "invalid_desktop_layout".to_string(),
+                    message: format!("{error:?}"),
+                };
+            }
+            if let Err(error) = desktop_config::set_layout_in_config_file(config_path, &layout) {
+                return local_ipc::LocalIpcResponse::Error {
+                    code: "desktop_config_write_failed".to_string(),
+                    message: error,
+                };
+            }
+            desktop_state_response(Some(config_path), true)
+        }
+    }
+}
+
+fn desktop_state_unavailable() -> local_ipc::LocalIpcResponse {
+    local_ipc::LocalIpcResponse::Error {
+        code: "desktop_state_unavailable".to_string(),
+        message: "desktop state is only available from the configured core service".to_string(),
+    }
+}
+
+fn desktop_state_response(
+    config_path: Option<&Path>,
+    applied: bool,
+) -> local_ipc::LocalIpcResponse {
+    let Some(config_path) = config_path else {
+        return desktop_state_unavailable();
+    };
+    match build_local_desktop_state(config_path) {
+        Ok(state) if applied => local_ipc::LocalIpcResponse::ConfigApplied { state },
+        Ok(state) => local_ipc::LocalIpcResponse::DesktopState { state },
+        Err(error) => local_ipc::LocalIpcResponse::Error {
+            code: "desktop_state_failed".to_string(),
+            message: error,
+        },
     }
 }
 
@@ -531,9 +701,11 @@ fn run_core_service(config_path: &Path) -> Result<(), String> {
         ));
     });
 
+    let ipc_endpoint = plan.ipc_endpoint.clone();
+    let ipc_config_path = plan.config_path.clone();
     thread::spawn(move || {
         let _ = result_tx.send(CoreServiceThreadResult::LocalIpc(
-            run_local_ipc_serve_forever(&plan.ipc_endpoint),
+            run_local_ipc_serve_forever(&ipc_endpoint, &ipc_config_path),
         ));
     });
 
@@ -595,7 +767,10 @@ fn wait_core_service_results(rx: Receiver<CoreServiceThreadResult>) -> Result<()
     }
 }
 
-fn run_local_ipc_serve_forever(endpoint: &local_ipc::LocalIpcEndpoint) -> Result<(), String> {
+fn run_local_ipc_serve_forever(
+    endpoint: &local_ipc::LocalIpcEndpoint,
+    config_path: &Path,
+) -> Result<(), String> {
     println!(
         "local_ipc_listening transport={} address={}",
         endpoint.transport.as_str(),
@@ -604,7 +779,9 @@ fn run_local_ipc_serve_forever(endpoint: &local_ipc::LocalIpcEndpoint) -> Result
     loop {
         local_ipc::LocalIpcServer::bind(endpoint)
             .map_err(|error| error.to_string())?
-            .serve_one(handle_local_ipc_request)
+            .serve_one(|request| {
+                handle_local_ipc_request_with_config_path(request, Some(config_path))
+            })
             .map_err(|error| error.to_string())?;
     }
 }
@@ -1986,7 +2163,7 @@ fn crash_report_dir() -> PathBuf {
 
     let base = env::var_os("KMSYNC_STATE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| env::temp_dir().join("kmsync-daemon"));
+        .unwrap_or_else(|| env::temp_dir().join("kmsync"));
     base.join("crash-reports")
 }
 
@@ -2538,6 +2715,10 @@ impl ProfileName {
 }
 
 enum Command {
+    Desktop {
+        config_path: PathBuf,
+        output_path: Option<PathBuf>,
+    },
     Info,
     SelfTest {
         profile: ProfileName,
@@ -2639,13 +2820,26 @@ impl Args {
     ) -> Result<Self, String> {
         let Some(command) = args.next() else {
             return Ok(Self {
-                command: Command::CoreService {
+                command: Command::Desktop {
                     config_path: default_config_path,
+                    output_path: None,
                 },
             });
         };
 
         match command.as_str() {
+            "desktop" => {
+                let config_path = args
+                    .next()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| default_config_path.clone());
+                Ok(Self {
+                    command: Command::Desktop {
+                        config_path,
+                        output_path: args.next().map(PathBuf::from),
+                    },
+                })
+            }
             "info" => Ok(Self {
                 command: Command::Info,
             }),
@@ -2884,7 +3078,7 @@ impl Args {
 
 fn default_daemon_config_path() -> PathBuf {
     let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("kmsync-daemon"));
+    let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("kmsync"));
     default_daemon_config_path_from(&current_dir, &exe_path)
 }
 
@@ -3046,34 +3240,32 @@ fn default_edge_cooldown() -> Duration {
 
 fn print_help() {
     println!("Usage:");
-    println!("  kmsync-daemon info");
-    println!("  kmsync-daemon self-test [mac-to-windows|windows-to-mac]");
-    println!("  kmsync-daemon listen 0.0.0.0:24800");
-    println!("  kmsync-daemon send-demo 127.0.0.1:24800 [mac-to-windows|windows-to-mac]");
-    println!("  kmsync-daemon capture-send 127.0.0.1:24800 [mac-to-windows|windows-to-mac] [all|lock|left|right|top|bottom|top-left|top-right|bottom-left|bottom-right] [threshold_px] [release_hotkey] [cooldown_ms] [local_app_csv]");
-    println!("  kmsync-daemon capture-connect configs/daemon.example.json <target_device_id> [mac-to-windows|windows-to-mac] [all|lock|left|right|top|bottom|top-left|top-right|bottom-left|bottom-right] [threshold_px] [release_hotkey] [cooldown_ms] [local_app_csv]");
-    println!("  kmsync-daemon core-service configs/daemon.example.json");
-    println!("  kmsync-daemon heartbeat configs/daemon.example.json");
-    println!("  kmsync-daemon clip-get");
-    println!("  kmsync-daemon clip-set \"hello\"");
-    println!("  kmsync-daemon clip-send 127.0.0.1:24800");
-    println!("  kmsync-daemon clip-watch 127.0.0.1:24800 [interval_seconds] [max_bytes] [enabled|disabled] [ttl_seconds] [sensitive_app_csv]");
-    println!("  kmsync-daemon file-send 127.0.0.1:24800 <file_path> [chunk_bytes]");
-    println!("  kmsync-daemon devices configs/daemon.example.json");
-    println!(
-        "  kmsync-daemon connection-diagnostics configs/daemon.example.json <target_device_id>"
-    );
-    println!("  kmsync-daemon profiles configs/daemon.example.json");
-    println!("  kmsync-daemon profile-set configs/daemon.example.json <source_device_id> <target_device_id> configs/mac-to-windows.profile.json");
-    println!("  kmsync-daemon update-check configs/daemon.example.json [device_id] [windows|macos|linux] [version] [stable]");
-    println!("  kmsync-daemon windows-service configs/daemon.example.json");
-    println!("  kmsync-daemon ipc-endpoint");
-    println!("  kmsync-daemon ipc-serve-once [endpoint]");
-    println!("  kmsync-daemon ipc-ping [endpoint]");
-    println!("  kmsync-daemon status [endpoint]");
-    println!("  kmsync-daemon ping [endpoint]");
-    println!("  kmsync-daemon layout-editor <profile.json> [output.html]");
-    println!("  kmsync-daemon control-panel <profile.json> [output.html]");
+    println!("  kmsync info");
+    println!("  kmsync self-test [mac-to-windows|windows-to-mac]");
+    println!("  kmsync listen 0.0.0.0:24800");
+    println!("  kmsync send-demo 127.0.0.1:24800 [mac-to-windows|windows-to-mac]");
+    println!("  kmsync capture-send 127.0.0.1:24800 [mac-to-windows|windows-to-mac] [all|lock|left|right|top|bottom|top-left|top-right|bottom-left|bottom-right] [threshold_px] [release_hotkey] [cooldown_ms] [local_app_csv]");
+    println!("  kmsync capture-connect configs/daemon.example.json <target_device_id> [mac-to-windows|windows-to-mac] [all|lock|left|right|top|bottom|top-left|top-right|bottom-left|bottom-right] [threshold_px] [release_hotkey] [cooldown_ms] [local_app_csv]");
+    println!("  kmsync core-service configs/daemon.example.json");
+    println!("  kmsync heartbeat configs/daemon.example.json");
+    println!("  kmsync clip-get");
+    println!("  kmsync clip-set \"hello\"");
+    println!("  kmsync clip-send 127.0.0.1:24800");
+    println!("  kmsync clip-watch 127.0.0.1:24800 [interval_seconds] [max_bytes] [enabled|disabled] [ttl_seconds] [sensitive_app_csv]");
+    println!("  kmsync file-send 127.0.0.1:24800 <file_path> [chunk_bytes]");
+    println!("  kmsync devices configs/daemon.example.json");
+    println!("  kmsync connection-diagnostics configs/daemon.example.json <target_device_id>");
+    println!("  kmsync profiles configs/daemon.example.json");
+    println!("  kmsync profile-set configs/daemon.example.json <source_device_id> <target_device_id> configs/mac-to-windows.profile.json");
+    println!("  kmsync update-check configs/daemon.example.json [device_id] [windows|macos|linux] [version] [stable]");
+    println!("  kmsync windows-service configs/daemon.example.json");
+    println!("  kmsync ipc-endpoint");
+    println!("  kmsync ipc-serve-once [endpoint]");
+    println!("  kmsync ipc-ping [endpoint]");
+    println!("  kmsync status [endpoint]");
+    println!("  kmsync ping [endpoint]");
+    println!("  kmsync layout-editor <profile.json> [output.html]");
+    println!("  kmsync control-panel <profile.json> [output.html]");
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3623,6 +3815,14 @@ mod tests {
     use kmsync_core::{ClipboardFormat, InputChannel, InputEventEnvelope, MouseButton, MouseEvent};
     use std::collections::VecDeque;
 
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        env::temp_dir().join(format!("kmsync-{name}-{}-{nanos}", std::process::id()))
+    }
+
     #[derive(Default)]
     struct RecordingInjector {
         events: Vec<InputEvent>,
@@ -3771,7 +3971,7 @@ mod tests {
         assert_eq!(error.kind(), DiagnosticKind::InjectionFailed);
         let formatted = format_user_diagnostic(&error);
 
-        assert!(formatted.contains("kmsync-daemon: Input injection failed"));
+        assert!(formatted.contains("kmsync: Input injection failed"));
         assert!(formatted.contains("native injector returned a platform failure"));
         assert!(formatted.contains("interactive desktop"));
     }
@@ -3792,7 +3992,7 @@ mod tests {
         let error = DaemonError::from_message("unsupported macOS key: MediaPlay");
         let formatted = format_user_diagnostic(&error);
 
-        assert!(formatted.contains("kmsync-daemon: Input injection failed"));
+        assert!(formatted.contains("kmsync: Input injection failed"));
         assert!(formatted.contains("details: unsupported macOS key: MediaPlay"));
         assert!(formatted.contains("next steps:"));
         assert!(formatted.contains("keyboard mapping"));
@@ -4069,10 +4269,42 @@ mod tests {
             .expect("parse default desktop launch");
 
         match args.command {
-            Command::CoreService { config_path } => {
+            Command::Desktop {
+                config_path,
+                output_path,
+            } => {
                 assert_eq!(config_path, default_config);
+                assert_eq!(output_path, None);
             }
-            _ => panic!("expected default desktop launch to start core-service"),
+            _ => panic!("expected default desktop launch to open desktop page"),
+        }
+    }
+
+    #[test]
+    fn args_parse_accepts_desktop_command_with_output_path() {
+        let args = Args::parse(
+            [
+                "desktop",
+                "configs/daemon.example.json",
+                "target/kmsync-desktop.html",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .expect("parse desktop command");
+
+        match args.command {
+            Command::Desktop {
+                config_path,
+                output_path,
+            } => {
+                assert_eq!(config_path, PathBuf::from("configs/daemon.example.json"));
+                assert_eq!(
+                    output_path,
+                    Some(PathBuf::from("target/kmsync-desktop.html"))
+                );
+            }
+            _ => panic!("expected desktop command"),
         }
     }
 
@@ -4102,7 +4334,7 @@ mod tests {
 
         let config_path = default_daemon_config_path_from(
             Path::new("unrelated-current-dir"),
-            &bin_dir.join("kmsync-daemon.exe"),
+            &bin_dir.join("kmsync.exe"),
         );
 
         assert_eq!(config_path, config_dir.join("daemon.example.json"));
@@ -4165,7 +4397,7 @@ mod tests {
             .expect("workspace root");
         let macos = std::fs::read_to_string(root.join("packaging/macos/build-pkg.sh"))
             .expect("read macOS packaging script");
-        let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync-daemon.nsi"))
+        let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync.nsi"))
             .expect("read Windows packaging script");
 
         assert!(macos.contains("<string>core-service</string>"));
@@ -4206,17 +4438,17 @@ mod tests {
 
     #[test]
     fn windows_service_entrypoint_is_separate_from_user_companion_hot_path() {
-        let binary = Path::new(r"C:\Program Files\KMSync\kmsync-daemon.exe");
+        let binary = Path::new(r"C:\Program Files\KMSync\kmsync.exe");
         let config = Path::new(r"C:\Program Files\KMSync\configs\daemon.example.json");
 
         assert_eq!(WINDOWS_SERVICE_NAME, "KMSyncCoreService");
         assert_eq!(
             windows_service_command_line(binary, config),
-            r#""C:\Program Files\KMSync\kmsync-daemon.exe" windows-service "C:\Program Files\KMSync\configs\daemon.example.json""#
+            r#""C:\Program Files\KMSync\kmsync.exe" windows-service "C:\Program Files\KMSync\configs\daemon.example.json""#
         );
         assert_eq!(
             windows_companion_command_line(binary, config),
-            r#""C:\Program Files\KMSync\kmsync-daemon.exe" core-service "C:\Program Files\KMSync\configs\daemon.example.json""#
+            r#""C:\Program Files\KMSync\kmsync.exe" core-service "C:\Program Files\KMSync\configs\daemon.example.json""#
         );
     }
 
@@ -4226,7 +4458,7 @@ mod tests {
             .parent()
             .and_then(Path::parent)
             .expect("workspace root");
-        let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync-daemon.nsi"))
+        let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync.nsi"))
             .expect("read Windows packaging script");
 
         assert!(windows.contains("KMSyncCoreService"));
@@ -4246,13 +4478,10 @@ mod tests {
             std::fs::read_to_string(root.join("Cargo.toml")).expect("read workspace manifest");
         let macos = std::fs::read_to_string(root.join("packaging/macos/build-pkg.sh"))
             .expect("read macOS packaging script");
-        let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync-daemon.nsi"))
+        let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync.nsi"))
             .expect("read Windows packaging script");
         let windows_build = std::fs::read_to_string(root.join("packaging/windows/build-nsis.ps1"))
             .expect("read Windows build script");
-        let user_guide =
-            std::fs::read_to_string(root.join("docs/USER_GUIDE.md")).expect("read user guide");
-
         assert!(workspace.contains("\"crates/kmsync-ui\""));
         assert!(!root.join("crates/kmsync-ui/src/main.rs").exists());
         assert!(!macos.contains("/usr/local/bin/kmsync-ui"));
@@ -4270,8 +4499,35 @@ mod tests {
         assert!(windows.contains(
             "CreateShortCut \"$SMPROGRAMS\\KMSync\\KMSync status.lnk\" \"$INSTDIR\\${APP_EXE}\" \"status\""
         ));
-        assert!(user_guide.contains("kmsync-daemon.exe status"));
-        assert!(!user_guide.contains("kmsync-ui.exe status"));
+        assert!(windows.contains("!define APP_EXE \"kmsync.exe\""));
+    }
+
+    #[test]
+    fn desktop_packaging_uses_kmsync_executable_name_and_no_console_subsystem() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let main_rs =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"))
+                .expect("read main source");
+        let macos = std::fs::read_to_string(root.join("packaging/macos/build-pkg.sh"))
+            .expect("read macOS packaging script");
+        let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync.nsi"))
+            .expect("read Windows packaging script");
+        let windows_build = std::fs::read_to_string(root.join("packaging/windows/build-nsis.ps1"))
+            .expect("read Windows build script");
+
+        assert!(main_rs.contains("windows_subsystem = \"windows\""));
+        assert!(windows.contains("!define APP_EXE \"kmsync.exe\""));
+        assert!(windows.contains(
+            "OutFile \"..\\..\\dist\\windows\\kmsync-${APP_VERSION}-windows-x64-setup.exe\""
+        ));
+        assert!(windows_build
+            .contains("$Installer = Join-Path $Dist \"kmsync-$Version-windows-x64-setup.exe\""));
+        assert!(windows_build.contains("\"kmsync\""));
+        assert!(macos.contains("/usr/local/bin/kmsync"));
+        assert!(macos.contains("PKG_PATH=\"${DIST_DIR}/kmsync-${VERSION}-macos.pkg\""));
     }
 
     #[test]
@@ -4285,7 +4541,7 @@ mod tests {
                 input_hot_path,
                 platform_transport,
             } => {
-                assert_eq!(service, "kmsync-daemon");
+                assert_eq!(service, "kmsync");
                 assert_eq!(version, env!("CARGO_PKG_VERSION"));
                 assert_eq!(input_hot_path, "not_on_local_ipc");
                 assert_eq!(
@@ -4295,6 +4551,64 @@ mod tests {
             }
             _ => panic!("expected local ipc status response"),
         }
+    }
+
+    #[test]
+    fn local_ipc_desktop_state_reads_config_and_layout_updates_write_back() {
+        let root = unique_test_dir("desktop-ipc-config");
+        let config_path = root.join("daemon.example.json");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "server_url": "http://127.0.0.1:24888",
+                "email": "dev@example.com",
+                "device_name": "Development Mac",
+                "listen_port": 24800,
+                "heartbeat_interval_seconds": 15,
+                "role": "master"
+            }"#,
+        )
+        .expect("write config");
+
+        let response = handle_local_ipc_request_with_config_path(
+            local_ipc::LocalIpcRequest::GetDesktopState,
+            Some(&config_path),
+        );
+        match response {
+            local_ipc::LocalIpcResponse::DesktopState { state } => {
+                assert_eq!(state.device.name, "Development Mac");
+                assert_eq!(
+                    state.server_state,
+                    kmsync_core::DesktopConnectionState::Connecting
+                );
+            }
+            _ => panic!("expected desktop state"),
+        }
+
+        let layout = kmsync_core::DesktopLayout {
+            left: Some("left-device".to_string()),
+            right: None,
+            top: None,
+            bottom: Some("bottom-device".to_string()),
+        };
+        let response = handle_local_ipc_request_with_config_path(
+            local_ipc::LocalIpcRequest::SetLayout {
+                layout: layout.clone(),
+            },
+            Some(&config_path),
+        );
+        match response {
+            local_ipc::LocalIpcResponse::ConfigApplied { state } => {
+                assert_eq!(state.layout, layout);
+            }
+            _ => panic!("expected config applied"),
+        }
+
+        let text = std::fs::read_to_string(&config_path).expect("read updated config");
+        assert!(text.contains("\"left\": \"left-device\""));
+        assert!(text.contains("\"bottom\": \"bottom-device\""));
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -6019,11 +6333,7 @@ mod tests {
         let report = crash_report_from_panic_parts(
             234_567,
             &secret_payload,
-            Some((
-                "/home/alice/kmsync/crates/kmsync-daemon/src/main.rs",
-                88,
-                11,
-            )),
+            Some(("/home/alice/kmsync/crates/kmsync/src/main.rs", 88, 11)),
         );
 
         let path = write_crash_report(&dir, &report).expect("write crash report");
@@ -6227,11 +6537,11 @@ mod packaging_tests {
         let root = workspace_root();
         let macos = std::fs::read_to_string(root.join("packaging/macos/build-pkg.sh"))
             .expect("read macOS packaging script");
-        let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync-daemon.nsi"))
+        let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync.nsi"))
             .expect("read Windows packaging script");
 
         assert!(macos.contains("Library/LaunchAgents"));
-        assert!(macos.contains("com.kmsync.mvp.daemon.plist"));
+        assert!(macos.contains("com.kmsync.mvp.plist"));
         assert!(macos.contains("USER_GUIDE.md"));
         assert!(macos.contains("uninstall-macos.sh"));
         assert!(macos.contains("launchctl bootout"));

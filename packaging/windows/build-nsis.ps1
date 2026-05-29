@@ -11,9 +11,9 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path "$PSScriptRoot\..\.."
 $Dist = Join-Path $Root "dist\windows"
-$Nsi = Join-Path $Root "packaging\windows\kmsync-daemon.nsi"
+$Nsi = Join-Path $Root "packaging\windows\kmsync.nsi"
 $ReleaseDir = Join-Path $Root "target\$Target\release"
-$Installer = Join-Path $Dist "kmsync-daemon-$Version-windows-x64-setup.exe"
+$Installer = Join-Path $Dist "kmsync-$Version-windows-x64-setup.exe"
 
 function Invoke-CheckedNative {
   param(
@@ -72,13 +72,13 @@ $cargoArgs += @(
   "build",
   "--release",
   "-p",
-  "kmsync-daemon",
+  "kmsync",
   "--target",
   $Target
 )
 Invoke-CheckedNative -FilePath "cargo" -Arguments $cargoArgs
 
-Sign-AuthenticodeFile (Join-Path $ReleaseDir "kmsync-daemon.exe")
+Sign-AuthenticodeFile (Join-Path $ReleaseDir "kmsync.exe")
 
 $makensis = Get-Command makensis.exe -ErrorAction SilentlyContinue
 if (-not $makensis) {

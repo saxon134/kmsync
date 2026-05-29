@@ -3,6 +3,8 @@ use std::io::{Read, Write};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use crate::{DesktopLayout, DesktopRole, DesktopState};
+
 pub const LOCAL_IPC_MAX_FRAME_BYTES: usize = 1 << 20;
 
 #[allow(dead_code)]
@@ -39,8 +41,18 @@ impl LocalIpcEndpoint {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LocalIpcRequest {
-    Ping { nonce: u64 },
+    Ping {
+        nonce: u64,
+    },
     Status,
+    GetDesktopState,
+    SetDeviceRole {
+        role: DesktopRole,
+        master_device_id: Option<String>,
+    },
+    SetLayout {
+        layout: DesktopLayout,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -54,6 +66,12 @@ pub enum LocalIpcResponse {
         version: String,
         input_hot_path: String,
         platform_transport: String,
+    },
+    DesktopState {
+        state: DesktopState,
+    },
+    ConfigApplied {
+        state: DesktopState,
     },
     Error {
         code: String,
@@ -545,6 +563,7 @@ mod windows_named_pipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopState};
     use std::io::Cursor;
     use std::sync::mpsc::sync_channel;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -568,6 +587,51 @@ mod tests {
             read_response_frame(&mut Cursor::new(response_bytes)).expect("read response frame");
 
         assert_eq!(decoded_response, response);
+    }
+
+    #[test]
+    fn codec_round_trips_desktop_state_requests_and_layout_updates() {
+        let get_state = LocalIpcRequest::GetDesktopState;
+        let mut request_bytes = Vec::new();
+        write_request_frame(&mut request_bytes, &get_state).expect("write get desktop state");
+        assert_eq!(
+            read_request_frame(&mut Cursor::new(request_bytes)).expect("read get desktop state"),
+            get_state
+        );
+
+        let layout = DesktopLayout {
+            left: None,
+            right: Some("device-right".to_string()),
+            top: None,
+            bottom: Some("device-bottom".to_string()),
+        };
+        let set_layout = LocalIpcRequest::SetLayout {
+            layout: layout.clone(),
+        };
+        let mut request_bytes = Vec::new();
+        write_request_frame(&mut request_bytes, &set_layout).expect("write set layout");
+        assert_eq!(
+            read_request_frame(&mut Cursor::new(request_bytes)).expect("read set layout"),
+            set_layout
+        );
+
+        let state = DesktopState {
+            device: crate::DesktopDeviceState {
+                role: DesktopRole::Master,
+                ..crate::DesktopDeviceState::default()
+            },
+            server_state: DesktopConnectionState::Connecting,
+            master_state: DesktopConnectionState::SelfDevice,
+            layout,
+            ..DesktopState::default()
+        };
+        let response = LocalIpcResponse::DesktopState { state };
+        let mut response_bytes = Vec::new();
+        write_response_frame(&mut response_bytes, &response).expect("write desktop state");
+        assert_eq!(
+            read_response_frame(&mut Cursor::new(response_bytes)).expect("read desktop state"),
+            response
+        );
     }
 
     #[test]

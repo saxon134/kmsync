@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/kmsync-core",
-    "crates/kmsync-daemon",
+    "crates/kmsync",
     "crates/kmsync-ui",
     "crates/kmsync-server"
 ]

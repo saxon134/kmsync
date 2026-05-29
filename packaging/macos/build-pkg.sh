@@ -6,9 +6,9 @@ DIST_DIR="${ROOT_DIR}/dist/macos"
 STAGING_DIR="${DIST_DIR}/staging"
 PKG_ROOT="${STAGING_DIR}/pkg-root"
 SCRIPTS_DIR="${STAGING_DIR}/scripts"
-IDENTIFIER="com.kmsync.mvp.daemon"
-LAUNCH_AGENT_ID="com.kmsync.mvp.daemon"
-VERSION="$(grep -m1 '^version' "${ROOT_DIR}/crates/kmsync-daemon/Cargo.toml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')"
+IDENTIFIER="com.kmsync.mvp"
+LAUNCH_AGENT_ID="com.kmsync.mvp"
+VERSION="$(grep -m1 '^version' "${ROOT_DIR}/crates/kmsync/Cargo.toml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 PKG_SIGN_IDENTITY="${PKG_SIGN_IDENTITY:-}"
 APPLE_ID="${APPLE_ID:-}"
@@ -71,19 +71,19 @@ mkdir -p \
   "${SCRIPTS_DIR}"
 
 if command -v lipo >/dev/null 2>&1 && rustup target list --installed | grep -q '^x86_64-apple-darwin$'; then
-  cargo build --release -p kmsync-daemon --target aarch64-apple-darwin
-  cargo build --release -p kmsync-daemon --target x86_64-apple-darwin
+  cargo build --release -p kmsync --target aarch64-apple-darwin
+  cargo build --release -p kmsync --target x86_64-apple-darwin
   lipo -create \
-    "${ROOT_DIR}/target/aarch64-apple-darwin/release/kmsync-daemon" \
-    "${ROOT_DIR}/target/x86_64-apple-darwin/release/kmsync-daemon" \
-    -output "${STAGING_DIR}/kmsync-daemon"
+    "${ROOT_DIR}/target/aarch64-apple-darwin/release/kmsync" \
+    "${ROOT_DIR}/target/x86_64-apple-darwin/release/kmsync" \
+    -output "${STAGING_DIR}/kmsync"
 else
-  cargo build --release -p kmsync-daemon
-  cp "${ROOT_DIR}/target/release/kmsync-daemon" "${STAGING_DIR}/kmsync-daemon"
+  cargo build --release -p kmsync
+  cp "${ROOT_DIR}/target/release/kmsync" "${STAGING_DIR}/kmsync"
 fi
 
-install -m 0755 "${STAGING_DIR}/kmsync-daemon" "${PKG_ROOT}/usr/local/bin/kmsync-daemon"
-sign_binary_if_configured "${PKG_ROOT}/usr/local/bin/kmsync-daemon"
+install -m 0755 "${STAGING_DIR}/kmsync" "${PKG_ROOT}/usr/local/bin/kmsync"
+sign_binary_if_configured "${PKG_ROOT}/usr/local/bin/kmsync"
 install -m 0644 "${ROOT_DIR}/configs/mac-to-windows.profile.json" "${PKG_ROOT}/usr/local/share/kmsync/configs/mac-to-windows.profile.json"
 install -m 0644 "${ROOT_DIR}/configs/windows-to-mac.profile.json" "${PKG_ROOT}/usr/local/share/kmsync/configs/windows-to-mac.profile.json"
 install -m 0644 "${ROOT_DIR}/configs/daemon.example.json" "${PKG_ROOT}/usr/local/share/kmsync/configs/daemon.example.json"
@@ -99,7 +99,7 @@ cat > "${PKG_ROOT}/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist" <<PLIST
   <string>${LAUNCH_AGENT_ID}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/kmsync-daemon</string>
+    <string>/usr/local/bin/kmsync</string>
     <string>core-service</string>
     <string>/usr/local/share/kmsync/configs/daemon.example.json</string>
   </array>
@@ -108,9 +108,9 @@ cat > "${PKG_ROOT}/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist" <<PLIST
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/tmp/kmsync-daemon.out.log</string>
+  <string>/tmp/kmsync.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/kmsync-daemon.err.log</string>
+  <string>/tmp/kmsync.err.log</string>
 </dict>
 </plist>
 PLIST
@@ -121,9 +121,9 @@ set -euo pipefail
 
 launchctl bootout "gui/\$(id -u)" "/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist" 2>/dev/null || true
 rm -f "/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist"
-rm -f /usr/local/bin/kmsync-daemon
+rm -f /usr/local/bin/kmsync
 rm -rf /usr/local/share/kmsync
-echo "KMSync daemon files removed."
+echo "KMSync files removed."
 SCRIPT
 
 chmod 0755 "${PKG_ROOT}/usr/local/share/kmsync/uninstall-macos.sh"
@@ -132,17 +132,17 @@ cat > "${SCRIPTS_DIR}/postinstall" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "KMSync daemon installed to /usr/local/bin/kmsync-daemon"
-echo "LaunchAgent installed to /Library/LaunchAgents/com.kmsync.mvp.daemon.plist for login startup"
+echo "KMSync installed to /usr/local/bin/kmsync"
+echo "LaunchAgent installed to /Library/LaunchAgents/com.kmsync.mvp.plist for login startup"
 echo "Permission guide installed to /usr/local/share/kmsync/docs/USER_GUIDE.md"
 echo "Uninstall cleanup script installed to /usr/local/share/kmsync/uninstall-macos.sh"
-echo "Run: /usr/local/bin/kmsync-daemon info"
+echo "Run: /usr/local/bin/kmsync info"
 exit 0
 SCRIPT
 
 chmod 0755 "${SCRIPTS_DIR}/postinstall"
 
-PKG_PATH="${DIST_DIR}/kmsync-daemon-${VERSION}-macos.pkg"
+PKG_PATH="${DIST_DIR}/kmsync-${VERSION}-macos.pkg"
 
 pkgbuild \
   --root "${PKG_ROOT}" \

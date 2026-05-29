@@ -400,7 +400,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
             <label>Sensitive apps<input id="clipboardSensitiveApps" value="OnePassword,Bitwarden,KeePassXC"></label>
           </div>
           <div class="section-body">
-            <div class="command" id="clipboardCommand">kmsync-daemon clip-watch &lt;target-ip&gt;:24800 1 1048576 enabled 300 OnePassword,Bitwarden,KeePassXC</div>
+            <div class="command" id="clipboardCommand">kmsync clip-watch &lt;target-ip&gt;:24800 1 1048576 enabled 300 OnePassword,Bitwarden,KeePassXC</div>
           </div>
         </section>
       </section>
@@ -410,15 +410,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
             <div class="section-head"><h2>Network diagnostics</h2><button type="button" id="checkHealth">Check server</button></div>
             <div class="section-body">
               <div class="status" id="networkStatus">Ready</div>
-              <div class="command">kmsync-daemon connection-diagnostics configs/daemon.example.json &lt;target_device_id&gt;</div>
-              <div class="command">kmsync-daemon self-test mac-to-windows</div>
+              <div class="command">kmsync connection-diagnostics configs/daemon.example.json &lt;target_device_id&gt;</div>
+              <div class="command">kmsync self-test mac-to-windows</div>
             </div>
           </section>
           <section class="section">
             <div class="section-head"><h2>Local IPC</h2></div>
             <div class="section-body">
-              <div class="command">kmsync-daemon status</div>
-              <div class="command">kmsync-daemon ipc-ping</div>
+              <div class="command">kmsync status</div>
+              <div class="command">kmsync ipc-ping</div>
             </div>
           </section>
         </div>
@@ -487,7 +487,7 @@ function updateClipboardCommand() {{
   const enabled = document.getElementById("clipboardEnabled").value;
   const ttl = document.getElementById("clipboardTtlSeconds").value;
   const apps = document.getElementById("clipboardSensitiveApps").value;
-  document.getElementById("clipboardCommand").textContent = `kmsync-daemon clip-watch <target-ip>:24800 1 ${{bytes}} ${{enabled}} ${{ttl}} ${{apps}}`;
+  document.getElementById("clipboardCommand").textContent = `kmsync clip-watch <target-ip>:24800 1 ${{bytes}} ${{enabled}} ${{ttl}} ${{apps}}`;
 }}
 
 document.querySelectorAll("[data-nav]").forEach((button) => {{

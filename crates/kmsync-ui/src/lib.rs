@@ -1,4 +1,5 @@
 pub mod control_panel;
+pub mod desktop_panel;
 pub mod layout_editor;
 
 use std::fs;
@@ -204,10 +205,10 @@ fn render_status_response(
 
 fn print_help() {
     println!("Usage:");
-    println!("  kmsync-daemon status [endpoint]");
-    println!("  kmsync-daemon ping [endpoint]");
-    println!("  kmsync-daemon layout-editor <profile.json> [output.html]");
-    println!("  kmsync-daemon control-panel <profile.json> [output.html]");
+    println!("  kmsync status [endpoint]");
+    println!("  kmsync ping [endpoint]");
+    println!("  kmsync layout-editor <profile.json> [output.html]");
+    println!("  kmsync control-panel <profile.json> [output.html]");
 }
 
 #[cfg(test)]
@@ -247,7 +248,7 @@ mod tests {
             "/tmp/kmsync-core-service.sock",
         );
         let response = LocalIpcResponse::Status {
-            service: "kmsync-daemon".to_string(),
+            service: "kmsync".to_string(),
             version: "0.1.0".to_string(),
             input_hot_path: "not_on_local_ipc".to_string(),
             platform_transport: "unix_domain_socket".to_string(),
@@ -256,7 +257,7 @@ mod tests {
         let output = render_status_response(&endpoint, &response).expect("render status");
 
         assert!(output.contains("KMSync"));
-        assert!(output.contains("core_service=kmsync-daemon"));
+        assert!(output.contains("core_service=kmsync"));
         assert!(output.contains("input_hot_path=not_on_local_ipc"));
         assert!(output.contains("local_ipc_transport=unix_domain_socket"));
         assert!(!output.contains("InputEvent"));

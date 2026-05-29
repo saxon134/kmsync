@@ -1,3 +1,4 @@
+pub mod desktop;
 pub mod event;
 pub mod input_state;
 pub mod keymap;
@@ -5,6 +6,10 @@ pub mod local_ipc;
 pub mod profile;
 pub mod protocol;
 
+pub use desktop::{
+    DesktopConnectionState, DesktopDeviceState, DesktopLayout, DesktopNetworkState,
+    DesktopPeerState, DesktopPermissionState, DesktopRole, DesktopState,
+};
 pub use event::{
     DeviceId, InputEvent, Key, KeyEvent, KeyState, ModifierSemantic, ModifierSide, Modifiers,
     MouseButton, MouseEvent, OsKind, ScrollEvent, KEY_CODE_SPACE,

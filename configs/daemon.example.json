@@ -5,5 +5,14 @@
   "device_name": "Development Mac",
   "identity_path": "kmsync-device-identity.json",
   "listen_port": 24800,
-  "heartbeat_interval_seconds": 15
+  "heartbeat_interval_seconds": 15,
+  "role": "client",
+  "master_device_id": null,
+  "layout": {
+    "left": null,
+    "right": null,
+    "top": null,
+    "bottom": null
+  },
+  "profile_path": "profiles/current.profile.json"
 }
