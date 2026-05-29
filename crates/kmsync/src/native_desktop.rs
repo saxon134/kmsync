@@ -173,6 +173,14 @@ struct NativeLanIpSummary {
     total_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeDeviceListRow {
+    name: String,
+    status: String,
+    lan_ips: Vec<String>,
+    public_ip: Option<String>,
+}
+
 impl NativeDesktopApp {
     fn load(config_path: PathBuf) -> Result<Self, String> {
         let state = crate::build_local_desktop_state(&config_path)?;
@@ -412,6 +420,7 @@ impl NativeDesktopApp {
         ui.heading("设备位置");
         ui.set_min_height(NATIVE_LAYOUT_PANEL_MIN_HEIGHT);
         let devices = native_layout_device_options(&self.state);
+        let center_device_name = native_layout_center_device_name(&self.state, &self.device_name);
         let combo_width = native_layout_combo_width(ui.available_width());
         egui::Grid::new("native_layout_grid")
             .num_columns(3)
@@ -423,7 +432,7 @@ impl NativeDesktopApp {
                 ui.label("");
                 ui.end_row();
                 device_combo(ui, "左边电脑", &mut self.layout.left, &devices, combo_width);
-                master_device_cell(ui, &self.state.device.name, self.is_master, combo_width);
+                master_device_cell(ui, &center_device_name, self.is_master, combo_width);
                 device_combo(
                     ui,
                     "右边电脑",
@@ -457,10 +466,7 @@ impl NativeDesktopApp {
             }
         });
         ui.set_min_height(NATIVE_DEVICES_PANEL_MIN_HEIGHT);
-        if self.state.devices.is_empty() {
-            ui.label("暂无其他设备");
-            return;
-        }
+        let rows = native_device_list_rows(&self.state, &self.device_name);
         let min_col_width = native_devices_grid_column_width(ui.available_width());
         let mut next_lan_ip_popup = None;
         egui::Grid::new("native_devices_grid")
@@ -473,24 +479,16 @@ impl NativeDesktopApp {
                 native_grid_strong(ui, "内网 IP", min_col_width);
                 native_grid_strong(ui, "公网 IP", min_col_width);
                 ui.end_row();
-                for device in &self.state.devices {
-                    native_grid_label(ui, &device.name, min_col_width);
-                    native_grid_label(
-                        ui,
-                        if device.online { "在线" } else { "离线" },
-                        min_col_width,
-                    );
-                    if native_grid_lan_ips(ui, &device.lan_ips, min_col_width) {
+                for row in &rows {
+                    native_grid_label(ui, &row.name, min_col_width);
+                    native_grid_label(ui, &row.status, min_col_width);
+                    if native_grid_lan_ips(ui, &row.lan_ips, min_col_width) {
                         next_lan_ip_popup = Some(NativeLanIpPopup {
-                            device_name: device.name.clone(),
-                            lan_ips: device.lan_ips.clone(),
+                            device_name: row.name.clone(),
+                            lan_ips: row.lan_ips.clone(),
                         });
                     }
-                    native_grid_label(
-                        ui,
-                        device.public_ip.as_deref().unwrap_or("-"),
-                        min_col_width,
-                    );
+                    native_grid_label(ui, row.public_ip.as_deref().unwrap_or("-"), min_col_width);
                     ui.end_row();
                 }
             });
@@ -568,6 +566,34 @@ fn native_layout_device_options(state: &DesktopState) -> Vec<(String, String)> {
         .filter(|device| Some(device.id.as_str()) != current_device_id)
         .map(|device| (device.id.clone(), device.name.clone()))
         .collect()
+}
+
+fn native_layout_center_device_name(state: &DesktopState, edited_device_name: &str) -> String {
+    let edited_device_name = edited_device_name.trim();
+    if edited_device_name.is_empty() {
+        state.device.name.clone()
+    } else {
+        edited_device_name.to_string()
+    }
+}
+
+fn native_device_list_rows(
+    state: &DesktopState,
+    edited_device_name: &str,
+) -> Vec<NativeDeviceListRow> {
+    let mut rows = vec![NativeDeviceListRow {
+        name: native_layout_center_device_name(state, edited_device_name),
+        status: "当前电脑".to_string(),
+        lan_ips: state.network.lan_ips.clone(),
+        public_ip: None,
+    }];
+    rows.extend(state.devices.iter().map(|device| NativeDeviceListRow {
+        name: device.name.clone(),
+        status: if device.online { "在线" } else { "离线" }.to_string(),
+        lan_ips: device.lan_ips.clone(),
+        public_ip: device.public_ip.clone(),
+    }));
+    rows
 }
 
 fn master_device_cell(ui: &mut egui::Ui, device_name: &str, is_master: bool, width: f32) {
@@ -974,6 +1000,59 @@ mod tests {
                 has_more: true,
                 total_count: 2
             }
+        );
+    }
+
+    #[test]
+    fn native_device_rows_include_live_current_device_name() {
+        let state = DesktopState {
+            device: DesktopDeviceState {
+                id: Some("current".to_string()),
+                name: "Old Name".to_string(),
+                os: "windows".to_string(),
+                app_version: "0.1.0".to_string(),
+                role: DesktopRole::Master,
+            },
+            network: DesktopNetworkState {
+                lan_ips: vec!["192.168.1.20".to_string()],
+                listen_port: Some(24_800),
+                ..DesktopNetworkState::default()
+            },
+            devices: vec![DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                os: "macos".to_string(),
+                online: true,
+                lan_ips: vec!["192.168.1.21".to_string()],
+                public_ip: None,
+                listen_port: Some(24_800),
+                last_seen_at: Some(124),
+            }],
+            ..DesktopState::default()
+        };
+
+        let rows = native_device_list_rows(&state, "Renamed PC");
+
+        assert_eq!(
+            rows,
+            vec![
+                NativeDeviceListRow {
+                    name: "Renamed PC".to_string(),
+                    status: "当前电脑".to_string(),
+                    lan_ips: vec!["192.168.1.20".to_string()],
+                    public_ip: None,
+                },
+                NativeDeviceListRow {
+                    name: "Right PC".to_string(),
+                    status: "在线".to_string(),
+                    lan_ips: vec!["192.168.1.21".to_string()],
+                    public_ip: None,
+                }
+            ]
+        );
+        assert_eq!(
+            native_layout_center_device_name(&state, "Renamed PC"),
+            "Renamed PC"
         );
     }
 
