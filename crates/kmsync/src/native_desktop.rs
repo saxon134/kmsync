@@ -5,6 +5,13 @@ use eframe::egui;
 use kmsync_core::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopState};
 
 const NATIVE_CJK_FONT_NAME: &str = "kmsync_cjk";
+const NATIVE_WINDOW_SIZE: [f32; 2] = [1120.0, 820.0];
+const NATIVE_WINDOW_MIN_SIZE: [f32; 2] = [900.0, 640.0];
+const NATIVE_LAYOUT_PANEL_MIN_HEIGHT: f32 = 180.0;
+const NATIVE_DEVICES_PANEL_MIN_HEIGHT: f32 = 220.0;
+const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 120.0;
+const NATIVE_ACTION_BUTTON_WIDTH: f32 = 150.0;
+const NATIVE_ACTION_BUTTON_HEIGHT: f32 = 34.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeDesktopViewModel {
@@ -15,6 +22,25 @@ pub(crate) struct NativeDesktopViewModel {
     pub(crate) is_master: bool,
     pub(crate) layout: DesktopLayout,
     pub(crate) device_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NativeDesktopLayoutMetrics {
+    window_size: [f32; 2],
+    min_window_size: [f32; 2],
+    full_width_sections: bool,
+    layout_panel_min_height: f32,
+    devices_panel_min_height: f32,
+    devices_grid_min_col_width: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeStatusTone {
+    Success,
+    Danger,
+    Warning,
+    Info,
+    Muted,
 }
 
 impl NativeDesktopViewModel {
@@ -40,11 +66,12 @@ impl NativeDesktopViewModel {
 
 pub(crate) fn run_native_desktop(config_path: &Path) -> Result<(), String> {
     let app = NativeDesktopApp::load(config_path.to_path_buf())?;
+    let metrics = native_desktop_layout_metrics();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("KMSync")
-            .with_inner_size([980.0, 720.0])
-            .with_min_inner_size([760.0, 560.0]),
+            .with_inner_size(metrics.window_size)
+            .with_min_inner_size(metrics.min_window_size),
         ..Default::default()
     };
     eframe::run_native(
@@ -56,6 +83,17 @@ pub(crate) fn run_native_desktop(config_path: &Path) -> Result<(), String> {
         }),
     )
     .map_err(|error| format!("native desktop window failed: {error}"))
+}
+
+fn native_desktop_layout_metrics() -> NativeDesktopLayoutMetrics {
+    NativeDesktopLayoutMetrics {
+        window_size: NATIVE_WINDOW_SIZE,
+        min_window_size: NATIVE_WINDOW_MIN_SIZE,
+        full_width_sections: true,
+        layout_panel_min_height: NATIVE_LAYOUT_PANEL_MIN_HEIGHT,
+        devices_panel_min_height: NATIVE_DEVICES_PANEL_MIN_HEIGHT,
+        devices_grid_min_col_width: NATIVE_DEVICES_GRID_MIN_COL_WIDTH,
+    }
 }
 
 fn install_native_text_fonts(ctx: &egui::Context) {
@@ -231,29 +269,34 @@ impl eframe::App for NativeDesktopApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("KMSync");
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!(
-                    "服务器：{}",
-                    connection_state_label(&self.state.server_state)
-                ));
+                connection_state_status(ui, "服务器", &self.state.server_state);
                 ui.separator();
-                ui.label(format!(
-                    "主电脑：{}",
-                    connection_state_label(&self.state.master_state)
-                ));
+                connection_state_status(ui, "主电脑", &self.state.master_state);
                 ui.separator();
                 ui.label(format!("状态：{}", self.status_message));
             });
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
+                let metrics = native_desktop_layout_metrics();
                 ui.columns(2, |columns| {
-                    columns[0].group(|ui| self.network_section(ui));
-                    columns[1].group(|ui| self.current_device_section(ui));
+                    columns[0].group(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        self.network_section(ui);
+                    });
+                    columns[1].group(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        self.current_device_section(ui);
+                    });
                 });
                 ui.add_space(12.0);
-                ui.group(|ui| self.layout_section(ui));
+                full_width_group(ui, metrics.layout_panel_min_height, |ui| {
+                    self.layout_section(ui);
+                });
                 ui.add_space(12.0);
-                ui.group(|ui| self.devices_section(ui));
+                full_width_group(ui, metrics.devices_panel_min_height, |ui| {
+                    self.devices_section(ui);
+                });
             });
         });
     }
@@ -267,7 +310,7 @@ impl NativeDesktopApp {
         ui.label("服务器端口");
         ui.text_edit_singleline(&mut self.server_port);
         ui.label(format!("完整地址：{}", self.server_url_preview()));
-        if ui.button("保存服务器配置").clicked() {
+        if native_action_button(ui, "保存服务器配置").clicked() {
             self.save_server_endpoint();
         }
         ui.separator();
@@ -297,40 +340,71 @@ impl NativeDesktopApp {
             self.state.device.id.as_deref().unwrap_or("-")
         ));
         ui.label(format!("系统：{}", self.state.device.os));
-        if ui.button("保存当前电脑配置").clicked() {
-            self.save_role();
-        }
-        if ui.button("刷新状态").clicked() {
-            self.reload_state();
-            self.status_message = "状态已刷新".to_string();
-        }
+        ui.horizontal_wrapped(|ui| {
+            if native_action_button(ui, "刷新状态").clicked() {
+                self.reload_state();
+                self.status_message = "状态已刷新".to_string();
+            }
+            if native_action_button(ui, "保存当前电脑配置").clicked() {
+                self.save_role();
+            }
+        });
     }
 
     fn layout_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("设备位置");
+        ui.set_min_height(NATIVE_LAYOUT_PANEL_MIN_HEIGHT);
         let devices = self
             .state
             .devices
             .iter()
             .map(|device| (device.id.clone(), device.name.clone()))
             .collect::<Vec<_>>();
-        device_combo(ui, "上方电脑", &mut self.layout.top, &devices);
-        device_combo(ui, "左边电脑", &mut self.layout.left, &devices);
-        device_combo(ui, "右边电脑", &mut self.layout.right, &devices);
-        device_combo(ui, "下方电脑", &mut self.layout.bottom, &devices);
-        if ui.button("保存设备位置").clicked() {
+        let combo_width = ((ui.available_width() - 18.0) / 2.0).max(240.0);
+        egui::Grid::new("native_layout_grid")
+            .num_columns(2)
+            .spacing([18.0, 10.0])
+            .min_col_width(combo_width)
+            .show(ui, |ui| {
+                device_combo(ui, "上方电脑", &mut self.layout.top, &devices, combo_width);
+                device_combo(
+                    ui,
+                    "下方电脑",
+                    &mut self.layout.bottom,
+                    &devices,
+                    combo_width,
+                );
+                ui.end_row();
+                device_combo(ui, "左边电脑", &mut self.layout.left, &devices, combo_width);
+                device_combo(
+                    ui,
+                    "右边电脑",
+                    &mut self.layout.right,
+                    &devices,
+                    combo_width,
+                );
+                ui.end_row();
+            });
+        ui.add_space(8.0);
+        if native_action_button(ui, "保存设备位置").clicked() {
             self.save_layout();
         }
     }
 
     fn devices_section(&self, ui: &mut egui::Ui) {
         ui.heading("设备列表");
+        ui.set_min_height(NATIVE_DEVICES_PANEL_MIN_HEIGHT);
         if self.state.devices.is_empty() {
             ui.label("暂无其他设备");
             return;
         }
+        let metrics = native_desktop_layout_metrics();
+        let min_col_width =
+            ((ui.available_width() - 72.0) / 4.0).max(metrics.devices_grid_min_col_width);
         egui::Grid::new("native_devices_grid")
             .striped(true)
+            .spacing([20.0, 8.0])
+            .min_col_width(min_col_width)
             .show(ui, |ui| {
                 ui.strong("设备");
                 ui.strong("状态");
@@ -353,6 +427,7 @@ fn device_combo(
     label: &str,
     selected: &mut Option<String>,
     devices: &[(String, String)],
+    width: f32,
 ) {
     let selected_text = selected
         .as_deref()
@@ -364,6 +439,7 @@ fn device_combo(
         })
         .unwrap_or("未配置");
     egui::ComboBox::from_label(label)
+        .width(width)
         .selected_text(selected_text)
         .show_ui(ui, |ui| {
             ui.selectable_value(selected, None, "未配置");
@@ -371,6 +447,60 @@ fn device_combo(
                 ui.selectable_value(selected, Some(id.clone()), name);
             }
         });
+}
+
+fn full_width_group<R>(
+    ui: &mut egui::Ui,
+    min_height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let width = ui.available_width();
+    ui.group(|ui| {
+        ui.set_min_width(width);
+        ui.set_min_height(min_height);
+        add_contents(ui)
+    })
+}
+
+fn native_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized(
+        native_action_button_size(),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .strong()
+                .color(egui::Color32::from_rgb(30, 64, 175)),
+        )
+        .fill(egui::Color32::from_rgb(239, 246, 255))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(147, 197, 253),
+        )),
+    )
+}
+
+fn native_action_button_size() -> egui::Vec2 {
+    egui::vec2(NATIVE_ACTION_BUTTON_WIDTH, NATIVE_ACTION_BUTTON_HEIGHT)
+}
+
+#[cfg(test)]
+fn native_action_button_labels() -> [&'static str; 4] {
+    [
+        "保存服务器配置",
+        "刷新状态",
+        "保存当前电脑配置",
+        "保存设备位置",
+    ]
+}
+
+fn connection_state_status(ui: &mut egui::Ui, label: &str, state: &DesktopConnectionState) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{label}："));
+        ui.label(
+            egui::RichText::new(connection_state_label(state))
+                .strong()
+                .color(connection_state_color(state)),
+        );
+    });
 }
 
 fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
@@ -381,6 +511,28 @@ fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
         DesktopConnectionState::AuthExpired => "登录失效",
         DesktopConnectionState::Retrying => "正在重试",
         DesktopConnectionState::SelfDevice => "当前电脑",
+    }
+}
+
+fn connection_state_tone(state: &DesktopConnectionState) -> NativeStatusTone {
+    match state {
+        DesktopConnectionState::Connected => NativeStatusTone::Success,
+        DesktopConnectionState::Connecting => NativeStatusTone::Danger,
+        DesktopConnectionState::AuthExpired | DesktopConnectionState::Retrying => {
+            NativeStatusTone::Warning
+        }
+        DesktopConnectionState::SelfDevice => NativeStatusTone::Info,
+        DesktopConnectionState::Disconnected => NativeStatusTone::Muted,
+    }
+}
+
+fn connection_state_color(state: &DesktopConnectionState) -> egui::Color32 {
+    match connection_state_tone(state) {
+        NativeStatusTone::Success => egui::Color32::from_rgb(21, 128, 61),
+        NativeStatusTone::Danger => egui::Color32::from_rgb(185, 28, 28),
+        NativeStatusTone::Warning => egui::Color32::from_rgb(180, 83, 9),
+        NativeStatusTone::Info => egui::Color32::from_rgb(37, 99, 235),
+        NativeStatusTone::Muted => egui::Color32::from_rgb(100, 116, 139),
     }
 }
 
@@ -446,6 +598,48 @@ mod tests {
         assert!(view_model.is_master);
         assert_eq!(view_model.layout.left.as_deref(), Some("left-device"));
         assert!(view_model.device_names.contains(&"Right PC".to_string()));
+    }
+
+    #[test]
+    fn native_desktop_layout_uses_wide_full_width_panels() {
+        let metrics = native_desktop_layout_metrics();
+
+        assert_eq!(metrics.window_size, [1120.0, 820.0]);
+        assert_eq!(metrics.min_window_size, [900.0, 640.0]);
+        assert!(metrics.full_width_sections);
+        assert!(metrics.layout_panel_min_height >= 180.0);
+        assert!(metrics.devices_panel_min_height >= 220.0);
+        assert!(metrics.devices_grid_min_col_width >= 120.0);
+    }
+
+    #[test]
+    fn native_desktop_connection_status_uses_semantic_colors() {
+        assert_eq!(
+            connection_state_tone(&DesktopConnectionState::Connected),
+            NativeStatusTone::Success
+        );
+        assert_eq!(
+            connection_state_tone(&DesktopConnectionState::Connecting),
+            NativeStatusTone::Danger
+        );
+        assert_ne!(
+            connection_state_color(&DesktopConnectionState::Connected),
+            connection_state_color(&DesktopConnectionState::Connecting)
+        );
+    }
+
+    #[test]
+    fn native_desktop_action_buttons_use_button_treatment() {
+        assert_eq!(
+            native_action_button_labels(),
+            [
+                "保存服务器配置",
+                "刷新状态",
+                "保存当前电脑配置",
+                "保存设备位置"
+            ]
+        );
+        assert_eq!(native_action_button_size(), egui::vec2(150.0, 34.0));
     }
 
     #[cfg(target_os = "windows")]
