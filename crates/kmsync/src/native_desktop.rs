@@ -53,6 +53,7 @@ struct NativeDeviceGridColumnWidths {
 }
 
 impl NativeDeviceGridColumnWidths {
+    #[cfg(test)]
     fn total_width(self, horizontal_spacing: f32) -> f32 {
         self.name + self.status + self.lan_ip + self.public_ip + horizontal_spacing * 3.0
     }
@@ -651,6 +652,7 @@ fn native_layout_combo_width(available_width: f32) -> f32 {
     )
 }
 
+#[cfg(test)]
 fn native_devices_grid_column_width(available_width: f32) -> f32 {
     native_fit_grid_column_width(
         available_width,
