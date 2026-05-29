@@ -67,8 +67,53 @@ pub struct DeviceIdentity {
 
 impl DeviceIdentity {
     pub fn load_or_generate(path: &Path) -> Result<Self, String> {
-        let secret_store = SystemDeviceIdentitySecretStore;
-        Self::load_or_generate_with_store(path, &secret_store)
+        Self::load_or_generate_for_storage_mode(path, system_device_identity_storage_mode())
+    }
+
+    fn load_or_generate_for_storage_mode(
+        path: &Path,
+        mode: DeviceIdentityStorageMode,
+    ) -> Result<Self, String> {
+        match mode {
+            DeviceIdentityStorageMode::LocalFile => Self::load_or_generate_local_file(path),
+            DeviceIdentityStorageMode::SystemSecretStore => {
+                let secret_store = SystemDeviceIdentitySecretStore;
+                Self::load_or_generate_with_store(path, &secret_store)
+            }
+        }
+    }
+
+    fn load_or_generate_local_file(path: &Path) -> Result<Self, String> {
+        if path.exists() {
+            let text = fs::read_to_string(path)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+            let stored: DeviceIdentityFile = serde_json::from_str(&text)
+                .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+            if let Some(private_key) = stored.private_key {
+                let device_id = stored.device_id.unwrap_or_else(generate_device_id);
+                let identity = DeviceIdentity {
+                    device_id,
+                    public_key: stored.public_key,
+                    private_key,
+                };
+                write_device_identity_local_file(
+                    path,
+                    &identity.device_id,
+                    &identity.public_key,
+                    &identity.private_key,
+                )?;
+                return Ok(identity);
+            }
+        }
+
+        let identity = Self::generate();
+        write_device_identity_local_file(
+            path,
+            &identity.device_id,
+            &identity.public_key,
+            &identity.private_key,
+        )?;
+        Ok(identity)
     }
 
     fn load_or_generate_with_store<S>(path: &Path, secret_store: &S) -> Result<Self, String>
@@ -105,6 +150,23 @@ impl DeviceIdentity {
             ),
             private_key: format!("ed25519:{}", hex_encode(&signing_key.to_bytes())),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceIdentityStorageMode {
+    LocalFile,
+    SystemSecretStore,
+}
+
+fn system_device_identity_storage_mode() -> DeviceIdentityStorageMode {
+    device_identity_storage_mode_for_os(std::env::consts::OS)
+}
+
+fn device_identity_storage_mode_for_os(os: &str) -> DeviceIdentityStorageMode {
+    match os {
+        "windows" => DeviceIdentityStorageMode::SystemSecretStore,
+        _ => DeviceIdentityStorageMode::LocalFile,
     }
 }
 
@@ -206,6 +268,21 @@ fn write_device_identity_file(
     write_device_identity_metadata(path, &stored)
 }
 
+fn write_device_identity_local_file(
+    path: &Path,
+    device_id: &str,
+    public_key: &str,
+    private_key: &str,
+) -> Result<(), String> {
+    let stored = DeviceIdentityFile {
+        device_id: Some(device_id.to_string()),
+        public_key: public_key.to_string(),
+        private_key: Some(private_key.to_string()),
+        private_key_ref: None,
+    };
+    write_device_identity_metadata(path, &stored)
+}
+
 fn write_device_identity_metadata(path: &Path, stored: &DeviceIdentityFile) -> Result<(), String> {
     let text = serde_json::to_string_pretty(stored)
         .map_err(|error| format!("failed to encode device identity: {error}"))?;
@@ -235,28 +312,18 @@ trait DeviceIdentitySecretStore {
     fn load_private_key(&self, reference: &DeviceIdentitySecretRef) -> Result<String, String>;
 }
 
-#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[cfg(all(test, target_os = "windows"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceIdentitySecretStoreKind {
-    #[cfg(target_os = "windows")]
     WindowsCredentialManager,
-    #[cfg(target_os = "macos")]
-    MacosKeychain,
 }
 
 struct SystemDeviceIdentitySecretStore;
 
-#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[cfg(all(test, target_os = "windows"))]
 impl SystemDeviceIdentitySecretStore {
     const fn kind() -> DeviceIdentitySecretStoreKind {
-        #[cfg(target_os = "windows")]
-        {
-            DeviceIdentitySecretStoreKind::WindowsCredentialManager
-        }
-        #[cfg(target_os = "macos")]
-        {
-            DeviceIdentitySecretStoreKind::MacosKeychain
-        }
+        DeviceIdentitySecretStoreKind::WindowsCredentialManager
     }
 }
 
@@ -274,7 +341,7 @@ impl DeviceIdentitySecretStore for SystemDeviceIdentitySecretStore {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "windows")]
 fn store_system_private_key(
     reference: &DeviceIdentitySecretRef,
     private_key: &str,
@@ -286,7 +353,7 @@ fn store_system_private_key(
         .map_err(|error| format!("failed to store private key in system credential store: {error}"))
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "windows")]
 fn load_system_private_key(reference: &DeviceIdentitySecretRef) -> Result<String, String> {
     let entry = keyring::Entry::new(&reference.service, &reference.account)
         .map_err(|error| format!("failed to open system credential store: {error}"))?;
@@ -295,17 +362,17 @@ fn load_system_private_key(reference: &DeviceIdentitySecretRef) -> Result<String
     })
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 fn store_system_private_key(
     _reference: &DeviceIdentitySecretRef,
     _private_key: &str,
 ) -> Result<(), String> {
-    Err("system credential store is only configured for macOS Keychain and Windows Credential Manager".to_string())
+    Err("system credential store is only configured for Windows Credential Manager".to_string())
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 fn load_system_private_key(_reference: &DeviceIdentitySecretRef) -> Result<String, String> {
-    Err("system credential store is only configured for macOS Keychain and Windows Credential Manager".to_string())
+    Err("system credential store is only configured for Windows Credential Manager".to_string())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -638,7 +705,8 @@ impl DirectLanReconnectState {
         F: FnMut(&ConnectionCandidate, SocketAddr) -> Result<(), String>,
     {
         let local_lan_ips = normalize_lan_ip_snapshot(local_lan_ips);
-        let direct_candidates = normalize_direct_candidate_snapshot(candidates);
+        let mut direct_candidates = normalize_direct_candidate_snapshot(candidates);
+        prioritize_direct_candidates_for_local_network(&mut direct_candidates, &local_lan_ips);
         let Some(reason) = self.reconnect_reason(
             current_connection_healthy,
             &local_lan_ips,
@@ -1148,6 +1216,50 @@ fn normalize_direct_candidate_snapshot(
         .collect::<Vec<_>>();
     sort_connection_candidates(&mut direct_candidates);
     dedupe_candidates_by_address(direct_candidates)
+}
+
+fn prioritize_direct_candidates_for_local_network(
+    candidates: &mut [ConnectionCandidate],
+    local_lan_ips: &[IpAddr],
+) {
+    candidates.sort_by(|left, right| {
+        let left_same_subnet = candidate_matches_local_subnet(left, local_lan_ips);
+        let right_same_subnet = candidate_matches_local_subnet(right, local_lan_ips);
+        right_same_subnet
+            .cmp(&left_same_subnet)
+            .then_with(|| right.priority.cmp(&left.priority))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+}
+
+fn candidate_matches_local_subnet(
+    candidate: &ConnectionCandidate,
+    local_lan_ips: &[IpAddr],
+) -> bool {
+    candidate
+        .address
+        .parse::<SocketAddr>()
+        .is_ok_and(|address| {
+            local_lan_ips
+                .iter()
+                .any(|local_ip| same_lan_subnet(*local_ip, address.ip()))
+        })
+}
+
+fn same_lan_subnet(left: IpAddr, right: IpAddr) -> bool {
+    match (left, right) {
+        (IpAddr::V4(left), IpAddr::V4(right)) => {
+            let left = left.octets();
+            let right = right.octets();
+            left[..3] == right[..3]
+        }
+        (IpAddr::V6(left), IpAddr::V6(right)) => {
+            let left = left.segments();
+            let right = right.segments();
+            left[..4] == right[..4]
+        }
+        _ => false,
+    }
 }
 
 fn push_candidate(
@@ -2406,6 +2518,45 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_state_prefers_same_subnet_lan_candidate() {
+        let mut state = DirectLanReconnectState::default();
+        let local_ips = vec!["192.168.30.10".parse().expect("local ip")];
+        let candidates = vec![
+            connection_candidate(
+                "windows",
+                ConnectionCandidateKind::MdnsLan,
+                "10.0.0.5:24800",
+            ),
+            connection_candidate(
+                "windows",
+                ConnectionCandidateKind::BackendLan,
+                "192.168.30.8:24800",
+            ),
+        ];
+        let mut attempted = Vec::new();
+
+        let outcome = state
+            .refresh(&local_ips, &candidates, false, |candidate, address| {
+                attempted.push((candidate.kind, address));
+                Ok(())
+            })
+            .expect("refresh")
+            .expect("outcome");
+
+        assert_eq!(
+            outcome.attempt.address,
+            "192.168.30.8:24800".parse().expect("same subnet")
+        );
+        assert_eq!(
+            attempted,
+            vec![(
+                ConnectionCandidateKind::BackendLan,
+                "192.168.30.8:24800".parse().expect("same subnet")
+            )]
+        );
+    }
+
+    #[test]
     fn reconnect_state_rediscovers_when_remote_candidates_change() {
         let mut state = DirectLanReconnectState::default();
         let local_ips = vec!["10.0.0.2".parse().expect("local ip")];
@@ -2822,6 +2973,30 @@ mod tests {
     }
 
     #[test]
+    fn local_file_identity_storage_persists_private_key_without_secret_ref() {
+        let path = temp_identity_path();
+        let first = DeviceIdentity::load_or_generate_for_storage_mode(
+            &path,
+            DeviceIdentityStorageMode::LocalFile,
+        )
+        .expect("generate local identity");
+        let text = fs::read_to_string(&path).expect("identity file");
+
+        assert!(text.contains("\"private_key\""));
+        assert!(text.contains(&first.private_key));
+        assert!(!text.contains("\"private_key_ref\""));
+
+        let second = DeviceIdentity::load_or_generate_for_storage_mode(
+            &path,
+            DeviceIdentityStorageMode::LocalFile,
+        )
+        .expect("load local identity");
+        assert_eq!(second, first);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn device_identity_file_keeps_private_key_in_secret_store() {
         let path = temp_identity_path();
         let store = RecordingDeviceIdentitySecretStore::default();
@@ -2883,10 +3058,18 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_identity_secret_store_uses_keychain() {
+    fn macos_identity_storage_uses_local_file() {
         assert_eq!(
-            SystemDeviceIdentitySecretStore::kind(),
-            DeviceIdentitySecretStoreKind::MacosKeychain
+            system_device_identity_storage_mode(),
+            DeviceIdentityStorageMode::LocalFile
+        );
+    }
+
+    #[test]
+    fn macos_identity_storage_policy_is_local_file() {
+        assert_eq!(
+            device_identity_storage_mode_for_os("macos"),
+            DeviceIdentityStorageMode::LocalFile
         );
     }
 

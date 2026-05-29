@@ -26,7 +26,7 @@
 | 热路径队列 | lock-free ring buffer / crossbeam / rtrb |
 | 协议编码 | 自定义 packed binary / FlatBuffers / Cap'n Proto |
 | 本地配置 | SQLite / sled / TOML + 原子写入 |
-| 安全存储 | Keychain / Credential Manager / libsecret |
+| 安全存储 | macOS / Linux 本地 JSON 文件；Windows Credential Manager |
 
 ## 3. 进程架构
 

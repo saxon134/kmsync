@@ -222,30 +222,31 @@ button.primary {{
           <div class="fact"><span>设备 ID</span><strong>{device_id}</strong></div>
           <div class="fact"><span>系统</span><strong>{device_os}</strong></div>
           <div class="fact"><span>内网 IP</span><strong>{lan_ips}</strong></div>
-          <div class="fact"><span>公网 IP</span><strong>{public_ip}</strong></div>
           <div class="fact"><span>监听端口</span><strong>{listen_port}</strong></div>
           <div class="fact"><span>最近心跳</span><strong>{last_seen_at}</strong></div>
           <button type="button" class="primary">保存配置</button>
         </div>
       </section>
     </section>
-    <section class="panel">
-      <h2>设备位置</h2>
-      <div class="body">
-        <div class="layout">
-          {layout_slots}
-          <div class="local"><strong>主电脑</strong><span>{device_name}</span></div>
+    <section class="grid secondary-grid">
+      <section class="panel">
+        <h2>设备位置</h2>
+        <div class="body">
+          <div class="layout">
+            {layout_slots}
+            <div class="local"><strong>主电脑</strong><span>{device_name}</span></div>
+          </div>
         </div>
-      </div>
-    </section>
-    <section class="panel">
-      <h2>设备列表</h2>
-      <div class="body">
-        <table class="devices">
-          <thead><tr><th>设备</th><th>状态</th><th>内网 IP</th><th>公网 IP</th></tr></thead>
-          <tbody>{device_rows}</tbody>
-        </table>
-      </div>
+      </section>
+      <section class="panel">
+        <h2>设备列表</h2>
+        <div class="body">
+          <table class="devices">
+            <thead><tr><th>设备</th><th>状态</th><th>内网 IP</th><th>公网 IP</th></tr></thead>
+            <tbody>{device_rows}</tbody>
+          </table>
+        </div>
+      </section>
     </section>
   </main>
 </div>
@@ -282,7 +283,6 @@ serverPortInput.addEventListener("input", updateServerUrlPreview);
             state.network.server_url.as_deref().unwrap_or("http://")
         )),
         lan_ips = escape_html(&empty_dash(&state.network.lan_ips.join(", "))),
-        public_ip = escape_html(state.network.public_ip.as_deref().unwrap_or("-")),
         listen_port = state
             .network
             .listen_port
@@ -485,7 +485,7 @@ mod tests {
         assert!(html.contains("serverPort"));
         assert!(html.contains("http://203.0.113.10:24888"));
         assert!(html.contains("内网 IP"));
-        assert!(html.contains("公网 IP"));
+        assert!(!html.contains("<div class=\"fact\"><span>公网 IP</span>"));
         assert!(html.contains("连接中"));
         assert!(html.contains("将当前电脑作为主电脑"));
         assert!(html.contains("左边电脑"));
@@ -500,7 +500,14 @@ mod tests {
             .nth(1)
             .expect("current computer section");
         assert!(current_device_section.contains("内网 IP"));
-        assert!(current_device_section.contains("公网 IP"));
+        assert!(!current_device_section.contains("<span>公网 IP</span>"));
         assert!(current_device_section.contains("监听端口"));
+
+        let layout_pair = html
+            .split("<section class=\"grid secondary-grid\">")
+            .nth(1)
+            .expect("secondary grid");
+        assert!(layout_pair.contains("<h2>设备位置</h2>"));
+        assert!(layout_pair.contains("<h2>设备列表</h2>"));
     }
 }

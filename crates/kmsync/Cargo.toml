@@ -55,7 +55,6 @@ x11rb = { version = "0.13", default-features = false, features = ["xinput", "xte
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 foreign-types = "0.5"
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
 
 [lints]
 workspace = true

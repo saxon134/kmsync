@@ -30,7 +30,7 @@ struct NativeDesktopLayoutMetrics {
     window_size: [f32; 2],
     min_window_size: [f32; 2],
     top_panel_min_height: f32,
-    full_width_sections: bool,
+    lower_panel_columns: usize,
     layout_panel_min_height: f32,
     devices_panel_min_height: f32,
     devices_grid_min_col_width: f32,
@@ -92,7 +92,7 @@ fn native_desktop_layout_metrics() -> NativeDesktopLayoutMetrics {
         window_size: NATIVE_WINDOW_SIZE,
         min_window_size: NATIVE_WINDOW_MIN_SIZE,
         top_panel_min_height: NATIVE_TOP_PANEL_MIN_HEIGHT,
-        full_width_sections: true,
+        lower_panel_columns: 2,
         layout_panel_min_height: NATIVE_LAYOUT_PANEL_MIN_HEIGHT,
         devices_panel_min_height: NATIVE_DEVICES_PANEL_MIN_HEIGHT,
         devices_grid_min_col_width: NATIVE_DEVICES_GRID_MIN_COL_WIDTH,
@@ -295,12 +295,17 @@ impl eframe::App for NativeDesktopApp {
                     });
                 });
                 ui.add_space(12.0);
-                full_width_group(ui, metrics.layout_panel_min_height, |ui| {
-                    self.layout_section(ui);
-                });
-                ui.add_space(12.0);
-                full_width_group(ui, metrics.devices_panel_min_height, |ui| {
-                    self.devices_section(ui);
+                ui.columns(metrics.lower_panel_columns, |columns| {
+                    columns[0].group(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.set_min_height(metrics.layout_panel_min_height);
+                        self.layout_section(ui);
+                    });
+                    columns[1].group(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.set_min_height(metrics.devices_panel_min_height);
+                        self.devices_section(ui);
+                    });
                 });
             });
         });
@@ -331,22 +336,21 @@ impl NativeDesktopApp {
         ui.label(format!("系统：{}", self.state.device.os));
         ui.separator();
         ui.label(format!(
-            "内网 IP：{}",
+            "{}：{}",
+            native_current_device_fact_labels()[0],
             empty_dash(&self.state.network.lan_ips.join(", "))
         ));
         ui.label(format!(
-            "公网 IP：{}",
-            self.state.network.public_ip.as_deref().unwrap_or("-")
-        ));
-        ui.label(format!(
-            "监听端口：{}",
+            "{}：{}",
+            native_current_device_fact_labels()[1],
             self.state
                 .network
                 .listen_port
                 .map_or_else(|| "-".to_string(), |port| port.to_string())
         ));
         ui.label(format!(
-            "最近心跳：{}",
+            "{}：{}",
+            native_current_device_fact_labels()[2],
             self.state
                 .network
                 .last_seen_at
@@ -371,7 +375,7 @@ impl NativeDesktopApp {
             .iter()
             .map(|device| (device.id.clone(), device.name.clone()))
             .collect::<Vec<_>>();
-        let combo_width = ((ui.available_width() - 48.0) / 3.0).max(180.0);
+        let combo_width = ((ui.available_width() - 32.0) / 3.0).max(120.0);
         egui::Grid::new("native_layout_grid")
             .num_columns(3)
             .spacing([24.0, 10.0])
@@ -487,19 +491,6 @@ fn master_device_cell(ui: &mut egui::Ui, device_name: &str, is_master: bool, wid
     );
 }
 
-fn full_width_group<R>(
-    ui: &mut egui::Ui,
-    min_height: f32,
-    add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> egui::InnerResponse<R> {
-    let width = ui.available_width();
-    ui.group(|ui| {
-        ui.set_min_width(width);
-        ui.set_min_height(min_height);
-        add_contents(ui)
-    })
-}
-
 fn native_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add_sized(
         native_action_button_size(),
@@ -539,6 +530,10 @@ fn status_message_for_state(state: &DesktopState, fallback: &str) -> String {
         return error.to_string();
     }
     fallback.to_string()
+}
+
+fn native_current_device_fact_labels() -> [&'static str; 3] {
+    ["内网 IP", "监听端口", "最近心跳"]
 }
 
 fn connection_state_status(ui: &mut egui::Ui, label: &str, state: &DesktopConnectionState) {
@@ -653,10 +648,18 @@ mod tests {
         assert_eq!(metrics.window_size, [1120.0, 820.0]);
         assert_eq!(metrics.min_window_size, [900.0, 640.0]);
         assert!(metrics.top_panel_min_height >= 250.0);
-        assert!(metrics.full_width_sections);
+        assert_eq!(metrics.lower_panel_columns, 2);
         assert!(metrics.layout_panel_min_height >= 180.0);
         assert!(metrics.devices_panel_min_height >= 220.0);
         assert!(metrics.devices_grid_min_col_width >= 120.0);
+    }
+
+    #[test]
+    fn native_current_device_facts_do_not_show_public_ip() {
+        assert_eq!(
+            native_current_device_fact_labels(),
+            ["内网 IP", "监听端口", "最近心跳"]
+        );
     }
 
     #[test]

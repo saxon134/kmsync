@@ -128,7 +128,7 @@ output_delta_x = input_delta_x * horizontal_multiplier
 姣忓彴璁惧棣栨鐧诲綍鍚庣敓鎴愬瘑閽ュ锛?
 - 绉侀挜鍙瓨鏈満瀹夊叏瀛樺偍銆?- 鍏挜涓婁紶鍒版湇鍔＄銆?- 鏈嶅姟绔繚瀛樿澶囧叕閽ュ拰璐︽埛缁戝畾鍏崇郴銆?- 璁惧寤鸿繛鏃朵娇鐢ㄥ叕閽ラ獙璇佸鏂硅韩浠姐€?
 鏈満瀹夊叏瀛樺偍锛?
-- macOS Keychain銆?- Windows Credential Manager / DPAPI銆?- Linux Secret Service / libsecret锛屽繀瑕佹椂闄嶇骇鍒板姞瀵嗘枃浠躲€?
+- macOS / Linux 使用本地身份文件保存；Windows 使用 Credential Manager / DPAPI。
 ### 7.3 绔埌绔姞瀵?
 褰撳墠瀹炵幇浣跨敤 QUIC TLS 1.3 鎻愪緵浼犺緭鍔犲瘑锛屽苟鍦ㄤ笟鍔″抚灞傚鍔犵鍒扮 envelope锛?
 - 浠?QUIC `export_keying_material` 瀵煎嚭鏁版嵁闈㈡牴瀵嗛挜銆?- 閫氳繃 HKDF-SHA256 涓烘瘡涓?epoch 娲剧敓鐙珛甯у瘑閽ャ€?- 浣跨敤 ChaCha20-Poly1305 鍔犲瘑杈撳叆銆佸壀璐存澘銆佹枃浠跺拰 control 甯с€?- envelope 璁よ瘉澶村寘鍚€氶亾銆乪poch 鍜屽畨鍏ㄥ簭鍒楀彿锛屼綔涓?AEAD AAD銆?- 鎺ユ敹绔寜 epoch 缁存姢閲嶆斁绐楀彛锛屾嫆缁濋噸澶嶆垨杩囨棫搴忓垪鍙枫€?- 鎺ユ敹绔鏌ュ抚鍐呰澶?ID锛屾嫆缁濇挙閿€璁惧缁х画鍙戦€佷笟鍔″唴瀹广€?
