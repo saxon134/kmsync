@@ -1,0 +1,42 @@
+{
+  "profile_id": "mac-user-to-windows",
+  "source_os": "macos",
+  "target_os": "windows",
+  "preset": "keep_mac_habit",
+  "modifier_mapping": {
+    "left_meta": "left_control",
+    "right_meta": "right_control",
+    "left_alt": "left_alt",
+    "right_alt": "right_alt",
+    "left_control": "left_control",
+    "right_control": "right_control"
+  },
+  "scroll": {
+    "vertical_multiplier": -1.0,
+    "horizontal_multiplier": -1.0
+  },
+  "pointer": {
+    "speed_multiplier": 1.0
+  },
+  "function_key_mode": "standard",
+  "keyboard_mode": "physical",
+  "source_keyboard_layout": "us_ansi",
+  "target_keyboard_layout": "us_ansi",
+  "non_english_input_strategy": "ime_passthrough",
+  "device_layout": {
+    "targets": [
+      {
+        "device_id": "windows-left",
+        "display_name": "Windows Left"
+      },
+      {
+        "device_id": "windows-right",
+        "display_name": "Windows Right"
+      }
+    ],
+    "edges": {
+      "left": "windows-left",
+      "right": "windows-right"
+    }
+  }
+}

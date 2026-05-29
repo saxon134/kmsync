@@ -1,0 +1,13 @@
+[package]
+name = "kmsync-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+kmsync-core = { path = "../kmsync-core" }
+serde_json = "1"
+
+[lints]
+workspace = true

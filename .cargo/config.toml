@@ -1,0 +1,5 @@
+[env]
+CC_x86_64_apple_darwin = { value = "tools/cross-check-cc.cmd", relative = true }
+CC_x86_64_unknown_linux_gnu = { value = "tools/cross-check-cc.cmd", relative = true }
+AR_x86_64_apple_darwin = "ar"
+AR_x86_64_unknown_linux_gnu = "ar"

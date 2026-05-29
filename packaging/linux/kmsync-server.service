@@ -1,0 +1,20 @@
+[Unit]
+Description=KMSync control-plane server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kmsync
+Group=kmsync
+ExecStart=/opt/kmsync/bin/kmsync-server /etc/kmsync/kmsync-server.json
+Restart=on-failure
+RestartSec=5
+StateDirectory=kmsync
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

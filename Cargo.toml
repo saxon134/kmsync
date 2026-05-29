@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/kmsync-core",
+    "crates/kmsync-daemon",
+    "crates/kmsync-ui",
+    "crates/kmsync-server"
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+authors = ["KMSync contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+unwrap_used = "warn"

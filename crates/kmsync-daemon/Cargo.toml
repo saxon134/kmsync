@@ -1,0 +1,59 @@
+[package]
+name = "kmsync-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+kmsync-core = { path = "../kmsync-core" }
+kmsync-ui = { path = "../kmsync-ui" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+ureq = { version = "3", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "bloom"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "io-util"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_DataExchange",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Services",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging"
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", default-features = false, features = ["xinput", "xtest"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.25", features = ["highsierra"] }
+core-foundation = "0.10"
+foreign-types = "0.5"
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[lints]
+workspace = true
