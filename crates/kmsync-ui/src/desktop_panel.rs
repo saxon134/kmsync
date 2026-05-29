@@ -86,7 +86,7 @@ body {{
   display: grid;
   grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.1fr);
   gap: 14px;
-  align-items: start;
+  align-items: stretch;
 }}
 .panel {{
   border: 1px solid var(--line);
@@ -208,20 +208,11 @@ button.primary {{
   <main class="content">
     <section class="grid">
       <section class="panel">
-        <h2>Linux 服务器</h2>
+        <h2>服务器</h2>
         <div class="body">
           <label class="field"><span>服务器 IP/域名</span><input id="serverHost" name="server_host" value="{server_host}" placeholder="1.2.3.4"></label>
           <label class="field"><span>服务器端口</span><input id="serverPort" name="server_port" type="number" min="1" max="65535" value="{server_port}" placeholder="24888"></label>
           <div class="fact"><span>完整地址</span><strong id="serverUrlPreview" data-scheme="{server_scheme}">{server_url}</strong></div>
-        </div>
-      </section>
-      <section class="panel">
-        <h2>网络状态</h2>
-        <div class="body facts">
-          <div class="fact"><span>内网 IP</span><strong>{lan_ips}</strong></div>
-          <div class="fact"><span>公网 IP</span><strong>{public_ip}</strong></div>
-          <div class="fact"><span>监听端口</span><strong>{listen_port}</strong></div>
-          <div class="fact"><span>最近心跳</span><strong>{last_seen_at}</strong></div>
         </div>
       </section>
       <section class="panel">
@@ -230,6 +221,10 @@ button.primary {{
           <label class="role"><input type="checkbox" {master_checked}> 将当前电脑作为主电脑</label>
           <div class="fact"><span>设备 ID</span><strong>{device_id}</strong></div>
           <div class="fact"><span>系统</span><strong>{device_os}</strong></div>
+          <div class="fact"><span>内网 IP</span><strong>{lan_ips}</strong></div>
+          <div class="fact"><span>公网 IP</span><strong>{public_ip}</strong></div>
+          <div class="fact"><span>监听端口</span><strong>{listen_port}</strong></div>
+          <div class="fact"><span>最近心跳</span><strong>{last_seen_at}</strong></div>
           <button type="button" class="primary">保存配置</button>
         </div>
       </section>
@@ -483,7 +478,9 @@ mod tests {
 
         let html = render_desktop_panel(&state).expect("render desktop panel");
 
-        assert!(html.contains("Linux 服务器"));
+        assert!(html.contains("<h2>服务器</h2>"));
+        assert!(!html.contains("Linux 服务器"));
+        assert!(!html.contains("<h2>网络状态</h2>"));
         assert!(html.contains("服务器 IP/域名"));
         assert!(html.contains("服务器端口"));
         assert!(html.contains("serverHost"));
@@ -499,5 +496,13 @@ mod tests {
         assert!(html.contains("203.0.113.10"));
         assert!(html.contains("Right PC"));
         assert!(!html.contains("legacy daemon"));
+
+        let current_device_section = html
+            .split("<h2>当前电脑</h2>")
+            .nth(1)
+            .expect("current computer section");
+        assert!(current_device_section.contains("内网 IP"));
+        assert!(current_device_section.contains("公网 IP"));
+        assert!(current_device_section.contains("监听端口"));
     }
 }

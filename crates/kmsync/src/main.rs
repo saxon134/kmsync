@@ -384,13 +384,29 @@ fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopS
     ensure_daemon_config_file(config_path)?;
     let client_config = client::ClientConfig::load(config_path)?;
     let desktop_config = desktop_config::DesktopConfig::load(config_path).unwrap_or_default();
-    let (server_state, server_error) = desktop_server_probe_result_to_state(
+    let (server_state, mut server_error) = desktop_server_probe_result_to_state(
         client::probe_server_reachable(&client_config.server_url),
     );
     let local_lan_ips = client::discover_local_lan_ips()
         .into_iter()
         .map(|ip| ip.to_string())
         .collect::<Vec<_>>();
+    let mut current_device_id = None;
+    let mut devices = Vec::new();
+    let mut master_error = None;
+    if server_state == kmsync_core::DesktopConnectionState::Connected {
+        match client::load_desktop_device_inventory(&client_config, &local_lan_ips) {
+            Ok(inventory) => {
+                current_device_id = Some(inventory.current_device_id);
+                devices = inventory.devices;
+            }
+            Err(error) => {
+                master_error = Some(format!("设备列表刷新失败：{error}"));
+            }
+        }
+    } else if server_error.is_none() {
+        server_error = Some("服务器未连接，无法刷新设备列表".to_string());
+    }
     let permissions = platform::current_platform().permission_checks();
     Ok(desktop_state::build_desktop_state(
         desktop_state::DesktopStateBuildInput {
@@ -398,14 +414,14 @@ fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopS
             device_name: &client_config.device_name,
             server_url: &client_config.server_url,
             listen_port: client_config.listen_port,
-            current_device_id: None,
+            current_device_id: current_device_id.as_deref(),
             local_lan_ips,
             desktop_config: &desktop_config,
-            devices: &[],
+            devices: &devices,
             permissions: &permissions,
             server_state,
             server_error,
-            master_error: None,
+            master_error,
         },
     ))
 }
@@ -3102,13 +3118,17 @@ fn default_daemon_config_path() -> PathBuf {
     let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("kmsync"));
     let home_dir = env::var_os("HOME").map(PathBuf::from);
     let appdata_dir = env::var_os("APPDATA").map(PathBuf::from);
-    default_daemon_config_path_from_env(
+    let config_path = default_daemon_config_path_from_env(
         &current_dir,
         &exe_path,
         home_dir.as_deref(),
         appdata_dir.as_deref(),
         env::consts::OS,
-    )
+    );
+    if let Err(error) = seed_default_daemon_config_if_needed(&config_path, &exe_path) {
+        eprintln!("kmsync: failed to prepare default config: {error}");
+    }
+    config_path
 }
 
 #[cfg(test)]
@@ -3123,6 +3143,12 @@ fn default_daemon_config_path_from_env(
     appdata_dir: Option<&Path>,
     os: &str,
 ) -> PathBuf {
+    if os == "macos" && is_macos_app_bundle_executable(exe_path) {
+        if let Some(path) = default_user_daemon_config_path(home_dir, appdata_dir, os) {
+            return path;
+        }
+    }
+
     let mut candidates = vec![
         current_dir.join("configs").join(DEFAULT_DAEMON_CONFIG_FILE),
         current_dir.join("config").join(DEFAULT_DAEMON_CONFIG_FILE),
@@ -3166,6 +3192,63 @@ fn default_user_daemon_config_path(
                 .join(DEFAULT_DAEMON_CONFIG_FILE)
         }),
     }
+}
+
+fn is_macos_app_bundle_executable(exe_path: &Path) -> bool {
+    let Some(exe_dir) = exe_path.parent() else {
+        return false;
+    };
+    if exe_dir.file_name().and_then(|name| name.to_str()) != Some("MacOS") {
+        return false;
+    }
+    let Some(contents_dir) = exe_dir.parent() else {
+        return false;
+    };
+    if contents_dir.file_name().and_then(|name| name.to_str()) != Some("Contents") {
+        return false;
+    }
+    contents_dir
+        .parent()
+        .and_then(|bundle| bundle.extension())
+        .and_then(|extension| extension.to_str())
+        == Some("app")
+}
+
+fn bundled_app_daemon_config_path(exe_path: &Path) -> Option<PathBuf> {
+    let exe_dir = exe_path.parent()?;
+    if exe_dir.file_name().and_then(|name| name.to_str()) != Some("MacOS") {
+        return None;
+    }
+    let contents_dir = exe_dir.parent()?;
+    Some(
+        contents_dir
+            .join("configs")
+            .join(DEFAULT_DAEMON_CONFIG_FILE),
+    )
+}
+
+fn seed_default_daemon_config_if_needed(config_path: &Path, exe_path: &Path) -> Result<(), String> {
+    if config_path.exists() {
+        return Ok(());
+    }
+    let Some(template_path) = bundled_app_daemon_config_path(exe_path) else {
+        return Ok(());
+    };
+    if !template_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    fs::copy(&template_path, config_path).map_err(|error| {
+        format!(
+            "failed to copy {} to {}: {error}",
+            template_path.display(),
+            config_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn parse_addr_arg(value: Option<String>, missing: &str) -> Result<SocketAddr, String> {
@@ -4454,6 +4537,45 @@ mod tests {
     }
 
     #[test]
+    fn default_daemon_config_path_uses_macos_user_config_for_installed_app_bundle() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("kmsync-macos-app-config-{suffix}"));
+        let home = root.join("home");
+        let contents_dir = root
+            .join("Applications")
+            .join("KMSync.app")
+            .join("Contents");
+        let macos_dir = contents_dir.join("MacOS");
+        let bundled_config_dir = contents_dir.join("configs");
+        std::fs::create_dir_all(&home).expect("create home dir");
+        std::fs::create_dir_all(&macos_dir).expect("create macos dir");
+        std::fs::create_dir_all(&bundled_config_dir).expect("create bundled config dir");
+        std::fs::write(bundled_config_dir.join(DEFAULT_DAEMON_CONFIG_FILE), "{}")
+            .expect("write bundled config");
+
+        let config_path = default_daemon_config_path_from_env(
+            Path::new("/"),
+            &macos_dir.join("kmsync"),
+            Some(home.as_path()),
+            None,
+            "macos",
+        );
+
+        assert_eq!(
+            config_path,
+            home.join("Library")
+                .join("Application Support")
+                .join("KMSync")
+                .join(DEFAULT_DAEMON_CONFIG_FILE)
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup temp package");
+    }
+
+    #[test]
     fn desktop_server_probe_result_sets_terminal_statuses() {
         assert_eq!(
             desktop_server_probe_result_to_state(Ok(())),
@@ -4478,6 +4600,8 @@ mod tests {
             listen_port: 24_800,
             heartbeat_interval_seconds: 15,
             identity_path: PathBuf::from("identity.json"),
+            auth_session: None,
+            source_path: None,
         };
         let plan =
             CoreServicePlan::from_config(PathBuf::from("configs/daemon.example.json"), &config);

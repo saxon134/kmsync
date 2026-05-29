@@ -1,7 +1,8 @@
 {
-  "server_url": "http://127.0.0.1:24888",
+  "server_url": "http://47.114.107.118:24888",
   "email": "dev@example.com",
   "email_login_code": null,
+  "auth_session": null,
   "device_name": "Development Mac",
   "identity_path": "kmsync-device-identity.json",
   "listen_port": 24800,

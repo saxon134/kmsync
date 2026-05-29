@@ -7,6 +7,7 @@ use kmsync_core::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopSta
 const NATIVE_CJK_FONT_NAME: &str = "kmsync_cjk";
 const NATIVE_WINDOW_SIZE: [f32; 2] = [1120.0, 820.0];
 const NATIVE_WINDOW_MIN_SIZE: [f32; 2] = [900.0, 640.0];
+const NATIVE_TOP_PANEL_MIN_HEIGHT: f32 = 286.0;
 const NATIVE_LAYOUT_PANEL_MIN_HEIGHT: f32 = 180.0;
 const NATIVE_DEVICES_PANEL_MIN_HEIGHT: f32 = 220.0;
 const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 120.0;
@@ -28,6 +29,7 @@ pub(crate) struct NativeDesktopViewModel {
 struct NativeDesktopLayoutMetrics {
     window_size: [f32; 2],
     min_window_size: [f32; 2],
+    top_panel_min_height: f32,
     full_width_sections: bool,
     layout_panel_min_height: f32,
     devices_panel_min_height: f32,
@@ -89,6 +91,7 @@ fn native_desktop_layout_metrics() -> NativeDesktopLayoutMetrics {
     NativeDesktopLayoutMetrics {
         window_size: NATIVE_WINDOW_SIZE,
         min_window_size: NATIVE_WINDOW_MIN_SIZE,
+        top_panel_min_height: NATIVE_TOP_PANEL_MIN_HEIGHT,
         full_width_sections: true,
         layout_panel_min_height: NATIVE_LAYOUT_PANEL_MIN_HEIGHT,
         devices_panel_min_height: NATIVE_DEVICES_PANEL_MIN_HEIGHT,
@@ -145,6 +148,7 @@ struct NativeDesktopApp {
     state: DesktopState,
     server_host: String,
     server_port: String,
+    email_login_code: String,
     is_master: bool,
     layout: DesktopLayout,
     status_message: String,
@@ -154,26 +158,32 @@ impl NativeDesktopApp {
     fn load(config_path: PathBuf) -> Result<Self, String> {
         let state = crate::build_local_desktop_state(&config_path)?;
         let view_model = NativeDesktopViewModel::from_state(&state);
+        let status_message = status_message_for_state(&state, "就绪");
+        let email_login_code = email_login_code_from_config(&config_path);
         Ok(Self {
             config_path,
             state,
             server_host: view_model.server_host,
             server_port: view_model.server_port,
+            email_login_code,
             is_master: view_model.is_master,
             layout: view_model.layout,
-            status_message: "就绪".to_string(),
+            status_message,
         })
     }
 
-    fn reload_state(&mut self) {
+    fn reload_state(&mut self, success_message: &str) {
         match crate::build_local_desktop_state(&self.config_path) {
             Ok(state) => {
                 let view_model = NativeDesktopViewModel::from_state(&state);
+                let status_message = status_message_for_state(&state, success_message);
                 self.state = state;
                 self.server_host = view_model.server_host;
                 self.server_port = view_model.server_port;
+                self.email_login_code = email_login_code_from_config(&self.config_path);
                 self.is_master = view_model.is_master;
                 self.layout = view_model.layout;
+                self.status_message = status_message;
             }
             Err(error) => {
                 self.status_message = format!("刷新失败：{error}");
@@ -195,11 +205,24 @@ impl NativeDesktopApp {
             port,
         ) {
             Ok(()) => {
-                self.status_message = "服务器配置已保存".to_string();
-                self.reload_state();
+                self.reload_state("服务器配置已保存");
             }
             Err(error) => {
                 self.status_message = format!("服务器配置保存失败：{error}");
+            }
+        }
+    }
+
+    fn save_email_login_code(&mut self) {
+        match crate::desktop_config::set_email_login_code_in_config_file(
+            &self.config_path,
+            &self.email_login_code,
+        ) {
+            Ok(()) => {
+                self.reload_state("验证码已保存，设备列表已刷新");
+            }
+            Err(error) => {
+                self.status_message = format!("验证码保存失败：{error}");
             }
         }
     }
@@ -221,8 +244,7 @@ impl NativeDesktopApp {
             master_device_id,
         ) {
             Ok(()) => {
-                self.status_message = "当前电脑配置已保存".to_string();
-                self.reload_state();
+                self.reload_state("当前电脑配置已保存");
             }
             Err(error) => {
                 self.status_message = format!("当前电脑配置保存失败：{error}");
@@ -237,8 +259,7 @@ impl NativeDesktopApp {
         }
         match crate::desktop_config::set_layout_in_config_file(&self.config_path, &self.layout) {
             Ok(()) => {
-                self.status_message = "设备位置已保存".to_string();
-                self.reload_state();
+                self.reload_state("设备位置已保存");
             }
             Err(error) => {
                 self.status_message = format!("设备位置保存失败：{error}");
@@ -282,10 +303,12 @@ impl eframe::App for NativeDesktopApp {
                 ui.columns(2, |columns| {
                     columns[0].group(|ui| {
                         ui.set_min_width(ui.available_width());
+                        ui.set_min_height(metrics.top_panel_min_height);
                         self.network_section(ui);
                     });
                     columns[1].group(|ui| {
                         ui.set_min_width(ui.available_width());
+                        ui.set_min_height(metrics.top_panel_min_height);
                         self.current_device_section(ui);
                     });
                 });
@@ -304,7 +327,7 @@ impl eframe::App for NativeDesktopApp {
 
 impl NativeDesktopApp {
     fn network_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Linux 服务器");
+        ui.heading("服务器");
         ui.label("服务器 IP/域名");
         ui.text_edit_singleline(&mut self.server_host);
         ui.label("服务器端口");
@@ -313,6 +336,23 @@ impl NativeDesktopApp {
         if native_action_button(ui, "保存服务器配置").clicked() {
             self.save_server_endpoint();
         }
+        ui.separator();
+        ui.label("邮箱验证码");
+        ui.text_edit_singleline(&mut self.email_login_code);
+        if native_action_button(ui, "保存验证码并刷新").clicked() {
+            self.save_email_login_code();
+        }
+    }
+
+    fn current_device_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("当前电脑");
+        ui.checkbox(&mut self.is_master, "将当前电脑作为主电脑");
+        ui.label(format!("设备名称：{}", self.state.device.name));
+        ui.label(format!(
+            "设备 ID：{}",
+            self.state.device.id.as_deref().unwrap_or("-")
+        ));
+        ui.label(format!("系统：{}", self.state.device.os));
         ui.separator();
         ui.label(format!(
             "内网 IP：{}",
@@ -329,21 +369,16 @@ impl NativeDesktopApp {
                 .listen_port
                 .map_or_else(|| "-".to_string(), |port| port.to_string())
         ));
-    }
-
-    fn current_device_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("当前电脑");
-        ui.checkbox(&mut self.is_master, "将当前电脑作为主电脑");
-        ui.label(format!("设备名称：{}", self.state.device.name));
         ui.label(format!(
-            "设备 ID：{}",
-            self.state.device.id.as_deref().unwrap_or("-")
+            "最近心跳：{}",
+            self.state
+                .network
+                .last_seen_at
+                .map_or_else(|| "-".to_string(), |value| value.to_string())
         ));
-        ui.label(format!("系统：{}", self.state.device.os));
         ui.horizontal_wrapped(|ui| {
             if native_action_button(ui, "刷新状态").clicked() {
-                self.reload_state();
-                self.status_message = "状态已刷新".to_string();
+                self.reload_state("状态已刷新");
             }
             if native_action_button(ui, "保存当前电脑配置").clicked() {
                 self.save_role();
@@ -360,22 +395,18 @@ impl NativeDesktopApp {
             .iter()
             .map(|device| (device.id.clone(), device.name.clone()))
             .collect::<Vec<_>>();
-        let combo_width = ((ui.available_width() - 18.0) / 2.0).max(240.0);
+        let combo_width = ((ui.available_width() - 48.0) / 3.0).max(180.0);
         egui::Grid::new("native_layout_grid")
-            .num_columns(2)
-            .spacing([18.0, 10.0])
+            .num_columns(3)
+            .spacing([24.0, 10.0])
             .min_col_width(combo_width)
             .show(ui, |ui| {
+                ui.label("");
                 device_combo(ui, "上方电脑", &mut self.layout.top, &devices, combo_width);
-                device_combo(
-                    ui,
-                    "下方电脑",
-                    &mut self.layout.bottom,
-                    &devices,
-                    combo_width,
-                );
+                ui.label("");
                 ui.end_row();
                 device_combo(ui, "左边电脑", &mut self.layout.left, &devices, combo_width);
+                master_device_cell(ui, &self.state.device.name, self.is_master, combo_width);
                 device_combo(
                     ui,
                     "右边电脑",
@@ -384,6 +415,16 @@ impl NativeDesktopApp {
                     combo_width,
                 );
                 ui.end_row();
+                ui.label("");
+                device_combo(
+                    ui,
+                    "下方电脑",
+                    &mut self.layout.bottom,
+                    &devices,
+                    combo_width,
+                );
+                ui.label("");
+                ui.end_row();
             });
         ui.add_space(8.0);
         if native_action_button(ui, "保存设备位置").clicked() {
@@ -391,8 +432,13 @@ impl NativeDesktopApp {
         }
     }
 
-    fn devices_section(&self, ui: &mut egui::Ui) {
-        ui.heading("设备列表");
+    fn devices_section(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("设备列表");
+            if native_action_button(ui, "刷新当前设备").clicked() {
+                self.reload_state("设备列表已刷新");
+            }
+        });
         ui.set_min_height(NATIVE_DEVICES_PANEL_MIN_HEIGHT);
         if self.state.devices.is_empty() {
             ui.label("暂无其他设备");
@@ -449,6 +495,22 @@ fn device_combo(
         });
 }
 
+fn master_device_cell(ui: &mut egui::Ui, device_name: &str, is_master: bool, width: f32) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 64.0),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.strong("主电脑");
+            ui.label(device_name);
+            ui.label(if is_master {
+                "当前电脑"
+            } else {
+                "已配置主电脑"
+            });
+        },
+    );
+}
+
 fn full_width_group<R>(
     ui: &mut egui::Ui,
     min_height: f32,
@@ -482,14 +544,33 @@ fn native_action_button_size() -> egui::Vec2 {
     egui::vec2(NATIVE_ACTION_BUTTON_WIDTH, NATIVE_ACTION_BUTTON_HEIGHT)
 }
 
+fn email_login_code_from_config(config_path: &Path) -> String {
+    crate::client::ClientConfig::load(config_path)
+        .ok()
+        .and_then(|config| config.email_login_code)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
-fn native_action_button_labels() -> [&'static str; 4] {
+fn native_action_button_labels() -> [&'static str; 6] {
     [
         "保存服务器配置",
+        "保存验证码并刷新",
         "刷新状态",
         "保存当前电脑配置",
+        "刷新当前设备",
         "保存设备位置",
     ]
+}
+
+fn status_message_for_state(state: &DesktopState, fallback: &str) -> String {
+    if let Some(error) = state.server_error.as_deref() {
+        return error.to_string();
+    }
+    if let Some(error) = state.master_error.as_deref() {
+        return error.to_string();
+    }
+    fallback.to_string()
 }
 
 fn connection_state_status(ui: &mut egui::Ui, label: &str, state: &DesktopConnectionState) {
@@ -606,6 +687,7 @@ mod tests {
 
         assert_eq!(metrics.window_size, [1120.0, 820.0]);
         assert_eq!(metrics.min_window_size, [900.0, 640.0]);
+        assert!(metrics.top_panel_min_height >= 250.0);
         assert!(metrics.full_width_sections);
         assert!(metrics.layout_panel_min_height >= 180.0);
         assert!(metrics.devices_panel_min_height >= 220.0);
@@ -634,8 +716,10 @@ mod tests {
             native_action_button_labels(),
             [
                 "保存服务器配置",
+                "保存验证码并刷新",
                 "刷新状态",
                 "保存当前电脑配置",
+                "刷新当前设备",
                 "保存设备位置"
             ]
         );

@@ -86,6 +86,13 @@ pub(crate) fn set_server_endpoint_in_config_file(
     local_config::write_text_atomic(path, &updated)
 }
 
+pub(crate) fn set_email_login_code_in_config_file(path: &Path, code: &str) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let updated = set_email_login_code_in_config_text(&text, code)?;
+    local_config::write_text_atomic(path, &updated)
+}
+
 fn set_role_in_config_text(
     text: &str,
     role: DesktopRole,
@@ -130,6 +137,23 @@ pub(crate) fn set_server_endpoint_in_config_text(
     let mut object = parse_config_object(text)?;
     let server_url = build_server_url(object.get("server_url"), host, port)?;
     object.insert("server_url".to_string(), Value::String(server_url));
+    serialize_config_object(object)
+}
+
+pub(crate) fn set_email_login_code_in_config_text(
+    text: &str,
+    code: &str,
+) -> Result<String, String> {
+    let mut object = parse_config_object(text)?;
+    let code = code.trim();
+    if code.is_empty() {
+        object.insert("email_login_code".to_string(), Value::Null);
+    } else {
+        object.insert(
+            "email_login_code".to_string(),
+            Value::String(code.to_string()),
+        );
+    }
     serialize_config_object(object)
 }
 
@@ -308,5 +332,26 @@ mod tests {
         .expect_err("empty host is invalid");
 
         assert!(error.contains("server host"));
+    }
+
+    #[test]
+    fn applying_email_login_code_sets_or_clears_code_and_preserves_fields() {
+        let updated = set_email_login_code_in_config_text(
+            r#"{
+                "server_url": "http://127.0.0.1:24888",
+                "email": "dev@example.com",
+                "email_login_code": null,
+                "role": "master"
+            }"#,
+            "  ABC123  ",
+        )
+        .expect("set code");
+        let json: serde_json::Value = serde_json::from_str(&updated).expect("valid json");
+        assert_eq!(json["email_login_code"], "ABC123");
+        assert_eq!(json["role"], "master");
+
+        let cleared = set_email_login_code_in_config_text(&updated, " ").expect("clear code");
+        let json: serde_json::Value = serde_json::from_str(&cleared).expect("valid json");
+        assert_eq!(json["email_login_code"], serde_json::Value::Null);
     }
 }
