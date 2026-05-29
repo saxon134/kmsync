@@ -86,7 +86,10 @@ body {{
   display: grid;
   grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.1fr);
   gap: 14px;
-  align-items: stretch;
+  align-items: start;
+}}
+.secondary-grid {{
+  grid-template-columns: minmax(420px, 1fr) minmax(420px, 1fr);
 }}
 .panel {{
   border: 1px solid var(--line);
@@ -157,6 +160,7 @@ select, input, button {{
   padding: 0 9px;
   font: inherit;
 }}
+select {{ width: 100%; min-width: 0; }}
 input {{ width: 100%; }}
 .field {{
   display: grid;
@@ -174,18 +178,20 @@ button.primary {{
 .devices {{
   width: 100%;
   border-collapse: collapse;
+  table-layout: fixed;
 }}
 .devices th, .devices td {{
   border-bottom: 1px solid var(--line);
   padding: 9px 8px;
   text-align: left;
   vertical-align: top;
+  overflow-wrap: anywhere;
 }}
 .devices th {{
   color: var(--muted);
   font-size: 12px;
 }}
-@media (max-width: 820px) {{
+@media (max-width: 920px) {{
   .topbar, .grid {{ grid-template-columns: 1fr; display: grid; }}
   .badges {{ justify-content: flex-start; }}
   .layout {{ grid-template-columns: 1fr; grid-template-rows: none; }}
@@ -509,5 +515,8 @@ mod tests {
             .expect("secondary grid");
         assert!(layout_pair.contains("<h2>设备位置</h2>"));
         assert!(layout_pair.contains("<h2>设备列表</h2>"));
+        assert!(html.contains(".secondary-grid {"));
+        assert!(html.contains("grid-template-columns: minmax(420px, 1fr) minmax(420px, 1fr);"));
+        assert!(html.contains("@media (max-width: 920px)"));
     }
 }

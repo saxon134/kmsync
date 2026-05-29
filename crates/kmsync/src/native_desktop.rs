@@ -7,10 +7,13 @@ use kmsync_core::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopSta
 const NATIVE_CJK_FONT_NAME: &str = "kmsync_cjk";
 const NATIVE_WINDOW_SIZE: [f32; 2] = [1120.0, 820.0];
 const NATIVE_WINDOW_MIN_SIZE: [f32; 2] = [900.0, 640.0];
-const NATIVE_TOP_PANEL_MIN_HEIGHT: f32 = 286.0;
+const NATIVE_TOP_PANEL_MIN_HEIGHT: f32 = 210.0;
 const NATIVE_LAYOUT_PANEL_MIN_HEIGHT: f32 = 180.0;
 const NATIVE_DEVICES_PANEL_MIN_HEIGHT: f32 = 220.0;
-const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 120.0;
+const NATIVE_LAYOUT_GRID_MIN_COL_WIDTH: f32 = 96.0;
+const NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING: f32 = 12.0;
+const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 92.0;
+const NATIVE_DEVICES_GRID_HORIZONTAL_SPACING: f32 = 12.0;
 const NATIVE_ACTION_BUTTON_WIDTH: f32 = 150.0;
 const NATIVE_ACTION_BUTTON_HEIGHT: f32 = 34.0;
 
@@ -375,10 +378,10 @@ impl NativeDesktopApp {
             .iter()
             .map(|device| (device.id.clone(), device.name.clone()))
             .collect::<Vec<_>>();
-        let combo_width = ((ui.available_width() - 32.0) / 3.0).max(120.0);
+        let combo_width = native_layout_combo_width(ui.available_width());
         egui::Grid::new("native_layout_grid")
             .num_columns(3)
-            .spacing([24.0, 10.0])
+            .spacing([native_layout_grid_horizontal_spacing(), 10.0])
             .min_col_width(combo_width)
             .show(ui, |ui| {
                 ui.label("");
@@ -424,24 +427,30 @@ impl NativeDesktopApp {
             ui.label("暂无其他设备");
             return;
         }
-        let metrics = native_desktop_layout_metrics();
-        let min_col_width =
-            ((ui.available_width() - 72.0) / 4.0).max(metrics.devices_grid_min_col_width);
+        let min_col_width = native_devices_grid_column_width(ui.available_width());
         egui::Grid::new("native_devices_grid")
             .striped(true)
-            .spacing([20.0, 8.0])
+            .spacing([native_devices_grid_horizontal_spacing(), 8.0])
             .min_col_width(min_col_width)
             .show(ui, |ui| {
-                ui.strong("设备");
-                ui.strong("状态");
-                ui.strong("内网 IP");
-                ui.strong("公网 IP");
+                native_grid_strong(ui, "设备", min_col_width);
+                native_grid_strong(ui, "状态", min_col_width);
+                native_grid_strong(ui, "内网 IP", min_col_width);
+                native_grid_strong(ui, "公网 IP", min_col_width);
                 ui.end_row();
                 for device in &self.state.devices {
-                    ui.label(&device.name);
-                    ui.label(if device.online { "在线" } else { "离线" });
-                    ui.label(empty_dash(&device.lan_ips.join(", ")));
-                    ui.label(device.public_ip.as_deref().unwrap_or("-"));
+                    native_grid_label(ui, &device.name, min_col_width);
+                    native_grid_label(
+                        ui,
+                        if device.online { "在线" } else { "离线" },
+                        min_col_width,
+                    );
+                    native_grid_label(ui, &empty_dash(&device.lan_ips.join(", ")), min_col_width);
+                    native_grid_label(
+                        ui,
+                        device.public_ip.as_deref().unwrap_or("-"),
+                        min_col_width,
+                    );
                     ui.end_row();
                 }
             });
@@ -464,15 +473,23 @@ fn device_combo(
                 .map(|(_, name)| name.as_str())
         })
         .unwrap_or("未配置");
-    egui::ComboBox::from_label(label)
-        .width(width)
-        .selected_text(selected_text)
-        .show_ui(ui, |ui| {
-            ui.selectable_value(selected, None, "未配置");
-            for (id, name) in devices {
-                ui.selectable_value(selected, Some(id.clone()), name);
-            }
-        });
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 58.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(width);
+            ui.label(label);
+            egui::ComboBox::from_id_salt(("native_layout_combo", label))
+                .width(width)
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(selected, None, "未配置");
+                    for (id, name) in devices {
+                        ui.selectable_value(selected, Some(id.clone()), name);
+                    }
+                });
+        },
+    );
 }
 
 fn master_device_cell(ui: &mut egui::Ui, device_name: &str, is_master: bool, width: f32) {
@@ -488,6 +505,66 @@ fn master_device_cell(ui: &mut egui::Ui, device_name: &str, is_master: bool, wid
                 "已配置主电脑"
             });
         },
+    );
+}
+
+fn native_layout_combo_width(available_width: f32) -> f32 {
+    native_fit_grid_column_width(
+        available_width,
+        3,
+        native_layout_grid_horizontal_spacing(),
+        NATIVE_LAYOUT_GRID_MIN_COL_WIDTH,
+    )
+}
+
+fn native_devices_grid_column_width(available_width: f32) -> f32 {
+    native_fit_grid_column_width(
+        available_width,
+        4,
+        native_devices_grid_horizontal_spacing(),
+        NATIVE_DEVICES_GRID_MIN_COL_WIDTH,
+    )
+}
+
+fn native_fit_grid_column_width(
+    available_width: f32,
+    column_count: usize,
+    horizontal_spacing: f32,
+    preferred_min_width: f32,
+) -> f32 {
+    let column_count = column_count.max(1);
+    let gap_width = horizontal_spacing * column_count.saturating_sub(1) as f32;
+    let fitted_width = ((available_width - gap_width) / column_count as f32).max(1.0);
+    if native_grid_total_width(preferred_min_width, column_count, horizontal_spacing)
+        <= available_width
+    {
+        fitted_width.max(preferred_min_width)
+    } else {
+        fitted_width
+    }
+}
+
+fn native_grid_total_width(column_width: f32, column_count: usize, horizontal_spacing: f32) -> f32 {
+    let column_count = column_count.max(1);
+    column_width * column_count as f32 + horizontal_spacing * column_count.saturating_sub(1) as f32
+}
+
+fn native_layout_grid_horizontal_spacing() -> f32 {
+    NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING
+}
+
+fn native_devices_grid_horizontal_spacing() -> f32 {
+    NATIVE_DEVICES_GRID_HORIZONTAL_SPACING
+}
+
+fn native_grid_label(ui: &mut egui::Ui, label: &str, width: f32) {
+    ui.add_sized(egui::vec2(width, 18.0), egui::Label::new(label).wrap());
+}
+
+fn native_grid_strong(ui: &mut egui::Ui, label: &str, width: f32) {
+    ui.add_sized(
+        egui::vec2(width, 18.0),
+        egui::Label::new(egui::RichText::new(label).strong()).wrap(),
     );
 }
 
@@ -647,11 +724,34 @@ mod tests {
 
         assert_eq!(metrics.window_size, [1120.0, 820.0]);
         assert_eq!(metrics.min_window_size, [900.0, 640.0]);
-        assert!(metrics.top_panel_min_height >= 250.0);
+        assert!(metrics.top_panel_min_height <= 220.0);
         assert_eq!(metrics.lower_panel_columns, 2);
         assert!(metrics.layout_panel_min_height >= 180.0);
         assert!(metrics.devices_panel_min_height >= 220.0);
-        assert!(metrics.devices_grid_min_col_width >= 120.0);
+        assert!(metrics.devices_grid_min_col_width <= 96.0);
+    }
+
+    #[test]
+    fn native_lower_grids_fit_inside_two_column_min_window() {
+        let lower_column_content_width = 420.0;
+
+        let layout_combo_width = native_layout_combo_width(lower_column_content_width);
+        assert!(
+            native_grid_total_width(
+                layout_combo_width,
+                3,
+                native_layout_grid_horizontal_spacing()
+            ) <= lower_column_content_width
+        );
+
+        let devices_column_width = native_devices_grid_column_width(lower_column_content_width);
+        assert!(
+            native_grid_total_width(
+                devices_column_width,
+                4,
+                native_devices_grid_horizontal_spacing()
+            ) <= lower_column_content_width
+        );
     }
 
     #[test]
