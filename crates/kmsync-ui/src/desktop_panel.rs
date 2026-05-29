@@ -74,7 +74,7 @@ body {{
 }}
 .badge[data-state="connected"], .badge[data-state="self_device"] {{ color: var(--ok); }}
 .badge[data-state="connecting"], .badge[data-state="retrying"] {{ color: var(--warn); }}
-.badge[data-state="disconnected"], .badge[data-state="auth_expired"] {{ color: var(--danger); }}
+.badge[data-state="disconnected"] {{ color: var(--danger); }}
 .content {{
   padding: 18px;
   display: grid;
@@ -374,7 +374,6 @@ fn connection_state_key(state: &DesktopConnectionState) -> &'static str {
         DesktopConnectionState::Connecting => "connecting",
         DesktopConnectionState::Connected => "connected",
         DesktopConnectionState::Disconnected => "disconnected",
-        DesktopConnectionState::AuthExpired => "auth_expired",
         DesktopConnectionState::Retrying => "retrying",
         DesktopConnectionState::SelfDevice => "self_device",
     }
@@ -385,7 +384,6 @@ fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
         DesktopConnectionState::Connecting => "连接中",
         DesktopConnectionState::Connected => "已连接",
         DesktopConnectionState::Disconnected => "未连接",
-        DesktopConnectionState::AuthExpired => "登录失效",
         DesktopConnectionState::Retrying => "正在重试",
         DesktopConnectionState::SelfDevice => "当前电脑",
     }

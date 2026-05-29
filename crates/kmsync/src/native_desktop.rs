@@ -148,7 +148,6 @@ struct NativeDesktopApp {
     state: DesktopState,
     server_host: String,
     server_port: String,
-    email_login_code: String,
     is_master: bool,
     layout: DesktopLayout,
     status_message: String,
@@ -159,13 +158,11 @@ impl NativeDesktopApp {
         let state = crate::build_local_desktop_state(&config_path)?;
         let view_model = NativeDesktopViewModel::from_state(&state);
         let status_message = status_message_for_state(&state, "就绪");
-        let email_login_code = email_login_code_from_config(&config_path);
         Ok(Self {
             config_path,
             state,
             server_host: view_model.server_host,
             server_port: view_model.server_port,
-            email_login_code,
             is_master: view_model.is_master,
             layout: view_model.layout,
             status_message,
@@ -180,7 +177,6 @@ impl NativeDesktopApp {
                 self.state = state;
                 self.server_host = view_model.server_host;
                 self.server_port = view_model.server_port;
-                self.email_login_code = email_login_code_from_config(&self.config_path);
                 self.is_master = view_model.is_master;
                 self.layout = view_model.layout;
                 self.status_message = status_message;
@@ -209,20 +205,6 @@ impl NativeDesktopApp {
             }
             Err(error) => {
                 self.status_message = format!("服务器配置保存失败：{error}");
-            }
-        }
-    }
-
-    fn save_email_login_code(&mut self) {
-        match crate::desktop_config::set_email_login_code_in_config_file(
-            &self.config_path,
-            &self.email_login_code,
-        ) {
-            Ok(()) => {
-                self.reload_state("验证码已保存，设备列表已刷新");
-            }
-            Err(error) => {
-                self.status_message = format!("验证码保存失败：{error}");
             }
         }
     }
@@ -335,12 +317,6 @@ impl NativeDesktopApp {
         ui.label(format!("完整地址：{}", self.server_url_preview()));
         if native_action_button(ui, "保存服务器配置").clicked() {
             self.save_server_endpoint();
-        }
-        ui.separator();
-        ui.label("邮箱验证码");
-        ui.text_edit_singleline(&mut self.email_login_code);
-        if native_action_button(ui, "保存验证码并刷新").clicked() {
-            self.save_email_login_code();
         }
     }
 
@@ -544,18 +520,10 @@ fn native_action_button_size() -> egui::Vec2 {
     egui::vec2(NATIVE_ACTION_BUTTON_WIDTH, NATIVE_ACTION_BUTTON_HEIGHT)
 }
 
-fn email_login_code_from_config(config_path: &Path) -> String {
-    crate::client::ClientConfig::load(config_path)
-        .ok()
-        .and_then(|config| config.email_login_code)
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
-fn native_action_button_labels() -> [&'static str; 6] {
+fn native_action_button_labels() -> [&'static str; 5] {
     [
         "保存服务器配置",
-        "保存验证码并刷新",
         "刷新状态",
         "保存当前电脑配置",
         "刷新当前设备",
@@ -589,7 +557,6 @@ fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
         DesktopConnectionState::Connecting => "连接中",
         DesktopConnectionState::Connected => "已连接",
         DesktopConnectionState::Disconnected => "未连接",
-        DesktopConnectionState::AuthExpired => "登录失效",
         DesktopConnectionState::Retrying => "正在重试",
         DesktopConnectionState::SelfDevice => "当前电脑",
     }
@@ -599,9 +566,7 @@ fn connection_state_tone(state: &DesktopConnectionState) -> NativeStatusTone {
     match state {
         DesktopConnectionState::Connected => NativeStatusTone::Success,
         DesktopConnectionState::Connecting => NativeStatusTone::Danger,
-        DesktopConnectionState::AuthExpired | DesktopConnectionState::Retrying => {
-            NativeStatusTone::Warning
-        }
+        DesktopConnectionState::Retrying => NativeStatusTone::Warning,
         DesktopConnectionState::SelfDevice => NativeStatusTone::Info,
         DesktopConnectionState::Disconnected => NativeStatusTone::Muted,
     }
@@ -716,7 +681,6 @@ mod tests {
             native_action_button_labels(),
             [
                 "保存服务器配置",
-                "保存验证码并刷新",
                 "刷新状态",
                 "保存当前电脑配置",
                 "刷新当前设备",

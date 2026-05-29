@@ -491,7 +491,7 @@ async fn issue_relay_token(
     headers: HeaderMap,
     Json(request): Json<RelayTokenRequest>,
 ) -> Result<Json<RelayTokenResponse>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     assert_device_owner(&store, user_id, request.source_device_id)?;
     assert_device_owner(&store, user_id, request.target_device_id)?;
@@ -561,7 +561,7 @@ async fn signal_connect_request(
     headers: HeaderMap,
     Json(request): Json<SignalConnectRequest>,
 ) -> Result<Json<SignalSession>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     assert_device_owner(&store, user_id, request.source_device_id)?;
     assert_device_owner(&store, user_id, request.target_device_id)?;
@@ -615,7 +615,7 @@ fn update_signal_session_status(
     session_id: Uuid,
     status: &str,
 ) -> Result<Json<SignalSession>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     let Some(session) = store.signal_sessions.get_mut(&session_id) else {
         return Err(ApiError::not_found("signal session not found"));
@@ -641,7 +641,7 @@ async fn signal_candidate_add(
     headers: HeaderMap,
     Json(request): Json<SignalCandidateRequest>,
 ) -> Result<Json<SignalSession>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     let Some(session) = store.signal_sessions.get_mut(&request.session_id) else {
         return Err(ApiError::not_found("signal session not found"));
@@ -826,7 +826,7 @@ async fn events_ws(
 ) -> Result<Response, ApiError> {
     let user_id = match query.access_token {
         Some(token) => authorize_access_token(&state, &token)?,
-        None => authorize(&state, &headers)?,
+        None => authorize_or_default(&state, &headers)?,
     };
     let events = state.subscribe_events();
     Ok(ws.on_upgrade(move |socket| stream_events(socket, events, user_id)))
@@ -874,7 +874,7 @@ async fn register_device(
     headers: HeaderMap,
     Json(request): Json<RegisterDeviceRequest>,
 ) -> Result<Json<RegisterDeviceResponse>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     if request.name.trim().is_empty() {
         return Err(ApiError::bad_request("device name is required"));
     }
@@ -937,7 +937,7 @@ async fn list_devices(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<DeviceWithPresence>>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let store = state.lock()?;
     let devices = store
         .devices
@@ -963,7 +963,7 @@ async fn update_device(
     AxumPath(device_id): AxumPath<Uuid>,
     Json(request): Json<UpdateDeviceRequest>,
 ) -> Result<Json<Device>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     let Some(device) = store.devices.get_mut(&device_id) else {
         return Err(ApiError::not_found("device not found"));
@@ -1020,7 +1020,7 @@ async fn reauthorize_device(
     AxumPath(device_id): AxumPath<Uuid>,
     Json(request): Json<ReauthorizeDeviceRequest>,
 ) -> Result<Json<Device>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     if request.public_key.trim().is_empty() {
         return Err(ApiError::bad_request("public key is required"));
     }
@@ -1058,7 +1058,7 @@ async fn delete_device(
     headers: HeaderMap,
     AxumPath(device_id): AxumPath<Uuid>,
 ) -> Result<Json<DeleteDeviceResponse>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     assert_device_owner(&store, user_id, device_id)?;
     let presence_version = store
@@ -1120,7 +1120,7 @@ async fn heartbeat(
     AxumPath(device_id): AxumPath<Uuid>,
     Json(request): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     let Some(device) = store.devices.get(&device_id) else {
         return Err(ApiError::not_found("device not found"));
@@ -1192,7 +1192,7 @@ async fn get_topology(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Topology>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let store = state.lock()?;
     Ok(Json(
         store
@@ -1214,7 +1214,7 @@ async fn upsert_topology(
     headers: HeaderMap,
     Json(request): Json<UpsertTopologyRequest>,
 ) -> Result<Json<Topology>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     if let Some(master_device_id) = request.master_device_id {
         assert_device_owner(&store, user_id, master_device_id)?;
@@ -1256,7 +1256,7 @@ async fn list_profiles(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<DeviceProfile>>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let store = state.lock()?;
     let profiles = store
         .profiles
@@ -1283,7 +1283,7 @@ async fn list_profile_changes(
     headers: HeaderMap,
     Query(query): Query<ProfileChangesQuery>,
 ) -> Result<Json<ProfileChangesResponse>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let since_revision = query.since_revision.unwrap_or(0);
     let store = state.lock()?;
     let mut profiles = store
@@ -1304,7 +1304,7 @@ async fn upsert_profile(
     headers: HeaderMap,
     Json(request): Json<UpsertProfileRequest>,
 ) -> Result<Json<DeviceProfile>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     assert_device_owner(&store, user_id, request.source_device_id)?;
     assert_device_owner(&store, user_id, request.target_device_id)?;
@@ -1358,7 +1358,7 @@ async fn rollback_profile(
     headers: HeaderMap,
     Json(request): Json<RollbackProfileRequest>,
 ) -> Result<Json<DeviceProfile>, ApiError> {
-    let user_id = authorize(&state, &headers)?;
+    let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     let current = store
         .profiles
@@ -1423,6 +1423,14 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
     authorize_access_token(state, token)
 }
 
+fn authorize_or_default(state: &AppState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    if headers.contains_key("authorization") {
+        authorize(state, headers)
+    } else {
+        Ok(default_user_id())
+    }
+}
+
 fn authorize_access_token(state: &AppState, token: &str) -> Result<Uuid, ApiError> {
     state
         .lock()?
@@ -1442,6 +1450,10 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
     value
         .strip_prefix("Bearer ")
         .ok_or_else(|| ApiError::unauthorized("expected bearer token"))
+}
+
+fn default_user_id() -> Uuid {
+    Uuid::from_u128(1)
 }
 
 fn normalize_email(email: &str) -> Result<String, ApiError> {
@@ -2061,6 +2073,65 @@ mod tests {
         assert_eq!(body[0]["device"]["name"], "desktop");
         assert_eq!(body[0]["presence"]["lan_ips"][0], "192.168.1.10");
         assert_eq!(body[0]["presence"]["public_ip"], "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn device_api_flow_accepts_no_auth_for_mvp_desktop_inventory() {
+        let app = test_app();
+        let (register_status, register_body) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            None,
+            json!({
+                "device_id": "11111111-1111-4111-8111-111111111111",
+                "name": "desktop",
+                "role": "master",
+                "os_type": "macos",
+                "os_version": "14",
+                "app_version": "0.1.0",
+                "public_key": "dev-key"
+            }),
+        )
+        .await;
+        assert_eq!(register_status, StatusCode::OK);
+        let device_id = register_body["device_id"].as_str().expect("device id");
+
+        let mut heartbeat = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/devices/{device_id}/heartbeat"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "lan_ips": ["192.168.1.10"],
+                    "listen_port": 24800,
+                    "nat_type": "open"
+                })
+                .to_string(),
+            ))
+            .expect("heartbeat request");
+        heartbeat.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<SocketAddr>().expect("addr"),
+        ));
+        let heartbeat_response = app
+            .clone()
+            .oneshot(heartbeat)
+            .await
+            .expect("heartbeat response");
+        assert_eq!(heartbeat_response.status(), StatusCode::OK);
+
+        let (list_status, devices) = json_request(
+            app,
+            Method::GET,
+            "/v1/devices".to_string(),
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(devices.as_array().expect("devices").len(), 1);
+        assert_eq!(devices[0]["device"]["name"], "desktop");
+        assert_eq!(devices[0]["presence"]["lan_ips"][0], "192.168.1.10");
     }
 
     #[tokio::test]

@@ -4593,15 +4593,11 @@ mod tests {
     fn core_service_plan_binds_data_plane_and_keeps_input_off_local_ipc() {
         let config = client::ClientConfig {
             server_url: "http://127.0.0.1:24888".to_string(),
-            email: "dev@example.com".to_string(),
-            email_login_code: None,
             device_name: "devbox".to_string(),
             role: kmsync_core::DesktopRole::Client,
             listen_port: 24_800,
             heartbeat_interval_seconds: 15,
             identity_path: PathBuf::from("identity.json"),
-            auth_session: None,
-            source_path: None,
         };
         let plan =
             CoreServicePlan::from_config(PathBuf::from("configs/daemon.example.json"), &config);
@@ -4819,7 +4815,6 @@ mod tests {
             &config_path,
             r#"{
                 "server_url": "http://127.0.0.1:24888",
-                "email": "dev@example.com",
                 "device_name": "Development Mac",
                 "listen_port": 24800,
                 "heartbeat_interval_seconds": 15,

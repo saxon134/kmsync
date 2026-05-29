@@ -3,7 +3,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,6 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::local_config;
 use crate::transport::QuicEventSender;
 
 const MDNS_SERVICE_TYPE: &str = "_kmsync._udp.local";
@@ -28,16 +26,10 @@ const DNS_CLASS_IN: u16 = 1;
 const DNS_CLASS_QU: u16 = 0x8000;
 const DEVICE_IDENTITY_SECRET_SERVICE: &str = "com.kmsync.device-identity";
 const DEVICE_IDENTITY_SECRET_STORE_SYSTEM: &str = "system";
-static EMAIL_LOGIN_SESSION_CACHE: OnceLock<Mutex<HashMap<String, LoginResponse>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientConfig {
     pub server_url: String,
-    pub email: String,
-    #[serde(default)]
-    pub email_login_code: Option<String>,
-    #[serde(default)]
-    pub auth_session: Option<AuthSession>,
     pub device_name: String,
     #[serde(default)]
     pub role: DesktopRole,
@@ -45,8 +37,6 @@ pub struct ClientConfig {
     pub heartbeat_interval_seconds: u64,
     #[serde(default = "default_identity_path")]
     pub identity_path: PathBuf,
-    #[serde(skip)]
-    pub source_path: Option<PathBuf>,
 }
 
 impl ClientConfig {
@@ -60,15 +50,8 @@ impl ClientConfig {
                 config.identity_path = parent.join(&config.identity_path);
             }
         }
-        config.source_path = Some(path.to_path_buf());
         Ok(config)
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AuthSession {
-    pub access_token: String,
-    pub refresh_token: String,
 }
 
 fn default_identity_path() -> PathBuf {
@@ -354,95 +337,41 @@ impl ControlClient {
         }
     }
 
-    pub fn start_email_login(&self, email: &str) -> Result<EmailLoginStartResponse, String> {
-        let request = EmailLoginStartRequest {
-            email: email.to_string(),
-        };
-        post_json(
-            &self.agent,
-            &format!("{}/v1/auth/email/start", self.server_url),
-            None,
-            &request,
-        )
-    }
-
-    pub fn verify_email_login(&self, email: &str, code: &str) -> Result<LoginResponse, String> {
-        let request = EmailLoginVerifyRequest {
-            email: email.to_string(),
-            code: code.to_string(),
-        };
-        post_json(
-            &self.agent,
-            &format!("{}/v1/auth/email/verify", self.server_url),
-            None,
-            &request,
-        )
-    }
-
-    pub fn refresh_access_token(&self, refresh_token: &str) -> Result<RefreshResponse, String> {
-        let request = RefreshRequest {
-            refresh_token: refresh_token.to_string(),
-        };
-        post_json(
-            &self.agent,
-            &format!("{}/v1/auth/refresh", self.server_url),
-            None,
-            &request,
-        )
-    }
-
     pub fn register_device(
         &self,
-        access_token: &str,
         request: &RegisterDeviceRequest,
     ) -> Result<RegisterDeviceResponse, String> {
         post_json(
             &self.agent,
             &format!("{}/v1/devices/register", self.server_url),
-            Some(access_token),
             request,
         )
     }
 
     pub fn heartbeat(
         &self,
-        access_token: &str,
         device_id: &str,
         request: &HeartbeatRequest,
     ) -> Result<HeartbeatResponse, String> {
         post_json(
             &self.agent,
             &format!("{}/v1/devices/{}/heartbeat", self.server_url, device_id),
-            Some(access_token),
             request,
         )
     }
 
-    pub fn list_devices(&self, access_token: &str) -> Result<Vec<DeviceWithPresence>, String> {
-        get_json(
-            &self.agent,
-            &format!("{}/v1/devices", self.server_url),
-            access_token,
-        )
+    pub fn list_devices(&self) -> Result<Vec<DeviceWithPresence>, String> {
+        get_json_without_auth(&self.agent, &format!("{}/v1/devices", self.server_url))
     }
 
-    pub fn list_profiles(&self, access_token: &str) -> Result<Vec<DeviceProfile>, String> {
-        get_json(
-            &self.agent,
-            &format!("{}/v1/profiles", self.server_url),
-            access_token,
-        )
+    pub fn list_profiles(&self) -> Result<Vec<DeviceProfile>, String> {
+        get_json_without_auth(&self.agent, &format!("{}/v1/profiles", self.server_url))
     }
 
-    pub fn upsert_profile(
-        &self,
-        access_token: &str,
-        request: &UpsertProfileRequest,
-    ) -> Result<DeviceProfile, String> {
+    pub fn upsert_profile(&self, request: &UpsertProfileRequest) -> Result<DeviceProfile, String> {
         put_json(
             &self.agent,
             &format!("{}/v1/profiles", self.server_url),
-            access_token,
             request,
         )
     }
@@ -450,13 +379,11 @@ impl ControlClient {
     #[allow(dead_code)]
     pub fn issue_relay_token(
         &self,
-        access_token: &str,
         request: &RelayTokenRequest,
     ) -> Result<RelayTokenResponse, String> {
         post_json(
             &self.agent,
             &format!("{}/v1/relay/token", self.server_url),
-            Some(access_token),
             request,
         )
     }
@@ -473,41 +400,6 @@ pub fn probe_server_reachable(server_url: &str) -> Result<(), String> {
     let client = ControlClient::new(server_url.to_string());
     let request = ReleaseCheckRequest::current(None, None, None, None);
     client.check_release(&request).map(|_| ())
-}
-
-#[derive(Debug, Serialize)]
-struct EmailLoginStartRequest {
-    email: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct EmailLoginStartResponse {
-    pub email: String,
-    pub expires_at: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct EmailLoginVerifyRequest {
-    email: String,
-    code: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct LoginResponse {
-    pub user_id: String,
-    pub access_token: String,
-    #[serde(default)]
-    pub refresh_token: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct RefreshRequest {
-    refresh_token: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct RefreshResponse {
-    pub access_token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1156,8 +1048,7 @@ pub fn refresh_target_direct_lan_connection(
     current_connection_healthy: bool,
 ) -> Result<Option<DirectLanReconnectOutcome>, String> {
     let client = ControlClient::new(config.server_url.clone());
-    let login = login_with_email_code(&client, &config)?;
-    let devices = client.list_devices(&login.access_token)?;
+    let devices = client.list_devices()?;
 
     let mdns_endpoints = discover_mdns_lan_endpoints(MDNS_DISCOVERY_TIMEOUT).unwrap_or_default();
     let verified = verified_target_connection_candidates(
@@ -1290,148 +1181,6 @@ fn dedupe_candidates_by_address(candidates: Vec<ConnectionCandidate>) -> Vec<Con
         .collect()
 }
 
-fn login_with_email_code(
-    client: &ControlClient,
-    config: &ClientConfig,
-) -> Result<LoginResponse, String> {
-    let saved_auth_error = if let Some(session) = valid_auth_session(config.auth_session.as_ref()) {
-        match client.refresh_access_token(&session.refresh_token) {
-            Ok(response) => {
-                let refreshed = AuthSession {
-                    access_token: response.access_token,
-                    refresh_token: session.refresh_token.clone(),
-                };
-                persist_auth_session(config, &refreshed, false)?;
-                return Ok(LoginResponse {
-                    user_id: String::new(),
-                    access_token: refreshed.access_token,
-                    refresh_token: Some(refreshed.refresh_token),
-                });
-            }
-            Err(error) => Some(error),
-        }
-    } else {
-        None
-    };
-
-    let Some(code) = email_login_code(config) else {
-        let challenge = client.start_email_login(&config.email)?;
-        let mut error = missing_email_login_code_error(config, &challenge);
-        if let Some(saved_auth_error) = saved_auth_error {
-            error = format!("saved auth session refresh failed: {saved_auth_error}; {error}");
-        }
-        return Err(error);
-    };
-    let cache_key = email_login_session_cache_key(&client.server_url, &config.email, &code);
-    if let Some(login) = cached_email_login_session(&cache_key) {
-        if let Some(refresh_token) = login.refresh_token.as_deref() {
-            let session = AuthSession {
-                access_token: login.access_token.clone(),
-                refresh_token: refresh_token.to_string(),
-            };
-            persist_auth_session(config, &session, true)?;
-        }
-        return Ok(login);
-    }
-
-    let login = client.verify_email_login(&config.email, &code)?;
-    if let Some(refresh_token) = login.refresh_token.as_deref() {
-        let session = AuthSession {
-            access_token: login.access_token.clone(),
-            refresh_token: refresh_token.to_string(),
-        };
-        persist_auth_session(config, &session, true)?;
-    }
-    cache_email_login_session(cache_key, login.clone());
-    Ok(login)
-}
-
-fn valid_auth_session(session: Option<&AuthSession>) -> Option<&AuthSession> {
-    session.filter(|session| !session.refresh_token.trim().is_empty())
-}
-
-fn email_login_code(config: &ClientConfig) -> Option<String> {
-    config
-        .email_login_code
-        .as_deref()
-        .map(str::trim)
-        .filter(|code| !code.is_empty())
-        .map(ToString::to_string)
-}
-
-fn email_login_session_cache_key(server_url: &str, email: &str, code: &str) -> String {
-    format!(
-        "{}|{}|{}",
-        server_url.trim_end_matches('/'),
-        email.trim().to_ascii_lowercase(),
-        code.trim().to_ascii_uppercase()
-    )
-}
-
-fn cached_email_login_session(cache_key: &str) -> Option<LoginResponse> {
-    let cache = EMAIL_LOGIN_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    cache.lock().ok()?.get(cache_key).cloned()
-}
-
-fn cache_email_login_session(cache_key: String, login: LoginResponse) {
-    let cache = EMAIL_LOGIN_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(cache_key, login);
-    }
-}
-
-fn persist_auth_session(
-    config: &ClientConfig,
-    session: &AuthSession,
-    clear_email_login_code: bool,
-) -> Result<(), String> {
-    let Some(path) = config.source_path.as_deref() else {
-        return Ok(());
-    };
-    set_auth_session_in_config_file(path, session, clear_email_login_code)
-}
-
-fn set_auth_session_in_config_file(
-    path: &Path,
-    session: &AuthSession,
-    clear_email_login_code: bool,
-) -> Result<(), String> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let mut value: Value =
-        serde_json::from_str(&text).map_err(|error| format!("failed to parse config: {error}"))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| "desktop config must be a JSON object".to_string())?;
-    object.insert(
-        "auth_session".to_string(),
-        serde_json::to_value(session).map_err(|error| error.to_string())?,
-    );
-    if clear_email_login_code {
-        object.insert("email_login_code".to_string(), Value::Null);
-    }
-    let mut updated = serde_json::to_string_pretty(&value)
-        .map_err(|error| format!("failed to encode config: {error}"))?;
-    updated.push('\n');
-    local_config::write_text_atomic(path, &updated)
-}
-
-fn missing_email_login_code_error(
-    config: &ClientConfig,
-    challenge: &EmailLoginStartResponse,
-) -> String {
-    let email = if challenge.email.is_empty() {
-        &config.email
-    } else {
-        &challenge.email
-    };
-    format!(
-        "email login challenge started for {} and expires_at={}; retrieve the code delivered by /v1/auth/email/start, then set email_login_code in the daemon config",
-        email,
-        challenge.expires_at
-    )
-}
-
 fn release_check_url(server_url: &str, request: &ReleaseCheckRequest) -> String {
     let mut url = format!(
         "{}/v1/releases/check?platform={}&version={}&channel={}",
@@ -1519,16 +1268,12 @@ fn render_release_check_report(release: &ReleaseCheckResponse) -> String {
 
 pub fn run_heartbeat_loop(config: ClientConfig) -> Result<(), String> {
     let client = ControlClient::new(config.server_url.clone());
-    let login = login_with_email_code(&client, &config)?;
     let identity = DeviceIdentity::load_or_generate(&config.identity_path)?;
-    let device = client.register_device(
-        &login.access_token,
-        &build_register_device_request(&config, &identity),
-    )?;
+    let device = client.register_device(&build_register_device_request(&config, &identity))?;
 
     println!(
-        "registered device {} for {}, heartbeat every {}s",
-        device.device_id, config.email, config.heartbeat_interval_seconds
+        "registered device {}, heartbeat every {}s",
+        device.device_id, config.heartbeat_interval_seconds
     );
 
     loop {
@@ -1537,7 +1282,7 @@ pub fn run_heartbeat_loop(config: ClientConfig) -> Result<(), String> {
             listen_port: config.listen_port,
             nat_type: "unknown".to_string(),
         };
-        let response = client.heartbeat(&login.access_token, &device.device_id, &request)?;
+        let response = client.heartbeat(&device.device_id, &request)?;
         println!(
             "heartbeat ok: online={} last_seen_at={} presence_version={}",
             response.online, response.last_seen_at, response.presence_version
@@ -1562,11 +1307,7 @@ fn load_desktop_device_inventory_with_identity(
     local_lan_ips: &[String],
 ) -> Result<DesktopDeviceInventory, String> {
     let client = ControlClient::new(config.server_url.clone());
-    let login = login_with_email_code(&client, config)?;
-    let device = client.register_device(
-        &login.access_token,
-        &build_register_device_request(config, identity),
-    )?;
+    let device = client.register_device(&build_register_device_request(config, identity))?;
     let lan_ips = if local_lan_ips.is_empty() {
         discover_lan_ips()
     } else {
@@ -1577,8 +1318,8 @@ fn load_desktop_device_inventory_with_identity(
         listen_port: config.listen_port,
         nat_type: "unknown".to_string(),
     };
-    client.heartbeat(&login.access_token, &device.device_id, &heartbeat)?;
-    let devices = client.list_devices(&login.access_token)?;
+    client.heartbeat(&device.device_id, &heartbeat)?;
+    let devices = client.list_devices()?;
     Ok(DesktopDeviceInventory {
         current_device_id: device.device_id,
         devices,
@@ -1602,11 +1343,10 @@ fn build_register_device_request(
 
 pub fn print_devices(config: ClientConfig) -> Result<(), String> {
     let client = ControlClient::new(config.server_url.clone());
-    let login = login_with_email_code(&client, &config)?;
-    let devices = client.list_devices(&login.access_token)?;
+    let devices = client.list_devices()?;
     let mdns_endpoints = discover_mdns_lan_endpoints(MDNS_DISCOVERY_TIMEOUT).unwrap_or_default();
     let discovered_lan_devices = discover_same_account_lan_devices(&devices, &mdns_endpoints);
-    println!("user_id: {}", login.user_id);
+    println!("device_count: {}", devices.len());
     for item in &devices {
         println!(
             "{} | {} | {} {} | app {}",
@@ -1649,8 +1389,7 @@ pub fn print_connection_diagnostics(
     target_device_id: &str,
 ) -> Result<(), String> {
     let client = ControlClient::new(config.server_url.clone());
-    let login = login_with_email_code(&client, &config)?;
-    let devices = client.list_devices(&login.access_token)?;
+    let devices = client.list_devices()?;
     let mdns_endpoints = discover_mdns_lan_endpoints(MDNS_DISCOVERY_TIMEOUT).unwrap_or_default();
     println!(
         "{}",
@@ -2075,9 +1814,8 @@ fn dedupe_lan_endpoints(
 
 pub fn print_profiles(config: ClientConfig) -> Result<(), String> {
     let client = ControlClient::new(config.server_url.clone());
-    let login = login_with_email_code(&client, &config)?;
-    let profiles = client.list_profiles(&login.access_token)?;
-    println!("user_id: {}", login.user_id);
+    let profiles = client.list_profiles()?;
+    println!("profile_count: {}", profiles.len());
     for profile in profiles {
         let compiled = compile_device_profile(&profile)?;
         let _hot_path_profile = &compiled.profile;
@@ -2125,15 +1863,11 @@ pub fn upsert_profile_from_file(
     let profile_config = serde_json::from_str(&text)
         .map_err(|error| format!("failed to parse {}: {error}", profile_path.display()))?;
     let client = ControlClient::new(config.server_url.clone());
-    let login = login_with_email_code(&client, &config)?;
-    let profile = client.upsert_profile(
-        &login.access_token,
-        &UpsertProfileRequest {
-            source_device_id,
-            target_device_id,
-            config: profile_config,
-        },
-    )?;
+    let profile = client.upsert_profile(&UpsertProfileRequest {
+        source_device_id,
+        target_device_id,
+        config: profile_config,
+    })?;
     println!(
         "saved profile {} version={} updated_at={}",
         profile.id, profile.version, profile.updated_at
@@ -2141,21 +1875,14 @@ pub fn upsert_profile_from_file(
     Ok(())
 }
 
-fn post_json<T, R>(
-    agent: &ureq::Agent,
-    url: &str,
-    access_token: Option<&str>,
-    request: &T,
-) -> Result<R, String>
+fn post_json<T, R>(agent: &ureq::Agent, url: &str, request: &T) -> Result<R, String>
 where
     T: Serialize,
     R: for<'de> Deserialize<'de>,
 {
-    let mut builder = agent.post(url).header("content-type", "application/json");
-    if let Some(token) = access_token {
-        builder = builder.header("authorization", &format!("Bearer {token}"));
-    }
-    let mut response = builder
+    let mut response = agent
+        .post(url)
+        .header("content-type", "application/json")
         .send_json(request)
         .map_err(|error| format!("request failed: {error}"))?;
     response
@@ -2168,15 +1895,6 @@ where
 mod tests {
     use super::*;
     use kmsync_core::{DesktopLayout, DesktopRole, InputEvent, Key, KeyEvent, KeyState, Modifiers};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_test_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("kmsync-{name}-{}-{nanos}", std::process::id()))
-    }
 
     #[test]
     fn mdns_query_requests_kmsync_ptr_records() {
@@ -2193,12 +1911,16 @@ mod tests {
     }
 
     #[test]
-    fn client_config_accepts_optional_email_login_code() {
+    fn client_config_ignores_legacy_email_and_auth_fields() {
         let config: ClientConfig = serde_json::from_str(
             r#"{
                 "server_url": "http://127.0.0.1:24888",
                 "email": "dev@example.com",
                 "email_login_code": "ABC12345",
+                "auth_session": {
+                    "access_token": "legacy-access",
+                    "refresh_token": "legacy-refresh"
+                },
                 "device_name": "Development Mac",
                 "listen_port": 24800,
                 "heartbeat_interval_seconds": 15
@@ -2206,7 +1928,8 @@ mod tests {
         )
         .expect("parse config");
 
-        assert_eq!(config.email_login_code.as_deref(), Some("ABC12345"));
+        assert_eq!(config.server_url, "http://127.0.0.1:24888");
+        assert_eq!(config.device_name, "Development Mac");
         assert_eq!(
             config.identity_path,
             PathBuf::from("kmsync-device-identity.json")
@@ -2232,7 +1955,6 @@ mod tests {
             &config_path,
             r#"{
                 "server_url": "http://127.0.0.1:24888",
-                "email": "dev@example.com",
                 "device_name": "Development Mac",
                 "identity_path": "kmsync-device-identity.json",
                 "listen_port": 24800,
@@ -2252,62 +1974,9 @@ mod tests {
     }
 
     #[test]
-    fn email_login_code_uses_config_file_only() {
-        let mut config = ClientConfig {
-            server_url: "http://127.0.0.1:24888".to_string(),
-            email: "dev@example.com".to_string(),
-            email_login_code: Some("CONFIG1".to_string()),
-            device_name: "Development Mac".to_string(),
-            role: DesktopRole::Client,
-            listen_port: 24_800,
-            heartbeat_interval_seconds: 15,
-            identity_path: PathBuf::from("identity.json"),
-            auth_session: None,
-            source_path: None,
-        };
-
-        assert_eq!(email_login_code(&config).as_deref(), Some("CONFIG1"));
-
-        config.email_login_code = None;
-        std::env::set_var("KMSYNC_EMAIL_LOGIN_CODE", "ENV12345");
-        assert_eq!(email_login_code(&config), None);
-        std::env::remove_var("KMSYNC_EMAIL_LOGIN_CODE");
-    }
-
-    #[test]
-    fn email_login_requires_code_after_starting_challenge() {
-        let config = ClientConfig {
-            server_url: "http://127.0.0.1:24888".to_string(),
-            email: "dev@example.com".to_string(),
-            email_login_code: None,
-            device_name: "Development Mac".to_string(),
-            role: DesktopRole::Client,
-            listen_port: 24_800,
-            heartbeat_interval_seconds: 15,
-            identity_path: PathBuf::from("identity.json"),
-            auth_session: None,
-            source_path: None,
-        };
-
-        let error = missing_email_login_code_error(
-            &config,
-            &EmailLoginStartResponse {
-                email: "dev@example.com".to_string(),
-                expires_at: 123,
-            },
-        );
-
-        assert!(error.contains("/v1/auth/email/start"));
-        assert!(error.contains("expires_at=123"));
-        assert!(!error.contains("KMSYNC_EMAIL_LOGIN_CODE"));
-        assert!(!error.contains("dev-login"));
-    }
-
-    #[test]
-    fn desktop_device_inventory_registers_heartbeats_and_lists_account_devices() {
+    fn desktop_device_inventory_registers_heartbeats_and_lists_devices_without_auth() {
         let current_device_id = "11111111-1111-4111-8111-111111111111";
         let server = MockJsonServer::spawn([
-            r#"{"user_id":"user-1","access_token":"token-1"}"#,
             r#"{"device_id":"11111111-1111-4111-8111-111111111111"}"#,
             r#"{"online":true,"last_seen_at":456,"presence_version":1}"#,
             r#"[
@@ -2346,15 +2015,11 @@ mod tests {
         ]);
         let config = ClientConfig {
             server_url: server.url(),
-            email: "dev@example.com".to_string(),
-            email_login_code: Some("123456".to_string()),
             device_name: "Development Mac".to_string(),
             role: DesktopRole::Master,
             listen_port: 24_800,
             heartbeat_interval_seconds: 15,
             identity_path: PathBuf::from("identity.json"),
-            auth_session: None,
-            source_path: None,
         };
         let identity = DeviceIdentity {
             device_id: current_device_id.to_string(),
@@ -2375,23 +2040,22 @@ mod tests {
 
         let requests = server.finish();
         let register_body: serde_json::Value =
-            serde_json::from_str(http_body(&requests[1])).expect("register json");
+            serde_json::from_str(http_body(&requests[0])).expect("register json");
         assert_eq!(register_body["device_id"], current_device_id);
         assert_eq!(register_body["role"], "master");
-        assert!(requests[2]
-            .to_ascii_lowercase()
-            .contains("authorization: bearer token-1"));
+        assert!(!requests
+            .iter()
+            .any(|request| request.to_ascii_lowercase().contains("authorization:")));
         let heartbeat_body: serde_json::Value =
-            serde_json::from_str(http_body(&requests[2])).expect("heartbeat json");
+            serde_json::from_str(http_body(&requests[1])).expect("heartbeat json");
         assert_eq!(heartbeat_body["lan_ips"][0], "192.168.1.10");
-        assert!(requests[3].starts_with("GET /v1/devices "));
+        assert!(requests[2].starts_with("GET /v1/devices "));
     }
 
     #[test]
-    fn desktop_device_inventory_reuses_in_memory_email_session_for_refresh() {
+    fn desktop_device_inventory_refresh_repeats_no_auth_device_requests() {
         let current_device_id = "33333333-3333-4333-8333-333333333333";
         let server = MockJsonServer::spawn([
-            r#"{"user_id":"user-2","access_token":"token-2"}"#,
             r#"{"device_id":"33333333-3333-4333-8333-333333333333"}"#,
             r#"{"online":true,"last_seen_at":456,"presence_version":1}"#,
             r#"[]"#,
@@ -2401,15 +2065,11 @@ mod tests {
         ]);
         let config = ClientConfig {
             server_url: server.url(),
-            email: "dev@example.com".to_string(),
-            email_login_code: Some("ONETIME".to_string()),
             device_name: "Development Mac".to_string(),
             role: DesktopRole::Client,
             listen_port: 24_800,
             heartbeat_interval_seconds: 15,
             identity_path: PathBuf::from("identity.json"),
-            auth_session: None,
-            source_path: None,
         };
         let identity = DeviceIdentity {
             device_id: current_device_id.to_string(),
@@ -2434,124 +2094,29 @@ mod tests {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.starts_with("POST /v1/auth/email/start "))
-                .count(),
-            0
-        );
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request.starts_with("POST /v1/auth/email/verify "))
-                .count(),
-            1
-        );
-        assert_eq!(
-            requests
-                .iter()
                 .filter(|request| request.starts_with("POST /v1/devices/register "))
                 .count(),
             2
         );
-    }
-
-    #[test]
-    fn desktop_device_inventory_persists_auth_session_after_email_code_login() {
-        let root = unique_test_dir("desktop-auth-session");
-        std::fs::create_dir_all(&root).expect("create root");
-        let config_path = root.join("daemon.example.json");
-        std::fs::write(
-            &config_path,
-            r#"{
-                "server_url": "http://127.0.0.1:24888",
-                "email": "dev@example.com",
-                "email_login_code": "ONETIME",
-                "device_name": "Development Mac",
-                "identity_path": "identity.json",
-                "listen_port": 24800,
-                "heartbeat_interval_seconds": 15
-            }"#,
-        )
-        .expect("write config");
-        let server = MockJsonServer::spawn([
-            r#"{"user_id":"user-3","access_token":"access-3","refresh_token":"refresh-3"}"#,
-            r#"{"device_id":"44444444-4444-4444-8444-444444444444"}"#,
-            r#"{"online":true,"last_seen_at":456,"presence_version":1}"#,
-            r#"[]"#,
-        ]);
-        let mut config = ClientConfig::load(&config_path).expect("load config");
-        config.server_url = server.url();
-
-        let identity = DeviceIdentity {
-            device_id: "44444444-4444-4444-8444-444444444444".to_string(),
-            public_key: "ed25519:persist".to_string(),
-            private_key: "ed25519:private".to_string(),
-        };
-        load_desktop_device_inventory_with_identity(&config, &identity, &["192.168.1.10".into()])
-            .expect("load inventory");
-
-        let updated: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
-                .expect("config json");
-        assert_eq!(updated["email_login_code"], serde_json::Value::Null);
-        assert_eq!(updated["auth_session"]["access_token"], "access-3");
-        assert_eq!(updated["auth_session"]["refresh_token"], "refresh-3");
-
-        let requests = server.finish();
-        assert!(requests[0].starts_with("POST /v1/auth/email/verify "));
-        std::fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn desktop_device_inventory_refreshes_saved_auth_session_without_email_code() {
-        let root = unique_test_dir("desktop-auth-refresh");
-        std::fs::create_dir_all(&root).expect("create root");
-        let config_path = root.join("daemon.example.json");
-        std::fs::write(
-            &config_path,
-            r#"{
-                "server_url": "http://127.0.0.1:24888",
-                "email": "dev@example.com",
-                "email_login_code": null,
-                "device_name": "Development Mac",
-                "identity_path": "identity.json",
-                "listen_port": 24800,
-                "heartbeat_interval_seconds": 15,
-                "auth_session": {
-                    "access_token": "old-access",
-                    "refresh_token": "refresh-4"
-                }
-            }"#,
-        )
-        .expect("write config");
-        let server = MockJsonServer::spawn([
-            r#"{"access_token":"access-4"}"#,
-            r#"{"device_id":"55555555-5555-4555-8555-555555555555"}"#,
-            r#"{"online":true,"last_seen_at":456,"presence_version":1}"#,
-            r#"[]"#,
-        ]);
-        let mut config = ClientConfig::load(&config_path).expect("load config");
-        config.server_url = server.url();
-
-        let identity = DeviceIdentity {
-            device_id: "55555555-5555-4555-8555-555555555555".to_string(),
-            public_key: "ed25519:refresh".to_string(),
-            private_key: "ed25519:private".to_string(),
-        };
-        load_desktop_device_inventory_with_identity(&config, &identity, &["192.168.1.10".into()])
-            .expect("load inventory");
-
-        let updated: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
-                .expect("config json");
-        assert_eq!(updated["auth_session"]["access_token"], "access-4");
-        assert_eq!(updated["auth_session"]["refresh_token"], "refresh-4");
-
-        let requests = server.finish();
-        assert!(requests[0].starts_with("POST /v1/auth/refresh "));
-        assert!(requests
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with(
+                    "POST /v1/devices/33333333-3333-4333-8333-333333333333/heartbeat "
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("GET /v1/devices "))
+                .count(),
+            2
+        );
+        assert!(!requests
             .iter()
-            .all(|request| !request.starts_with("POST /v1/auth/email/verify ")));
-        std::fs::remove_dir_all(root).expect("cleanup");
+            .any(|request| request.to_ascii_lowercase().contains("authorization:")));
     }
 
     #[test]
@@ -3329,15 +2894,11 @@ mod tests {
     fn register_device_request_uses_generated_identity_public_key() {
         let config = ClientConfig {
             server_url: "http://127.0.0.1:24888".to_string(),
-            email: "dev@example.com".to_string(),
-            email_login_code: None,
             device_name: "Desktop".to_string(),
             role: DesktopRole::Master,
             listen_port: 24800,
             heartbeat_interval_seconds: 15,
             identity_path: temp_identity_path(),
-            auth_session: None,
-            source_path: None,
         };
         let identity = DeviceIdentity {
             device_id: "44444444-4444-4444-8444-444444444444".to_string(),
@@ -3416,11 +2977,8 @@ mod tests {
 
     #[test]
     fn relay_token_response_builds_target_candidate() {
-        let _method: fn(
-            &ControlClient,
-            &str,
-            &RelayTokenRequest,
-        ) -> Result<RelayTokenResponse, String> = ControlClient::issue_relay_token;
+        let _method: fn(&ControlClient, &RelayTokenRequest) -> Result<RelayTokenResponse, String> =
+            ControlClient::issue_relay_token;
         let _request = RelayTokenRequest {
             source_device_id: "source-device".to_string(),
             target_device_id: "target-device".to_string(),
@@ -3661,33 +3219,12 @@ mod tests {
     }
 }
 
-fn get_json<R>(agent: &ureq::Agent, url: &str, access_token: &str) -> Result<R, String>
-where
-    R: for<'de> Deserialize<'de>,
-{
-    get_json_optional_auth(agent, url, Some(access_token))
-}
-
 fn get_json_without_auth<R>(agent: &ureq::Agent, url: &str) -> Result<R, String>
 where
     R: for<'de> Deserialize<'de>,
 {
-    get_json_optional_auth(agent, url, None)
-}
-
-fn get_json_optional_auth<R>(
-    agent: &ureq::Agent,
-    url: &str,
-    access_token: Option<&str>,
-) -> Result<R, String>
-where
-    R: for<'de> Deserialize<'de>,
-{
-    let mut builder = agent.get(url);
-    if let Some(token) = access_token {
-        builder = builder.header("authorization", &format!("Bearer {token}"));
-    }
-    let mut response = builder
+    let mut response = agent
+        .get(url)
         .call()
         .map_err(|error| format!("request failed: {error}"))?;
     response
@@ -3696,12 +3233,7 @@ where
         .map_err(|error| format!("invalid json response: {error}"))
 }
 
-fn put_json<T, R>(
-    agent: &ureq::Agent,
-    url: &str,
-    access_token: &str,
-    request: &T,
-) -> Result<R, String>
+fn put_json<T, R>(agent: &ureq::Agent, url: &str, request: &T) -> Result<R, String>
 where
     T: Serialize,
     R: for<'de> Deserialize<'de>,
@@ -3709,7 +3241,6 @@ where
     let mut response = agent
         .put(url)
         .header("content-type", "application/json")
-        .header("authorization", &format!("Bearer {access_token}"))
         .send_json(request)
         .map_err(|error| format!("request failed: {error}"))?;
     response

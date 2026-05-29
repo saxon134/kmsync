@@ -312,8 +312,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   <aside class="rail">
     <div class="brand"><strong>KMSync</strong><span>Local control panel</span></div>
     <nav class="nav" aria-label="Control panel sections">
-      <button type="button" data-nav="login" aria-current="page">Login</button>
-      <button type="button" data-nav="devices">Devices</button>
+      <button type="button" data-nav="devices" aria-current="page">Devices</button>
       <button type="button" data-nav="layout">Layout</button>
       <button type="button" data-nav="habits">Habits</button>
       <button type="button" data-nav="clipboard">Clipboard</button>
@@ -324,42 +323,19 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   <main>
     <header class="topbar">
       <div>
-        <h1 id="viewTitle">Login</h1>
+        <h1 id="viewTitle">Devices</h1>
         <div class="context">{} to {}, {} mode</div>
       </div>
       <button type="button" class="primary" id="copyProfile">Copy Profile JSON</button>
     </header>
     <div class="content">
-      <section class="view active" data-view="login">
-        <div class="grid-2">
-          <section class="section">
-            <div class="section-head"><h2>Email login</h2></div>
-            <div class="section-body">
-              <label>Server URL<input id="serverUrl" value="http://127.0.0.1:24888"></label>
-              <label>Email<input id="email" type="email" value="dev@example.com"></label>
-              <div class="actions">
-                <button type="button" id="startLogin">Send code</button>
-                <button type="button" class="primary" id="verifyLogin">Verify</button>
-              </div>
-              <label>Code<input id="emailCode" autocomplete="one-time-code"></label>
-              <div class="status" id="authStatus">Not signed in</div>
-            </div>
-          </section>
-          <section class="section">
-            <div class="section-head"><h2>Session</h2></div>
-            <div class="section-body">
-              <label>Access token<textarea id="accessToken" spellcheck="false"></textarea></label>
-              <label>Refresh token<textarea id="refreshToken" spellcheck="false"></textarea></label>
-            </div>
-          </section>
-        </div>
-      </section>
-      <section class="view" data-view="devices">
+      <section class="view active" data-view="devices">
         <section class="section">
           <div class="section-head"><h2>Device list</h2><button type="button" id="loadDevices">Refresh</button></div>
           <div class="section-body">
+            <label>Server URL<input id="serverUrl" value="http://127.0.0.1:24888"></label>
             <table class="table" aria-label="Devices"><thead><tr><th>Name</th><th>OS</th><th>Presence</th><th>Device ID</th></tr></thead><tbody id="deviceRows"></tbody></table>
-            <div class="status" id="deviceStatus">Sign in, then refresh devices.</div>
+            <div class="status" id="deviceStatus">Refresh devices.</div>
           </div>
         </section>
       </section>
@@ -442,8 +418,6 @@ const controlData = {};
 let profile = structuredClone(controlData.profile);
 const targets = controlData.targets;
 const edgeNames = ["left", "right", "top", "bottom"];
-const tokenBox = document.getElementById("accessToken");
-const refreshBox = document.getElementById("refreshToken");
 const profileJson = document.getElementById("profileJson");
 
 function serverUrl() {{
@@ -458,8 +432,6 @@ function setStatus(id, text, tone) {{
 
 async function api(path, options = {{}}) {{
   const headers = Object.assign({{ "content-type": "application/json" }}, options.headers || {{}});
-  const token = tokenBox.value.trim();
-  if (token) headers.authorization = `Bearer ${{token}}`;
   const response = await fetch(`${{serverUrl()}}${{path}}`, Object.assign({{}}, options, {{ headers }}));
   const body = await response.json().catch(() => ({{}}));
   if (!response.ok) throw new Error(body.error || `HTTP ${{response.status}}`);
@@ -497,32 +469,6 @@ document.querySelectorAll("[data-nav]").forEach((button) => {{
     document.querySelectorAll("[data-view]").forEach((view) => view.classList.toggle("active", view.dataset.view === button.dataset.nav));
     document.getElementById("viewTitle").textContent = button.textContent;
   }});
-}});
-
-document.getElementById("startLogin").addEventListener("click", async () => {{
-  try {{
-    const body = await api("/v1/auth/email/start", {{
-      method: "POST",
-      body: JSON.stringify({{ email: document.getElementById("email").value }})
-    }});
-    setStatus("authStatus", `Code sent, expires_at=${{body.expires_at}}`, "ok");
-  }} catch (error) {{
-    setStatus("authStatus", error.message, "warn");
-  }}
-}});
-
-document.getElementById("verifyLogin").addEventListener("click", async () => {{
-  try {{
-    const body = await api("/v1/auth/email/verify", {{
-      method: "POST",
-      body: JSON.stringify({{ email: document.getElementById("email").value, code: document.getElementById("emailCode").value }})
-    }});
-    tokenBox.value = body.access_token || "";
-    refreshBox.value = body.refresh_token || "";
-    setStatus("authStatus", `Signed in as ${{body.user_id}}`, "ok");
-  }} catch (error) {{
-    setStatus("authStatus", error.message, "warn");
-  }}
 }});
 
 document.getElementById("loadDevices").addEventListener("click", async () => {{

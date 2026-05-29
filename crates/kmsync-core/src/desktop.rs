@@ -73,7 +73,6 @@ pub enum DesktopConnectionState {
     Connecting,
     Connected,
     Disconnected,
-    AuthExpired,
     Retrying,
     SelfDevice,
 }
