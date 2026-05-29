@@ -8,14 +8,18 @@ const NATIVE_CJK_FONT_NAME: &str = "kmsync_cjk";
 const NATIVE_WINDOW_SIZE: [f32; 2] = [1120.0, 880.0];
 const NATIVE_WINDOW_MIN_SIZE: [f32; 2] = [900.0, 700.0];
 const NATIVE_TOP_PANEL_MIN_HEIGHT: f32 = 210.0;
-const NATIVE_LAYOUT_PANEL_MIN_HEIGHT: f32 = 280.0;
-const NATIVE_DEVICES_PANEL_MIN_HEIGHT: f32 = 280.0;
+const NATIVE_LOWER_PANEL_MIN_HEIGHT: f32 = 320.0;
 const NATIVE_LAYOUT_GRID_MIN_COL_WIDTH: f32 = 96.0;
 const NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING: f32 = 12.0;
 const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 92.0;
+const NATIVE_DEVICES_GRID_NAME_MIN_WIDTH: f32 = 86.0;
+const NATIVE_DEVICES_GRID_STATUS_MIN_WIDTH: f32 = 70.0;
+const NATIVE_DEVICES_GRID_LAN_IP_MIN_WIDTH: f32 = 140.0;
+const NATIVE_DEVICES_GRID_PUBLIC_IP_MIN_WIDTH: f32 = 86.0;
 const NATIVE_DEVICES_GRID_HORIZONTAL_SPACING: f32 = 12.0;
 const NATIVE_ACTION_BUTTON_WIDTH: f32 = 150.0;
 const NATIVE_ACTION_BUTTON_HEIGHT: f32 = 34.0;
+const NATIVE_LAN_IP_POPUP_VERTICAL_OFFSET: f32 = 6.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeDesktopViewModel {
@@ -38,6 +42,24 @@ struct NativeDesktopLayoutMetrics {
     layout_panel_min_height: f32,
     devices_panel_min_height: f32,
     devices_grid_min_col_width: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NativeDeviceGridColumnWidths {
+    name: f32,
+    status: f32,
+    lan_ip: f32,
+    public_ip: f32,
+}
+
+impl NativeDeviceGridColumnWidths {
+    fn total_width(self, horizontal_spacing: f32) -> f32 {
+        self.name + self.status + self.lan_ip + self.public_ip + horizontal_spacing * 3.0
+    }
+
+    fn content_width(self) -> f32 {
+        self.name + self.status + self.lan_ip + self.public_ip
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,8 +120,8 @@ fn native_desktop_layout_metrics() -> NativeDesktopLayoutMetrics {
         min_window_size: NATIVE_WINDOW_MIN_SIZE,
         top_panel_min_height: NATIVE_TOP_PANEL_MIN_HEIGHT,
         lower_panel_columns: 2,
-        layout_panel_min_height: NATIVE_LAYOUT_PANEL_MIN_HEIGHT,
-        devices_panel_min_height: NATIVE_DEVICES_PANEL_MIN_HEIGHT,
+        layout_panel_min_height: NATIVE_LOWER_PANEL_MIN_HEIGHT,
+        devices_panel_min_height: NATIVE_LOWER_PANEL_MIN_HEIGHT,
         devices_grid_min_col_width: NATIVE_DEVICES_GRID_MIN_COL_WIDTH,
     }
 }
@@ -164,6 +186,7 @@ struct NativeDesktopApp {
 struct NativeLanIpPopup {
     device_name: String,
     lan_ips: Vec<String>,
+    position: egui::Pos2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,7 +441,7 @@ impl NativeDesktopApp {
 
     fn layout_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("设备位置");
-        ui.set_min_height(NATIVE_LAYOUT_PANEL_MIN_HEIGHT);
+        ui.set_min_height(native_desktop_layout_metrics().layout_panel_min_height);
         let devices = native_layout_device_options(&self.state);
         let center_device_name = native_layout_center_device_name(&self.state, &self.device_name);
         let combo_width = native_layout_combo_width(ui.available_width());
@@ -459,39 +482,45 @@ impl NativeDesktopApp {
     }
 
     fn devices_section(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("设备列表");
-            if native_action_button(ui, "刷新").clicked() {
-                self.reload_state("设备列表已刷新");
-            }
-        });
-        ui.set_min_height(NATIVE_DEVICES_PANEL_MIN_HEIGHT);
+        ui.heading("设备列表");
+        ui.set_min_height(native_desktop_layout_metrics().devices_panel_min_height);
         let rows = native_device_list_rows(&self.state, &self.device_name);
-        let min_col_width = native_devices_grid_column_width(ui.available_width());
+        let column_widths = native_devices_grid_column_widths(ui.available_width());
         let mut next_lan_ip_popup = None;
         egui::Grid::new("native_devices_grid")
             .striped(true)
             .spacing([native_devices_grid_horizontal_spacing(), 8.0])
-            .min_col_width(min_col_width)
+            .min_col_width(1.0)
             .show(ui, |ui| {
-                native_grid_strong(ui, "设备", min_col_width);
-                native_grid_strong(ui, "状态", min_col_width);
-                native_grid_strong(ui, "内网 IP", min_col_width);
-                native_grid_strong(ui, "公网 IP", min_col_width);
+                native_grid_strong(ui, "设备", column_widths.name);
+                native_grid_strong(ui, "状态", column_widths.status);
+                native_grid_strong(ui, "内网 IP", column_widths.lan_ip);
+                native_grid_strong(ui, "公网 IP", column_widths.public_ip);
                 ui.end_row();
                 for row in &rows {
-                    native_grid_label(ui, &row.name, min_col_width);
-                    native_grid_label(ui, &row.status, min_col_width);
-                    if native_grid_lan_ips(ui, &row.lan_ips, min_col_width) {
+                    native_grid_label(ui, &row.name, column_widths.name);
+                    native_grid_label(ui, &row.status, column_widths.status);
+                    if let Some(position) =
+                        native_grid_lan_ips(ui, &row.lan_ips, column_widths.lan_ip)
+                    {
                         next_lan_ip_popup = Some(NativeLanIpPopup {
                             device_name: row.name.clone(),
                             lan_ips: row.lan_ips.clone(),
+                            position,
                         });
                     }
-                    native_grid_label(ui, row.public_ip.as_deref().unwrap_or("-"), min_col_width);
+                    native_grid_label(
+                        ui,
+                        row.public_ip.as_deref().unwrap_or("-"),
+                        column_widths.public_ip,
+                    );
                     ui.end_row();
                 }
             });
+        ui.add_space(8.0);
+        if native_action_button(ui, "刷新").clicked() {
+            self.reload_state("设备列表已刷新");
+        }
         if next_lan_ip_popup.is_some() {
             self.lan_ip_popup = next_lan_ip_popup;
         }
@@ -506,6 +535,7 @@ impl NativeDesktopApp {
         egui::Window::new(format!("{} 的内网 IP", popup.device_name))
             .collapsible(false)
             .resizable(false)
+            .fixed_pos(popup.position)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(260.0);
@@ -630,6 +660,36 @@ fn native_devices_grid_column_width(available_width: f32) -> f32 {
     )
 }
 
+fn native_devices_grid_column_widths(available_width: f32) -> NativeDeviceGridColumnWidths {
+    let min_widths = NativeDeviceGridColumnWidths {
+        name: NATIVE_DEVICES_GRID_NAME_MIN_WIDTH,
+        status: NATIVE_DEVICES_GRID_STATUS_MIN_WIDTH,
+        lan_ip: NATIVE_DEVICES_GRID_LAN_IP_MIN_WIDTH,
+        public_ip: NATIVE_DEVICES_GRID_PUBLIC_IP_MIN_WIDTH,
+    };
+    let spacing = native_devices_grid_horizontal_spacing();
+    let gap_width = spacing * 3.0;
+    let available_content_width = (available_width - gap_width).max(4.0);
+    let min_content_width = min_widths.content_width();
+    if available_content_width < min_content_width {
+        let scale = available_content_width / min_content_width;
+        return NativeDeviceGridColumnWidths {
+            name: (min_widths.name * scale).max(1.0),
+            status: (min_widths.status * scale).max(1.0),
+            lan_ip: (min_widths.lan_ip * scale).max(1.0),
+            public_ip: (min_widths.public_ip * scale).max(1.0),
+        };
+    }
+
+    let extra = available_content_width - min_content_width;
+    NativeDeviceGridColumnWidths {
+        name: min_widths.name + extra * 0.25,
+        status: min_widths.status + extra * 0.15,
+        lan_ip: min_widths.lan_ip + extra * 0.40,
+        public_ip: min_widths.public_ip + extra * 0.20,
+    }
+}
+
 fn native_fit_grid_column_width(
     available_width: f32,
     column_count: usize,
@@ -672,25 +732,32 @@ fn native_grid_strong(ui: &mut egui::Ui, label: &str, width: f32) {
     );
 }
 
-fn native_grid_lan_ips(ui: &mut egui::Ui, lan_ips: &[String], width: f32) -> bool {
+fn native_grid_lan_ips(ui: &mut egui::Ui, lan_ips: &[String], width: f32) -> Option<egui::Pos2> {
     let summary = native_lan_ip_summary(lan_ips);
-    let mut open_popup = false;
+    let mut popup_position = None;
     ui.allocate_ui_with_layout(
         egui::vec2(width, 22.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            let button_width = if summary.has_more { 48.0 } else { 0.0 };
+            let button_width = if summary.has_more { 54.0 } else { 0.0 };
             let label_width = (width - button_width).max(1.0);
             ui.add_sized(
                 egui::vec2(label_width, 18.0),
                 egui::Label::new(summary.primary).wrap(),
             );
-            if summary.has_more && ui.small_button("更多").clicked() {
-                open_popup = true;
+            if summary.has_more {
+                let response = ui.small_button("更多");
+                if response.clicked() {
+                    popup_position = Some(native_lan_ip_popup_position(response.rect));
+                }
             }
         },
     );
-    open_popup
+    popup_position
+}
+
+fn native_lan_ip_popup_position(button_rect: egui::Rect) -> egui::Pos2 {
+    button_rect.left_bottom() + egui::vec2(0.0, NATIVE_LAN_IP_POPUP_VERTICAL_OFFSET)
 }
 
 fn native_lan_ip_summary(lan_ips: &[String]) -> NativeLanIpSummary {
@@ -729,8 +796,8 @@ fn native_action_button_labels() -> [&'static str; 5] {
         "保存服务器配置",
         "刷新状态",
         "保存当前电脑配置",
-        "刷新",
         "保存设备位置",
+        "刷新",
     ]
 }
 
@@ -891,6 +958,25 @@ mod tests {
                 native_devices_grid_horizontal_spacing()
             ) <= lower_column_content_width
         );
+
+        let device_widths = native_devices_grid_column_widths(lower_column_content_width);
+        assert!(device_widths.lan_ip > device_widths.status);
+        assert!(device_widths.lan_ip > device_widths.public_ip);
+        assert!(
+            device_widths.total_width(native_devices_grid_horizontal_spacing())
+                <= lower_column_content_width
+        );
+    }
+
+    #[test]
+    fn native_lan_ip_popup_opens_next_to_more_button() {
+        let button_rect =
+            egui::Rect::from_min_size(egui::pos2(320.0, 180.0), egui::vec2(44.0, 20.0));
+
+        let popup_pos = native_lan_ip_popup_position(button_rect);
+
+        assert_eq!(popup_pos.x, button_rect.min.x);
+        assert!(popup_pos.y > button_rect.max.y);
     }
 
     #[test]
@@ -968,8 +1054,8 @@ mod tests {
                 "保存服务器配置",
                 "刷新状态",
                 "保存当前电脑配置",
-                "刷新",
-                "保存设备位置"
+                "保存设备位置",
+                "刷新"
             ]
         );
         assert_eq!(native_action_button_size(), egui::vec2(150.0, 34.0));

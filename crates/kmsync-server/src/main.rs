@@ -17,6 +17,8 @@ use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+const PRESENCE_TTL_SECONDS: u64 = 60;
+
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
@@ -881,7 +883,16 @@ async fn register_device(
 
     let mut store = state.lock()?;
     let now = now_seconds();
-    let device_id = request.device_id.unwrap_or_else(Uuid::new_v4);
+    let requested_device_id = request.device_id.unwrap_or_else(Uuid::new_v4);
+    let device_id = if store.devices.contains_key(&requested_device_id) {
+        requested_device_id
+    } else {
+        store
+            .devices
+            .values()
+            .find(|device| device.user_id == user_id && device.public_key == request.public_key)
+            .map_or(requested_device_id, |device| device.id)
+    };
     if let Some(device) = store.devices.get_mut(&device_id) {
         if device.user_id != user_id {
             return Err(ApiError::conflict(
@@ -939,16 +950,37 @@ async fn list_devices(
 ) -> Result<Json<Vec<DeviceWithPresence>>, ApiError> {
     let user_id = authorize_or_default(&state, &headers)?;
     let store = state.lock()?;
+    let now = now_seconds();
     let devices = store
         .devices
         .values()
         .filter(|device| device.user_id == user_id)
         .map(|device| DeviceWithPresence {
             device: device.clone(),
-            presence: store.presence.get(&device.id).cloned(),
+            presence: presence_for_device_list(store.presence.get(&device.id), now),
         })
         .collect();
     Ok(Json(devices))
+}
+
+fn presence_for_device_list(presence: Option<&Presence>, now: u64) -> Option<Presence> {
+    let mut presence = presence.cloned()?;
+    if !presence_is_online_at(&presence, now) {
+        presence.online = false;
+    }
+    Some(presence)
+}
+
+fn presence_is_online_at(presence: &Presence, now: u64) -> bool {
+    presence.online && now <= presence_expires_at(presence)
+}
+
+fn presence_expires_at(presence: &Presence) -> u64 {
+    if presence.expires_at == 0 {
+        presence.last_seen_at.saturating_add(PRESENCE_TTL_SECONDS)
+    } else {
+        presence.expires_at
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1134,8 +1166,11 @@ async fn heartbeat(
 
     let last_seen_at = now_seconds();
     let nat_type = request.nat_type.unwrap_or_else(|| "unknown".to_string());
+    let previous_presence = store.presence.get(&device_id);
+    let previous_online =
+        previous_presence.is_some_and(|presence| presence_is_online_at(presence, last_seen_at));
     let presence_version = store.presence.get(&device_id).map_or(1, |presence| {
-        if presence.online
+        if previous_online
             && presence.lan_ips == request.lan_ips
             && presence.listen_port == request.listen_port
             && presence.nat_type == nat_type
@@ -1146,7 +1181,7 @@ async fn heartbeat(
         }
     });
     let should_publish = store.presence.get(&device_id).is_none_or(|presence| {
-        !presence.online
+        !presence_is_online_at(presence, last_seen_at)
             || presence.lan_ips != request.lan_ips
             || presence.listen_port != request.listen_port
             || presence.nat_type != nat_type
@@ -1160,7 +1195,7 @@ async fn heartbeat(
         listen_port: request.listen_port,
         nat_type,
         last_seen_at,
-        expires_at: last_seen_at.saturating_add(60),
+        expires_at: last_seen_at.saturating_add(PRESENCE_TTL_SECONDS),
         presence_version,
     };
     store.presence.insert(device_id, presence);
@@ -1666,7 +1701,7 @@ mod tests {
     use axum::extract::ConnectInfo;
     use axum::http::{Method, Request};
     use serde_json::json;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tower::util::ServiceExt;
 
     fn test_app() -> Router {
@@ -1745,7 +1780,7 @@ mod tests {
                 "os_type": "windows",
                 "os_version": "11",
                 "app_version": "0.1.0",
-                "public_key": "dev-key"
+                "public_key": format!("dev-key-{name}")
             }),
         )
         .await;
@@ -1888,6 +1923,66 @@ mod tests {
         .await;
         assert_eq!(conflict_status, StatusCode::CONFLICT);
         assert_eq!(conflict["error"], "device public key mismatch");
+    }
+
+    #[tokio::test]
+    async fn stable_device_registration_reuses_public_key_when_device_id_changes() {
+        let app = test_app();
+        let token = login(app.clone()).await;
+        let first_device_id = "33333333-3333-4333-8333-333333333333";
+        let regenerated_device_id = "44444444-4444-4444-8444-444444444444";
+
+        let (first_status, first_body) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": first_device_id,
+                "name": "Office PC",
+                "role": "client",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:stable-device-key"
+            }),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(first_body["device_id"], first_device_id);
+
+        let (second_status, second_body) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": regenerated_device_id,
+                "name": "Fresh Install Name",
+                "role": "client",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.2.0",
+                "public_key": "ed25519:stable-device-key"
+            }),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(second_body["device_id"], first_device_id);
+
+        let (list_status, devices) = json_request(
+            app,
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(devices.as_array().expect("devices").len(), 1);
+        assert_eq!(devices[0]["device"]["id"], first_device_id);
+        assert_eq!(devices[0]["device"]["name"], "Office PC");
+        assert_eq!(devices[0]["device"]["app_version"], "0.2.0");
     }
 
     #[tokio::test]
@@ -2207,6 +2302,115 @@ mod tests {
         assert_eq!(devices[0]["presence"]["public_ip"], "203.0.113.44");
         assert_eq!(devices[0]["presence"]["listen_port"], 24999);
         assert_eq!(devices[0]["presence"]["nat_type"], "symmetric");
+    }
+
+    #[tokio::test]
+    async fn device_list_marks_expired_presence_offline() {
+        let state = AppState::load(None).expect("in-memory state");
+        let app = build_app(state.clone());
+        let token = login(app.clone()).await;
+        let device_id = register_device(app.clone(), &token, "desktop").await;
+        let (heartbeat_status, _) = send_heartbeat(
+            app.clone(),
+            &token,
+            &device_id,
+            vec!["192.168.1.10"],
+            24800,
+            "open",
+            "127.0.0.1:40000",
+        )
+        .await;
+        assert_eq!(heartbeat_status, StatusCode::OK);
+
+        let expired_at = now_seconds().saturating_sub(1);
+        {
+            let mut store = state.lock().expect("store");
+            let presence = store
+                .presence
+                .get_mut(&Uuid::parse_str(&device_id).expect("device uuid"))
+                .expect("presence");
+            presence.online = true;
+            presence.last_seen_at = expired_at.saturating_sub(60);
+            presence.expires_at = expired_at;
+        }
+
+        let (list_status, devices) = json_request(
+            app,
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(devices.as_array().expect("devices").len(), 1);
+        assert_eq!(devices[0]["presence"]["online"], false);
+        assert_eq!(devices[0]["presence"]["lan_ips"][0], "192.168.1.10");
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_expiry_publishes_online_presence_change() {
+        let state = AppState::load(None).expect("in-memory state");
+        let app = build_app(state.clone());
+        let token = login(app.clone()).await;
+        let device_id = register_device(app.clone(), &token, "desktop").await;
+        let (heartbeat_status, first) = send_heartbeat(
+            app.clone(),
+            &token,
+            &device_id,
+            vec!["192.168.1.10"],
+            24800,
+            "open",
+            "127.0.0.1:40000",
+        )
+        .await;
+        assert_eq!(heartbeat_status, StatusCode::OK);
+        assert_eq!(first["presence_version"], 1);
+
+        let expired_at = now_seconds().saturating_sub(1);
+        {
+            let mut store = state.lock().expect("store");
+            let presence = store
+                .presence
+                .get_mut(&Uuid::parse_str(&device_id).expect("device uuid"))
+                .expect("presence");
+            presence.online = true;
+            presence.last_seen_at = expired_at.saturating_sub(60);
+            presence.expires_at = expired_at;
+        }
+
+        let mut events = state.subscribe_events();
+        let (reconnect_status, reconnect) = send_heartbeat(
+            app,
+            &token,
+            &device_id,
+            vec!["192.168.1.10"],
+            24800,
+            "open",
+            "127.0.0.1:40000",
+        )
+        .await;
+
+        assert_eq!(reconnect_status, StatusCode::OK);
+        assert_eq!(reconnect["presence_version"], 2);
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("presence event")
+            .expect("event");
+        match event {
+            ServerEvent::DevicePresenceChanged {
+                device_id: changed_device_id,
+                online,
+                presence_version,
+                ..
+            } => {
+                assert_eq!(changed_device_id.to_string(), device_id);
+                assert!(online);
+                assert_eq!(presence_version, 2);
+            }
+            other => panic!("expected presence change event, got {other:?}"),
+        }
     }
 
     #[tokio::test]

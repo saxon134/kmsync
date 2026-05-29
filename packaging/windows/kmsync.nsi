@@ -27,16 +27,16 @@ Section "Install"
   SetOutPath "$INSTDIR\configs"
   File "..\..\configs\mac-to-windows.profile.json"
   File "..\..\configs\windows-to-mac.profile.json"
-  File "..\..\configs\daemon.example.json"
   SetOutPath "$INSTDIR\docs"
   File "..\..\docs\USER_GUIDE.md"
+  File /oname=daemon.example.json "..\..\configs\daemon.example.json"
 
   CreateDirectory "$SMPROGRAMS\KMSync"
   CreateShortCut "$SMPROGRAMS\KMSync\KMSync permissions and guide.lnk" "$INSTDIR\docs\USER_GUIDE.md"
   CreateShortCut "$SMPROGRAMS\KMSync\KMSync status.lnk" "$INSTDIR\${APP_EXE}" "status"
   CreateShortCut "$SMPROGRAMS\KMSync\KMSync info.lnk" "$INSTDIR\${APP_EXE}" "info"
-  nsExec::ExecToLog 'sc.exe create "${SERVICE_NAME}" binPath= "\"$INSTDIR\${APP_EXE}\" windows-service \"$INSTDIR\configs\daemon.example.json\"" DisplayName= "${SERVICE_DISPLAY_NAME}" start= auto'
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "KMSync" '"$INSTDIR\${APP_EXE}" core-service "$INSTDIR\configs\daemon.example.json"'
+  nsExec::ExecToLog 'sc.exe create "${SERVICE_NAME}" binPath= "\"$INSTDIR\${APP_EXE}\" windows-service" DisplayName= "${SERVICE_DISPLAY_NAME}" start= auto'
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "KMSync" '"$INSTDIR\${APP_EXE}" core-service'
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KMSync" "DisplayName" "${APP_NAME}"
@@ -51,8 +51,8 @@ Section "Uninstall"
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\configs\mac-to-windows.profile.json"
   Delete "$INSTDIR\configs\windows-to-mac.profile.json"
-  Delete "$INSTDIR\configs\daemon.example.json"
   Delete "$INSTDIR\docs\USER_GUIDE.md"
+  Delete "$INSTDIR\docs\daemon.example.json"
   Delete "$SMPROGRAMS\KMSync\KMSync permissions and guide.lnk"
   Delete "$SMPROGRAMS\KMSync\KMSync status.lnk"
   Delete "$SMPROGRAMS\KMSync\KMSync info.lnk"

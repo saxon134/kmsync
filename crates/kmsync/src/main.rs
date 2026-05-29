@@ -769,21 +769,13 @@ fn run_windows_service(config_path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-fn windows_service_command_line(binary: &Path, config: &Path) -> String {
-    format!(
-        "{} windows-service {}",
-        quote_command_path(binary),
-        quote_command_path(config)
-    )
+fn windows_service_command_line(binary: &Path) -> String {
+    format!("{} windows-service", quote_command_path(binary))
 }
 
 #[cfg(test)]
-fn windows_companion_command_line(binary: &Path, config: &Path) -> String {
-    format!(
-        "{} core-service {}",
-        quote_command_path(binary),
-        quote_command_path(config)
-    )
+fn windows_companion_command_line(binary: &Path) -> String {
+    format!("{} core-service", quote_command_path(binary))
 }
 
 #[cfg(test)]
@@ -3143,6 +3135,12 @@ fn default_daemon_config_path_from_env(
     appdata_dir: Option<&Path>,
     os: &str,
 ) -> PathBuf {
+    if os == "windows" && is_windows_installed_package_executable(exe_path) {
+        if let Some(path) = default_user_daemon_config_path(home_dir, appdata_dir, os) {
+            return path;
+        }
+    }
+
     if os == "macos" && is_macos_app_bundle_executable(exe_path) {
         if let Some(path) = default_user_daemon_config_path(home_dir, appdata_dir, os) {
             return path;
@@ -3214,6 +3212,13 @@ fn is_macos_app_bundle_executable(exe_path: &Path) -> bool {
         == Some("app")
 }
 
+fn is_windows_installed_package_executable(exe_path: &Path) -> bool {
+    let Some(exe_dir) = exe_path.parent() else {
+        return false;
+    };
+    exe_dir.join("Uninstall.exe").exists()
+}
+
 fn bundled_app_daemon_config_path(exe_path: &Path) -> Option<PathBuf> {
     let exe_dir = exe_path.parent()?;
     if exe_dir.file_name().and_then(|name| name.to_str()) != Some("MacOS") {
@@ -3227,8 +3232,20 @@ fn bundled_app_daemon_config_path(exe_path: &Path) -> Option<PathBuf> {
     )
 }
 
+fn legacy_package_daemon_config_path(exe_path: &Path) -> Option<PathBuf> {
+    exe_path
+        .parent()
+        .map(|exe_dir| exe_dir.join("configs").join(DEFAULT_DAEMON_CONFIG_FILE))
+}
+
 fn seed_default_daemon_config_if_needed(config_path: &Path, exe_path: &Path) -> Result<(), String> {
     if config_path.exists() {
+        return Ok(());
+    }
+    if let Some(legacy_path) = legacy_package_daemon_config_path(exe_path)
+        .filter(|path| path.exists() && path != config_path)
+    {
+        copy_seed_daemon_config(&legacy_path, config_path)?;
         return Ok(());
     }
     let Some(template_path) = bundled_app_daemon_config_path(exe_path) else {
@@ -3237,15 +3254,60 @@ fn seed_default_daemon_config_if_needed(config_path: &Path, exe_path: &Path) -> 
     if !template_path.exists() {
         return Ok(());
     }
+    copy_seed_daemon_config(&template_path, config_path)
+}
+
+fn copy_seed_daemon_config(source_path: &Path, config_path: &Path) -> Result<(), String> {
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     }
-    fs::copy(&template_path, config_path).map_err(|error| {
+    fs::copy(source_path, config_path).map_err(|error| {
         format!(
             "failed to copy {} to {}: {error}",
-            template_path.display(),
+            source_path.display(),
             config_path.display()
+        )
+    })?;
+    copy_relative_identity_seed(source_path, config_path)?;
+    Ok(())
+}
+
+fn copy_relative_identity_seed(source_config: &Path, target_config: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(source_config)
+        .map_err(|error| format!("failed to read {}: {error}", source_config.display()))?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(());
+    };
+    let identity_path = value
+        .get("identity_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("kmsync-device-identity.json");
+    let identity_path = PathBuf::from(identity_path);
+    if identity_path.is_absolute() {
+        return Ok(());
+    }
+
+    let Some(source_parent) = source_config.parent() else {
+        return Ok(());
+    };
+    let Some(target_parent) = target_config.parent() else {
+        return Ok(());
+    };
+    let source_identity = source_parent.join(&identity_path);
+    let target_identity = target_parent.join(&identity_path);
+    if !source_identity.exists() || target_identity.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target_identity.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    fs::copy(&source_identity, &target_identity).map_err(|error| {
+        format!(
+            "failed to copy {} to {}: {error}",
+            source_identity.display(),
+            target_identity.display()
         )
     })?;
     Ok(())
@@ -4576,6 +4638,74 @@ mod tests {
     }
 
     #[test]
+    fn default_daemon_config_path_uses_windows_user_config_for_installed_package() {
+        let root = unique_test_dir("windows-installed-config");
+        let appdata = root.join("AppData").join("Roaming");
+        let install_dir = root.join("Program Files").join("KMSync");
+        let install_config_dir = install_dir.join("configs");
+        std::fs::create_dir_all(&appdata).expect("create appdata");
+        std::fs::create_dir_all(&install_config_dir).expect("create install config dir");
+        std::fs::write(install_dir.join("Uninstall.exe"), "").expect("write uninstall marker");
+        std::fs::write(install_config_dir.join(DEFAULT_DAEMON_CONFIG_FILE), "{}")
+            .expect("write install config");
+
+        let config_path = default_daemon_config_path_from_env(
+            Path::new(r"C:\Windows\System32"),
+            &install_dir.join("kmsync.exe"),
+            None,
+            Some(appdata.as_path()),
+            "windows",
+        );
+
+        assert_eq!(
+            config_path,
+            appdata.join("KMSync").join(DEFAULT_DAEMON_CONFIG_FILE)
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup temp package");
+    }
+
+    #[test]
+    fn seed_default_daemon_config_migrates_legacy_config_and_identity() {
+        let root = unique_test_dir("windows-config-migration");
+        let install_dir = root.join("Program Files").join("KMSync");
+        let legacy_config_dir = install_dir.join("configs");
+        let user_config_dir = root.join("AppData").join("Roaming").join("KMSync");
+        let user_config_path = user_config_dir.join(DEFAULT_DAEMON_CONFIG_FILE);
+        std::fs::create_dir_all(&legacy_config_dir).expect("create legacy config dir");
+        std::fs::write(
+            legacy_config_dir.join(DEFAULT_DAEMON_CONFIG_FILE),
+            r#"{
+  "server_url": "http://203.0.113.10:24888",
+  "device_name": "Existing PC",
+  "identity_path": "kmsync-device-identity.json",
+  "listen_port": 24800,
+  "heartbeat_interval_seconds": 15,
+  "role": "client"
+}
+"#,
+        )
+        .expect("write legacy config");
+        std::fs::write(
+            legacy_config_dir.join("kmsync-device-identity.json"),
+            r#"{"device_id":"stable-device","public_key":"ed25519:stable","private_key_ref":{"store":"system","service":"kmsync-device-identity","account":"device-stable"}}"#,
+        )
+        .expect("write legacy identity");
+
+        seed_default_daemon_config_if_needed(&user_config_path, &install_dir.join("kmsync.exe"))
+            .expect("seed config");
+
+        let migrated_config = std::fs::read_to_string(&user_config_path).expect("read config");
+        let migrated_identity =
+            std::fs::read_to_string(user_config_dir.join("kmsync-device-identity.json"))
+                .expect("read identity");
+        assert!(migrated_config.contains("\"device_name\": \"Existing PC\""));
+        assert!(migrated_identity.contains("\"device_id\":\"stable-device\""));
+
+        std::fs::remove_dir_all(root).expect("cleanup temp package");
+    }
+
+    #[test]
     fn desktop_server_probe_result_sets_terminal_statuses() {
         assert_eq!(
             desktop_server_probe_result_to_state(Ok(())),
@@ -4692,16 +4822,15 @@ mod tests {
     #[test]
     fn windows_service_entrypoint_is_separate_from_user_companion_hot_path() {
         let binary = Path::new(r"C:\Program Files\KMSync\kmsync.exe");
-        let config = Path::new(r"C:\Program Files\KMSync\configs\daemon.example.json");
 
         assert_eq!(WINDOWS_SERVICE_NAME, "KMSyncCoreService");
         assert_eq!(
-            windows_service_command_line(binary, config),
-            r#""C:\Program Files\KMSync\kmsync.exe" windows-service "C:\Program Files\KMSync\configs\daemon.example.json""#
+            windows_service_command_line(binary),
+            r#""C:\Program Files\KMSync\kmsync.exe" windows-service"#
         );
         assert_eq!(
-            windows_companion_command_line(binary, config),
-            r#""C:\Program Files\KMSync\kmsync.exe" core-service "C:\Program Files\KMSync\configs\daemon.example.json""#
+            windows_companion_command_line(binary),
+            r#""C:\Program Files\KMSync\kmsync.exe" core-service"#
         );
     }
 
@@ -4719,6 +4848,8 @@ mod tests {
         assert!(windows.contains("core-service"));
         assert!(windows.contains("sc.exe create"));
         assert!(windows.contains("sc.exe delete"));
+        assert!(!windows.contains("windows-service \"$INSTDIR\\configs\\daemon.example.json\""));
+        assert!(!windows.contains("core-service \"$INSTDIR\\configs\\daemon.example.json\""));
     }
 
     #[test]
