@@ -7,19 +7,28 @@ use kmsync_core::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopSta
 const NATIVE_CJK_FONT_NAME: &str = "kmsync_cjk";
 const NATIVE_WINDOW_SIZE: [f32; 2] = [1120.0, 880.0];
 const NATIVE_WINDOW_MIN_SIZE: [f32; 2] = [900.0, 700.0];
-const NATIVE_TOP_PANEL_MIN_HEIGHT: f32 = 210.0;
-const NATIVE_LOWER_PANEL_MIN_HEIGHT: f32 = 320.0;
+const NATIVE_TOP_PANEL_MIN_HEIGHT: f32 = 190.0;
+const NATIVE_LOWER_PANEL_MIN_HEIGHT: f32 = 480.0;
+const NATIVE_PANEL_SPACING: f32 = 16.0;
 const NATIVE_LAYOUT_GRID_MIN_COL_WIDTH: f32 = 96.0;
 const NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING: f32 = 12.0;
 const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 92.0;
+#[cfg(test)]
 const NATIVE_DEVICES_GRID_NAME_MIN_WIDTH: f32 = 86.0;
+#[cfg(test)]
 const NATIVE_DEVICES_GRID_STATUS_MIN_WIDTH: f32 = 70.0;
+#[cfg(test)]
 const NATIVE_DEVICES_GRID_LAN_IP_MIN_WIDTH: f32 = 140.0;
+#[cfg(test)]
 const NATIVE_DEVICES_GRID_PUBLIC_IP_MIN_WIDTH: f32 = 86.0;
+#[cfg(test)]
 const NATIVE_DEVICES_GRID_HORIZONTAL_SPACING: f32 = 12.0;
 const NATIVE_ACTION_BUTTON_WIDTH: f32 = 150.0;
 const NATIVE_ACTION_BUTTON_HEIGHT: f32 = 34.0;
 const NATIVE_LAN_IP_POPUP_VERTICAL_OFFSET: f32 = 6.0;
+const NATIVE_LAYOUT_SLOT_HEIGHT: f32 = 112.0;
+const NATIVE_LAYOUT_CENTER_HEIGHT: f32 = 118.0;
+const NATIVE_DEVICE_ROW_HEIGHT: f32 = 72.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeDesktopViewModel {
@@ -44,6 +53,7 @@ struct NativeDesktopLayoutMetrics {
     devices_grid_min_col_width: f32,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct NativeDeviceGridColumnWidths {
     name: f32,
@@ -52,14 +62,27 @@ struct NativeDeviceGridColumnWidths {
     public_ip: f32,
 }
 
+#[cfg(test)]
 impl NativeDeviceGridColumnWidths {
-    #[cfg(test)]
     fn total_width(self, horizontal_spacing: f32) -> f32 {
         self.name + self.status + self.lan_ip + self.public_ip + horizontal_spacing * 3.0
     }
 
     fn content_width(self) -> f32 {
         self.name + self.status + self.lan_ip + self.public_ip
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NativeSplitPanelWidths {
+    primary: f32,
+    secondary: f32,
+}
+
+impl NativeSplitPanelWidths {
+    #[cfg(test)]
+    fn total_width(self, horizontal_spacing: f32) -> f32 {
+        self.primary + self.secondary + horizontal_spacing
     }
 }
 
@@ -70,6 +93,14 @@ enum NativeStatusTone {
     Warning,
     Info,
     Muted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeLayoutDirection {
+    Left,
+    Right,
+    Top,
+    Bottom,
 }
 
 impl NativeDesktopViewModel {
@@ -200,9 +231,25 @@ struct NativeLanIpSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeDeviceListRow {
     name: String,
+    detail: String,
     status: String,
+    status_tone: NativeStatusTone,
     lan_ips: Vec<String>,
-    public_ip: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeLayoutSlotView {
+    device_name: String,
+    status_label: String,
+    route_hint: String,
+    tone: NativeStatusTone,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeToneColors {
+    text: egui::Color32,
+    fill: egui::Color32,
+    stroke: egui::Color32,
 }
 
 impl NativeDesktopApp {
@@ -371,212 +418,308 @@ impl NativeDesktopApp {
 
 impl eframe::App for NativeDesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("KMSync");
-            ui.horizontal_wrapped(|ui| {
-                connection_state_status(
-                    ui,
-                    native_top_status_labels()[0],
-                    &self.state.server_state,
-                );
-                ui.separator();
-                ui.label(format!("状态：{}", self.status_message));
-            });
-            ui.separator();
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(native_app_background())
+                    .inner_margin(egui::Margin::symmetric(18, 18)),
+            )
+            .show(ctx, |ui| {
+                native_app_header(ui, &self.state, &self.status_message);
+                ui.add_space(14.0);
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let metrics = native_desktop_layout_metrics();
-                ui.columns(2, |columns| {
-                    columns[0].group(|ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.set_min_height(metrics.top_panel_min_height);
-                        self.network_section(ui);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let metrics = native_desktop_layout_metrics();
+                        let top_widths = native_top_panel_widths(ui.available_width());
+                        ui.horizontal_top(|ui| {
+                            native_panel(
+                                ui,
+                                top_widths.primary,
+                                metrics.top_panel_min_height,
+                                |ui| {
+                                    self.network_section(ui);
+                                },
+                            );
+                            native_panel(
+                                ui,
+                                top_widths.secondary,
+                                metrics.top_panel_min_height,
+                                |ui| {
+                                    self.current_device_section(ui);
+                                },
+                            );
+                        });
+                        ui.add_space(NATIVE_PANEL_SPACING);
+                        let lower_widths = native_lower_panel_widths(ui.available_width());
+                        ui.horizontal_top(|ui| {
+                            native_panel(
+                                ui,
+                                lower_widths.primary,
+                                metrics.layout_panel_min_height,
+                                |ui| {
+                                    self.layout_section(ui);
+                                },
+                            );
+                            native_panel(
+                                ui,
+                                lower_widths.secondary,
+                                metrics.devices_panel_min_height,
+                                |ui| {
+                                    self.devices_section(ui);
+                                },
+                            );
+                        });
                     });
-                    columns[1].group(|ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.set_min_height(metrics.top_panel_min_height);
-                        self.current_device_section(ui);
-                    });
-                });
-                ui.add_space(12.0);
-                ui.columns(metrics.lower_panel_columns, |columns| {
-                    columns[0].group(|ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.set_min_height(metrics.layout_panel_min_height);
-                        self.layout_section(ui);
-                    });
-                    columns[1].group(|ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.set_min_height(metrics.devices_panel_min_height);
-                        self.devices_section(ui);
-                    });
-                });
             });
-        });
         self.lan_ip_popup_window(ctx);
     }
 }
 
 impl NativeDesktopApp {
     fn network_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("服务器");
-        ui.label("服务器 IP/域名");
-        ui.text_edit_singleline(&mut self.server_host);
-        ui.label("服务器端口");
-        ui.text_edit_singleline(&mut self.server_port);
-        ui.label(format!("完整地址：{}", self.server_url_preview()));
-        if native_action_button(ui, "保存服务器配置").clicked() {
-            self.save_server_endpoint();
-        }
+        native_section_title(
+            ui,
+            "服务器",
+            Some((
+                connection_state_label(&self.state.server_state),
+                connection_state_tone(&self.state.server_state),
+            )),
+        );
+        ui.add_space(12.0);
+        ui.horizontal_top(|ui| {
+            native_labeled_text_edit(ui, "服务器 IP / 域名", &mut self.server_host, 220.0);
+            ui.add_space(8.0);
+            native_labeled_text_edit(ui, "端口", &mut self.server_port, 90.0);
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.add_space(23.0);
+                if native_action_button(ui, "保存服务器配置").clicked() {
+                    self.save_server_endpoint();
+                }
+            });
+        });
+        ui.add_space(16.0);
+        ui.monospace(format!("完整地址：{}", self.server_url_preview()));
+        ui.add_space(8.0);
+        ui.colored_label(native_muted_text(), "配置保存到本地文件，应用会自动重连。");
     }
 
     fn current_device_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("当前电脑");
-        ui.checkbox(&mut self.is_master, "将当前电脑作为主电脑");
-        ui.label("设备名称");
-        ui.text_edit_singleline(&mut self.device_name);
-        ui.label(format!(
-            "设备 ID：{}",
-            self.state.device.id.as_deref().unwrap_or("-")
-        ));
-        ui.label(format!("系统：{}", self.state.device.os));
-        ui.label(native_master_assignment_text(&self.state));
-        ui.separator();
-        ui.label(format!(
-            "{}：{}",
-            native_current_device_fact_labels()[0],
-            empty_dash(&self.state.network.lan_ips.join(", "))
-        ));
-        ui.label(format!(
-            "{}：{}",
-            native_current_device_fact_labels()[1],
-            self.state
-                .network
-                .listen_port
-                .map_or_else(|| "-".to_string(), |port| port.to_string())
-        ));
-        ui.label(format!(
-            "{}：{}",
-            native_current_device_fact_labels()[2],
-            self.state
-                .network
-                .last_seen_at
-                .map_or_else(|| "-".to_string(), |value| value.to_string())
-        ));
-        ui.horizontal_wrapped(|ui| {
-            if native_action_button(ui, "刷新状态").clicked() {
-                self.reload_state("状态已刷新");
-            }
-            if native_action_button(ui, "保存当前电脑配置").clicked() {
-                self.save_current_device_config();
-            }
+        native_section_title(
+            ui,
+            "当前电脑",
+            Some((
+                if self.is_master {
+                    "主电脑"
+                } else {
+                    "从电脑"
+                },
+                NativeStatusTone::Info,
+            )),
+        );
+        ui.add_space(12.0);
+        ui.horizontal_top(|ui| {
+            native_labeled_text_edit(ui, "设备名称", &mut self.device_name, 220.0);
+            ui.add_space(8.0);
+            native_readonly_field(
+                ui,
+                "设备 ID",
+                self.state.device.id.as_deref().unwrap_or("-"),
+                140.0,
+            );
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.add_space(23.0);
+                if native_action_button(ui, "保存当前电脑配置").clicked() {
+                    self.save_current_device_config();
+                }
+            });
         });
+        ui.add_space(14.0);
+        ui.horizontal_top(|ui| {
+            native_metric_card(
+                ui,
+                native_current_device_fact_labels()[0],
+                &empty_dash(&self.state.network.lan_ips.join(", ")),
+                NativeStatusTone::Success,
+                140.0,
+            );
+            ui.add_space(8.0);
+            native_metric_card(
+                ui,
+                native_current_device_fact_labels()[1],
+                &self
+                    .state
+                    .network
+                    .listen_port
+                    .map_or_else(|| "-".to_string(), |port| port.to_string()),
+                NativeStatusTone::Muted,
+                90.0,
+            );
+            ui.add_space(8.0);
+            native_metric_card(
+                ui,
+                "主电脑配置",
+                &native_master_assignment_text(&self.state),
+                if self.is_master {
+                    NativeStatusTone::Success
+                } else {
+                    NativeStatusTone::Muted
+                },
+                130.0,
+            );
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.add_space(10.0);
+                if native_action_button(ui, "刷新").clicked() {
+                    self.reload_state("状态已刷新");
+                }
+            });
+        });
+        ui.add_space(8.0);
+        ui.checkbox(&mut self.is_master, "将当前电脑作为主电脑");
+        ui.colored_label(
+            native_muted_text(),
+            format!(
+                "系统：{}，最近心跳：{}",
+                self.state.device.os,
+                self.state
+                    .network
+                    .last_seen_at
+                    .map_or_else(|| "-".to_string(), |value| value.to_string())
+            ),
+        );
     }
 
     fn layout_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("设备位置");
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.heading("设备位置");
+                ui.colored_label(
+                    native_muted_text(),
+                    "以主电脑为中心配置上下左右，触碰屏幕边缘时切换控制目标。",
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if native_primary_action_button(ui, "保存设备位置").clicked() {
+                    self.save_layout();
+                }
+            });
+        });
+        ui.add_space(14.0);
         ui.set_min_height(native_desktop_layout_metrics().layout_panel_min_height);
         let devices = native_layout_device_options(&self.state);
         let center_device_name = native_layout_center_device_name(&self.state, &self.device_name);
-        let combo_width = native_layout_combo_width(ui.available_width());
-        let top_status = native_layout_slot_status_text(&self.state, self.layout.top.as_deref());
-        let left_status = native_layout_slot_status_text(&self.state, self.layout.left.as_deref());
-        let right_status =
-            native_layout_slot_status_text(&self.state, self.layout.right.as_deref());
-        let bottom_status =
-            native_layout_slot_status_text(&self.state, self.layout.bottom.as_deref());
-        egui::Grid::new("native_layout_grid")
-            .num_columns(3)
-            .spacing([native_layout_grid_horizontal_spacing(), 10.0])
-            .min_col_width(combo_width)
-            .show(ui, |ui| {
-                ui.label("");
-                device_combo(
-                    ui,
-                    "上方电脑",
-                    &mut self.layout.top,
-                    &devices,
-                    combo_width,
-                    &top_status,
-                );
-                ui.label("");
-                ui.end_row();
-                device_combo(
-                    ui,
-                    "左边电脑",
-                    &mut self.layout.left,
-                    &devices,
-                    combo_width,
-                    &left_status,
-                );
-                master_device_cell(ui, &center_device_name, self.is_master, combo_width);
-                device_combo(
-                    ui,
-                    "右边电脑",
-                    &mut self.layout.right,
-                    &devices,
-                    combo_width,
-                    &right_status,
-                );
-                ui.end_row();
-                ui.label("");
-                device_combo(
-                    ui,
-                    "下方电脑",
-                    &mut self.layout.bottom,
-                    &devices,
-                    combo_width,
-                    &bottom_status,
-                );
-                ui.label("");
-                ui.end_row();
-            });
-        ui.add_space(8.0);
-        if native_action_button(ui, "保存设备位置").clicked() {
-            self.save_layout();
-        }
+        let combo_width = native_layout_combo_width((ui.available_width() - 48.0).max(1.0));
+        let mut edited_layout = self.layout.clone();
+        let top_view = native_layout_slot_view(&self.state, edited_layout.top.as_deref());
+        let left_view = native_layout_slot_view(&self.state, edited_layout.left.as_deref());
+        let right_view = native_layout_slot_view(&self.state, edited_layout.right.as_deref());
+        let bottom_view = native_layout_slot_view(&self.state, edited_layout.bottom.as_deref());
+        native_layout_canvas(ui, |ui| {
+            egui::Grid::new("native_layout_grid")
+                .num_columns(3)
+                .spacing([native_layout_grid_horizontal_spacing(), 12.0])
+                .min_col_width(combo_width)
+                .show(ui, |ui| {
+                    ui.label("");
+                    if layout_slot_card(
+                        ui,
+                        "上方",
+                        &mut edited_layout.top,
+                        &devices,
+                        combo_width,
+                        &top_view,
+                    ) {
+                        native_layout_clear_duplicate_targets(
+                            &mut edited_layout,
+                            NativeLayoutDirection::Top,
+                        );
+                    }
+                    ui.label("");
+                    ui.end_row();
+                    if layout_slot_card(
+                        ui,
+                        "左侧",
+                        &mut edited_layout.left,
+                        &devices,
+                        combo_width,
+                        &left_view,
+                    ) {
+                        native_layout_clear_duplicate_targets(
+                            &mut edited_layout,
+                            NativeLayoutDirection::Left,
+                        );
+                    }
+                    master_device_cell(ui, &center_device_name, self.is_master, combo_width);
+                    if layout_slot_card(
+                        ui,
+                        "右侧",
+                        &mut edited_layout.right,
+                        &devices,
+                        combo_width,
+                        &right_view,
+                    ) {
+                        native_layout_clear_duplicate_targets(
+                            &mut edited_layout,
+                            NativeLayoutDirection::Right,
+                        );
+                    }
+                    ui.end_row();
+                    ui.label("");
+                    if layout_slot_card(
+                        ui,
+                        "下方",
+                        &mut edited_layout.bottom,
+                        &devices,
+                        combo_width,
+                        &bottom_view,
+                    ) {
+                        native_layout_clear_duplicate_targets(
+                            &mut edited_layout,
+                            NativeLayoutDirection::Bottom,
+                        );
+                    }
+                    ui.label("");
+                    ui.end_row();
+                });
+        });
+        self.layout = edited_layout;
     }
 
     fn devices_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("设备列表");
+        ui.colored_label(
+            native_muted_text(),
+            "同账号下设备，名称和 IP 会随心跳刷新。",
+        );
+        ui.add_space(14.0);
         ui.set_min_height(native_desktop_layout_metrics().devices_panel_min_height);
         let rows = native_device_list_rows(&self.state, &self.device_name);
-        let column_widths = native_devices_grid_column_widths(ui.available_width());
+        let row_width = ui.available_width();
         let mut next_lan_ip_popup = None;
-        egui::Grid::new("native_devices_grid")
-            .striped(true)
-            .spacing([native_devices_grid_horizontal_spacing(), 8.0])
-            .min_col_width(1.0)
-            .show(ui, |ui| {
-                native_grid_strong(ui, "设备", column_widths.name);
-                native_grid_strong(ui, "状态", column_widths.status);
-                native_grid_strong(ui, "内网 IP", column_widths.lan_ip);
-                native_grid_strong(ui, "公网 IP", column_widths.public_ip);
-                ui.end_row();
-                for row in &rows {
-                    native_grid_label(ui, &row.name, column_widths.name);
-                    native_grid_label(ui, &row.status, column_widths.status);
-                    if let Some(position) =
-                        native_grid_lan_ips(ui, &row.lan_ips, column_widths.lan_ip)
-                    {
-                        next_lan_ip_popup = Some(NativeLanIpPopup {
-                            device_name: row.name.clone(),
-                            lan_ips: row.lan_ips.clone(),
-                            position,
-                        });
-                    }
-                    native_grid_label(
-                        ui,
-                        row.public_ip.as_deref().unwrap_or("-"),
-                        column_widths.public_ip,
-                    );
-                    ui.end_row();
-                }
-            });
-        ui.add_space(8.0);
-        if native_action_button(ui, "刷新").clicked() {
-            self.reload_state("设备列表已刷新");
+        for row in &rows {
+            if let Some(position) = native_device_row_card(ui, row, row_width) {
+                next_lan_ip_popup = Some(NativeLanIpPopup {
+                    device_name: row.name.clone(),
+                    lan_ips: row.lan_ips.clone(),
+                    position,
+                });
+            }
+            ui.add_space(10.0);
         }
+        native_hint_box(
+            ui,
+            "提示：离线设备会保留位置配置，重新上线后自动刷新连接信息。",
+        );
+        ui.add_space(10.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if native_action_button(ui, "刷新").clicked() {
+                self.reload_state("设备列表已刷新");
+            }
+        });
         if next_lan_ip_popup.is_some() {
             self.lan_ip_popup = next_lan_ip_popup;
         }
@@ -609,14 +752,252 @@ impl NativeDesktopApp {
     }
 }
 
-fn device_combo(
+fn native_app_header(ui: &mut egui::Ui, state: &DesktopState, status_message: &str) {
+    let width = ui.available_width();
+    egui::Frame::new()
+        .fill(native_panel_background())
+        .stroke(egui::Stroke::new(1.0, native_panel_stroke()))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(22, 14))
+        .show(ui, |ui| {
+            ui.set_min_width((width - 46.0).max(1.0));
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("KMSync")
+                            .size(28.0)
+                            .strong()
+                            .color(native_primary_text()),
+                    );
+                    ui.colored_label(
+                        native_muted_text(),
+                        format!("桌面端控制台，状态：{status_message}"),
+                    );
+                });
+                ui.add_space((ui.available_width() - 360.0).max(12.0));
+                native_status_chip(
+                    ui,
+                    &format!(
+                        "{} {}",
+                        native_top_status_labels()[0],
+                        connection_state_label(&state.server_state)
+                    ),
+                    connection_state_tone(&state.server_state),
+                );
+                native_status_chip(ui, "LAN 优先", NativeStatusTone::Info);
+                native_status_chip(ui, "刚刚刷新", NativeStatusTone::Muted);
+            });
+        });
+}
+
+fn native_panel(
+    ui: &mut egui::Ui,
+    width: f32,
+    min_height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, min_height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::Frame::new()
+                .fill(native_panel_background())
+                .stroke(egui::Stroke::new(1.0, native_panel_stroke()))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(20, 18))
+                .show(ui, |ui| {
+                    ui.set_min_width((width - 42.0).max(1.0));
+                    ui.set_min_height((min_height - 38.0).max(1.0));
+                    add_contents(ui);
+                });
+        },
+    );
+}
+
+fn native_section_title(
+    ui: &mut egui::Ui,
+    title: &str,
+    trailing_status: Option<(&str, NativeStatusTone)>,
+) {
+    ui.horizontal(|ui| {
+        ui.heading(title);
+        if let Some((status, tone)) = trailing_status {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                native_status_chip(ui, status, tone);
+            });
+        }
+    });
+}
+
+fn native_labeled_text_edit(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .strong()
+                .color(native_muted_text()),
+        );
+        ui.add_sized(
+            egui::vec2(width, 32.0),
+            egui::TextEdit::singleline(value).desired_width(width),
+        );
+    });
+}
+
+fn native_readonly_field(ui: &mut egui::Ui, label: &str, value: &str, width: f32) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .strong()
+                .color(native_muted_text()),
+        );
+        egui::Frame::new()
+            .fill(native_subtle_background())
+            .stroke(egui::Stroke::new(1.0, native_panel_stroke()))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_min_width((width - 24.0).max(1.0));
+                ui.label(egui::RichText::new(value).color(native_primary_text()));
+            });
+    });
+}
+
+fn native_metric_card(
     ui: &mut egui::Ui,
     label: &str,
+    value: &str,
+    tone: NativeStatusTone,
+    width: f32,
+) {
+    let colors = native_tone_colors(tone);
+    egui::Frame::new()
+        .fill(colors.fill)
+        .stroke(egui::Stroke::new(1.0, colors.stroke))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_min_width((width - 24.0).max(1.0));
+            ui.label(egui::RichText::new(label).color(native_muted_text()));
+            ui.label(egui::RichText::new(value).strong().color(colors.text));
+        });
+}
+
+fn native_layout_canvas(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(native_canvas_background())
+        .stroke(egui::Stroke::new(1.0, native_panel_stroke()))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(24, 24))
+        .show(ui, |ui| {
+            ui.set_min_width((ui.available_width() - 48.0).max(1.0));
+            ui.set_min_height(360.0);
+            add_contents(ui);
+        });
+}
+
+fn native_tinted_card(
+    ui: &mut egui::Ui,
+    width: f32,
+    height: f32,
+    tone: NativeStatusTone,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let colors = native_tone_colors(tone);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::Frame::new()
+                .fill(colors.fill)
+                .stroke(egui::Stroke::new(1.0, colors.stroke))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width((width - 26.0).max(1.0));
+                    ui.set_min_height((height - 22.0).max(1.0));
+                    add_contents(ui);
+                });
+        },
+    );
+}
+
+fn native_status_chip(ui: &mut egui::Ui, label: &str, tone: NativeStatusTone) {
+    let colors = native_tone_colors(tone);
+    egui::Frame::new()
+        .fill(colors.fill)
+        .stroke(egui::Stroke::new(1.0, colors.stroke))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).strong().color(colors.text));
+        });
+}
+
+fn native_device_row_card(
+    ui: &mut egui::Ui,
+    row: &NativeDeviceListRow,
+    width: f32,
+) -> Option<egui::Pos2> {
+    let colors = native_tone_colors(row.status_tone);
+    let summary = native_lan_ip_summary(&row.lan_ips);
+    let mut popup_position = None;
+    egui::Frame::new()
+        .fill(native_panel_background())
+        .stroke(egui::Stroke::new(1.0, native_panel_stroke()))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_min_width((width - 30.0).max(1.0));
+            ui.set_min_height(NATIVE_DEVICE_ROW_HEIGHT - 20.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").size(17.0).color(colors.text));
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(&row.name)
+                            .strong()
+                            .color(native_primary_text()),
+                    );
+                    ui.colored_label(native_muted_text(), &row.detail);
+                });
+                ui.add_space((ui.available_width() - 210.0).max(8.0));
+                native_status_chip(ui, &row.status, row.status_tone);
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(summary.primary.as_str())
+                        .strong()
+                        .color(native_primary_text()),
+                );
+                if summary.has_more {
+                    let response = ui.small_button("更多");
+                    if response.clicked() {
+                        popup_position = Some(native_lan_ip_popup_position(response.rect));
+                    }
+                }
+            });
+        });
+    popup_position
+}
+
+fn native_hint_box(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::new()
+        .fill(native_canvas_background())
+        .stroke(egui::Stroke::new(1.0, native_panel_stroke()))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.colored_label(native_muted_text(), text);
+        });
+}
+
+fn layout_slot_card(
+    ui: &mut egui::Ui,
+    direction: &str,
     selected: &mut Option<String>,
     devices: &[(String, String)],
     width: f32,
-    status_text: &str,
-) {
+    view: &NativeLayoutSlotView,
+) -> bool {
+    let before = selected.clone();
     let selected_text = selected
         .as_deref()
         .and_then(|selected_id| {
@@ -626,24 +1007,36 @@ fn device_combo(
                 .map(|(_, name)| name.as_str())
         })
         .unwrap_or("未配置");
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 76.0),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            ui.set_width(width);
-            ui.label(label);
-            egui::ComboBox::from_id_salt(("native_layout_combo", label))
-                .width(width)
-                .selected_text(selected_text)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(selected, None, "未配置");
-                    for (id, name) in devices {
-                        ui.selectable_value(selected, Some(id.clone()), name);
-                    }
-                });
-            ui.label(status_text);
-        },
-    );
+    native_tinted_card(ui, width, NATIVE_LAYOUT_SLOT_HEIGHT, view.tone, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(direction)
+                    .strong()
+                    .color(native_muted_text()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                native_status_chip(ui, &view.status_label, view.tone);
+            });
+        });
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(&view.device_name)
+                .strong()
+                .color(native_primary_text()),
+        );
+        ui.colored_label(native_muted_text(), &view.route_hint);
+        ui.add_space(6.0);
+        egui::ComboBox::from_id_salt(("native_layout_combo", direction))
+            .width((width - 24.0).max(1.0))
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(selected, None, "未配置");
+                for (id, name) in devices {
+                    ui.selectable_value(selected, Some(id.clone()), name);
+                }
+            });
+    });
+    *selected != before
 }
 
 fn native_layout_device_options(state: &DesktopState) -> Vec<(String, String)> {
@@ -654,6 +1047,49 @@ fn native_layout_device_options(state: &DesktopState) -> Vec<(String, String)> {
         .filter(|device| Some(device.id.as_str()) != current_device_id)
         .map(|device| (device.id.clone(), device.name.clone()))
         .collect()
+}
+
+fn native_layout_clear_duplicate_targets(
+    layout: &mut DesktopLayout,
+    changed_direction: NativeLayoutDirection,
+) {
+    let Some(selected_device_id) =
+        native_layout_direction_value(layout, changed_direction).map(str::to_string)
+    else {
+        return;
+    };
+    if changed_direction != NativeLayoutDirection::Left
+        && layout.left.as_deref() == Some(selected_device_id.as_str())
+    {
+        layout.left = None;
+    }
+    if changed_direction != NativeLayoutDirection::Right
+        && layout.right.as_deref() == Some(selected_device_id.as_str())
+    {
+        layout.right = None;
+    }
+    if changed_direction != NativeLayoutDirection::Top
+        && layout.top.as_deref() == Some(selected_device_id.as_str())
+    {
+        layout.top = None;
+    }
+    if changed_direction != NativeLayoutDirection::Bottom
+        && layout.bottom.as_deref() == Some(selected_device_id.as_str())
+    {
+        layout.bottom = None;
+    }
+}
+
+fn native_layout_direction_value(
+    layout: &DesktopLayout,
+    direction: NativeLayoutDirection,
+) -> Option<&str> {
+    match direction {
+        NativeLayoutDirection::Left => layout.left.as_deref(),
+        NativeLayoutDirection::Right => layout.right.as_deref(),
+        NativeLayoutDirection::Top => layout.top.as_deref(),
+        NativeLayoutDirection::Bottom => layout.bottom.as_deref(),
+    }
 }
 
 fn native_layout_center_device_name(state: &DesktopState, edited_device_name: &str) -> String {
@@ -686,6 +1122,7 @@ fn native_master_assignment_text(state: &DesktopState) -> String {
     }
 }
 
+#[cfg(test)]
 fn native_layout_slot_status_text(
     state: &DesktopState,
     selected_device_id: Option<&str>,
@@ -693,17 +1130,48 @@ fn native_layout_slot_status_text(
     let Some(selected_device_id) = selected_device_id else {
         return "未配置".to_string();
     };
+    let slot = native_layout_slot_view(state, Some(selected_device_id));
+    format!("{}：{}", slot.device_name, slot.status_label)
+}
+
+fn native_layout_slot_view(
+    state: &DesktopState,
+    selected_device_id: Option<&str>,
+) -> NativeLayoutSlotView {
+    let Some(selected_device_id) = selected_device_id else {
+        return NativeLayoutSlotView {
+            device_name: "未配置设备".to_string(),
+            status_label: "未配置".to_string(),
+            route_hint: "该边缘保持本机控制".to_string(),
+            tone: NativeStatusTone::Muted,
+        };
+    };
     match state
         .devices
         .iter()
         .find(|device| device.id == selected_device_id)
     {
-        Some(device) => format!(
-            "{}：{}",
-            device.name,
-            if device.online { "在线" } else { "离线" }
-        ),
-        None => format!("{selected_device_id}：未知"),
+        Some(device) if device.online => NativeLayoutSlotView {
+            device_name: device.name.clone(),
+            status_label: "在线".to_string(),
+            route_hint: device
+                .lan_ips
+                .first()
+                .map_or_else(|| "等待 LAN 地址".to_string(), |ip| format!("LAN：{ip}")),
+            tone: NativeStatusTone::Success,
+        },
+        Some(device) => NativeLayoutSlotView {
+            device_name: device.name.clone(),
+            status_label: "离线".to_string(),
+            route_hint: "保留配置，等待心跳".to_string(),
+            tone: NativeStatusTone::Muted,
+        },
+        None => NativeLayoutSlotView {
+            device_name: "未知设备".to_string(),
+            status_label: "未知".to_string(),
+            route_hint: selected_device_id.to_string(),
+            tone: NativeStatusTone::Warning,
+        },
     }
 }
 
@@ -713,31 +1181,88 @@ fn native_device_list_rows(
 ) -> Vec<NativeDeviceListRow> {
     let mut rows = vec![NativeDeviceListRow {
         name: native_layout_center_device_name(state, edited_device_name),
+        detail: format!("{}，本机", state.device.os),
         status: "当前电脑".to_string(),
+        status_tone: NativeStatusTone::Info,
         lan_ips: state.network.lan_ips.clone(),
-        public_ip: None,
     }];
     rows.extend(state.devices.iter().map(|device| NativeDeviceListRow {
         name: device.name.clone(),
+        detail: native_device_row_detail(&state.layout, device),
         status: if device.online { "在线" } else { "离线" }.to_string(),
+        status_tone: if device.online {
+            NativeStatusTone::Success
+        } else {
+            NativeStatusTone::Muted
+        },
         lan_ips: device.lan_ips.clone(),
-        public_ip: device.public_ip.clone(),
     }));
     rows
 }
 
+fn native_device_row_detail(
+    layout: &DesktopLayout,
+    device: &kmsync_core::DesktopPeerState,
+) -> String {
+    native_layout_position_for_device(layout, &device.id).map_or_else(
+        || device.os.clone(),
+        |position| format!("{}，{position}", device.os),
+    )
+}
+
+fn native_layout_position_for_device(
+    layout: &DesktopLayout,
+    device_id: &str,
+) -> Option<&'static str> {
+    if layout.left.as_deref() == Some(device_id) {
+        Some("左侧")
+    } else if layout.right.as_deref() == Some(device_id) {
+        Some("右侧")
+    } else if layout.top.as_deref() == Some(device_id) {
+        Some("上方")
+    } else if layout.bottom.as_deref() == Some(device_id) {
+        Some("下方")
+    } else {
+        None
+    }
+}
+
 fn master_device_cell(ui: &mut egui::Ui, device_name: &str, is_master: bool, width: f32) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 64.0),
-        egui::Layout::top_down(egui::Align::Center),
+    native_tinted_card(
+        ui,
+        width,
+        NATIVE_LAYOUT_CENTER_HEIGHT,
+        NativeStatusTone::Info,
         |ui| {
-            ui.strong("主电脑");
-            ui.label(device_name);
-            ui.label(if is_master {
-                "当前电脑"
-            } else {
-                "已配置主电脑"
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("主电脑")
+                        .strong()
+                        .color(native_info_text()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    native_status_chip(
+                        ui,
+                        if is_master {
+                            "当前电脑"
+                        } else {
+                            "已配置主电脑"
+                        },
+                        if is_master {
+                            NativeStatusTone::Success
+                        } else {
+                            NativeStatusTone::Info
+                        },
+                    );
+                });
             });
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(device_name)
+                    .strong()
+                    .color(native_primary_text()),
+            );
+            ui.colored_label(native_muted_text(), "鼠标键盘从这里出发");
         },
     );
 }
@@ -751,6 +1276,22 @@ fn native_layout_combo_width(available_width: f32) -> f32 {
     )
 }
 
+fn native_top_panel_widths(available_width: f32) -> NativeSplitPanelWidths {
+    let content_width = (available_width - NATIVE_PANEL_SPACING).max(1.0);
+    let primary = (content_width * 0.47).max(1.0);
+    NativeSplitPanelWidths {
+        primary,
+        secondary: (content_width - primary).max(1.0),
+    }
+}
+
+fn native_lower_panel_widths(available_width: f32) -> NativeSplitPanelWidths {
+    let content_width = (available_width - NATIVE_PANEL_SPACING).max(1.0);
+    let secondary = (content_width * 0.36).clamp(320.0, 440.0);
+    let primary = (content_width - secondary).max(1.0);
+    NativeSplitPanelWidths { primary, secondary }
+}
+
 #[cfg(test)]
 fn native_devices_grid_column_width(available_width: f32) -> f32 {
     native_fit_grid_column_width(
@@ -761,6 +1302,7 @@ fn native_devices_grid_column_width(available_width: f32) -> f32 {
     )
 }
 
+#[cfg(test)]
 fn native_devices_grid_column_widths(available_width: f32) -> NativeDeviceGridColumnWidths {
     let min_widths = NativeDeviceGridColumnWidths {
         name: NATIVE_DEVICES_GRID_NAME_MIN_WIDTH,
@@ -818,43 +1360,9 @@ fn native_layout_grid_horizontal_spacing() -> f32 {
     NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING
 }
 
+#[cfg(test)]
 fn native_devices_grid_horizontal_spacing() -> f32 {
     NATIVE_DEVICES_GRID_HORIZONTAL_SPACING
-}
-
-fn native_grid_label(ui: &mut egui::Ui, label: &str, width: f32) {
-    ui.add_sized(egui::vec2(width, 18.0), egui::Label::new(label).wrap());
-}
-
-fn native_grid_strong(ui: &mut egui::Ui, label: &str, width: f32) {
-    ui.add_sized(
-        egui::vec2(width, 18.0),
-        egui::Label::new(egui::RichText::new(label).strong()).wrap(),
-    );
-}
-
-fn native_grid_lan_ips(ui: &mut egui::Ui, lan_ips: &[String], width: f32) -> Option<egui::Pos2> {
-    let summary = native_lan_ip_summary(lan_ips);
-    let mut popup_position = None;
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 22.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            let button_width = if summary.has_more { 54.0 } else { 0.0 };
-            let label_width = (width - button_width).max(1.0);
-            ui.add_sized(
-                egui::vec2(label_width, 18.0),
-                egui::Label::new(summary.primary).wrap(),
-            );
-            if summary.has_more {
-                let response = ui.small_button("更多");
-                if response.clicked() {
-                    popup_position = Some(native_lan_ip_popup_position(response.rect));
-                }
-            }
-        },
-    );
-    popup_position
 }
 
 fn native_lan_ip_popup_position(button_rect: egui::Rect) -> egui::Pos2 {
@@ -880,10 +1388,25 @@ fn native_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
                 .color(egui::Color32::from_rgb(30, 64, 175)),
         )
         .fill(egui::Color32::from_rgb(239, 246, 255))
+        .corner_radius(egui::CornerRadius::same(7))
         .stroke(egui::Stroke::new(
             1.0,
             egui::Color32::from_rgb(147, 197, 253),
         )),
+    )
+}
+
+fn native_primary_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized(
+        native_action_button_size(),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .strong()
+                .color(egui::Color32::from_rgb(246, 249, 255)),
+        )
+        .fill(egui::Color32::from_rgb(35, 88, 184))
+        .corner_radius(egui::CornerRadius::same(7))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 88, 184))),
     )
 }
 
@@ -895,7 +1418,7 @@ fn native_action_button_size() -> egui::Vec2 {
 fn native_action_button_labels() -> [&'static str; 5] {
     [
         "保存服务器配置",
-        "刷新状态",
+        "刷新",
         "保存当前电脑配置",
         "保存设备位置",
         "刷新",
@@ -920,17 +1443,6 @@ fn native_top_status_labels() -> [&'static str; 1] {
     ["服务器"]
 }
 
-fn connection_state_status(ui: &mut egui::Ui, label: &str, state: &DesktopConnectionState) {
-    ui.horizontal(|ui| {
-        ui.label(format!("{label}："));
-        ui.label(
-            egui::RichText::new(connection_state_label(state))
-                .strong()
-                .color(connection_state_color(state)),
-        );
-    });
-}
-
 fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
     match state {
         DesktopConnectionState::Connecting => "连接中",
@@ -951,6 +1463,7 @@ fn connection_state_tone(state: &DesktopConnectionState) -> NativeStatusTone {
     }
 }
 
+#[cfg(test)]
 fn connection_state_color(state: &DesktopConnectionState) -> egui::Color32 {
     match connection_state_tone(state) {
         NativeStatusTone::Success => egui::Color32::from_rgb(21, 128, 61),
@@ -959,6 +1472,68 @@ fn connection_state_color(state: &DesktopConnectionState) -> egui::Color32 {
         NativeStatusTone::Info => egui::Color32::from_rgb(37, 99, 235),
         NativeStatusTone::Muted => egui::Color32::from_rgb(100, 116, 139),
     }
+}
+
+fn native_tone_colors(tone: NativeStatusTone) -> NativeToneColors {
+    match tone {
+        NativeStatusTone::Success => NativeToneColors {
+            text: egui::Color32::from_rgb(20, 114, 74),
+            fill: egui::Color32::from_rgb(231, 243, 236),
+            stroke: egui::Color32::from_rgb(185, 220, 199),
+        },
+        NativeStatusTone::Danger => NativeToneColors {
+            text: egui::Color32::from_rgb(173, 61, 54),
+            fill: egui::Color32::from_rgb(252, 236, 234),
+            stroke: egui::Color32::from_rgb(244, 195, 189),
+        },
+        NativeStatusTone::Warning => NativeToneColors {
+            text: egui::Color32::from_rgb(175, 85, 36),
+            fill: egui::Color32::from_rgb(255, 240, 227),
+            stroke: egui::Color32::from_rgb(240, 201, 168),
+        },
+        NativeStatusTone::Info => NativeToneColors {
+            text: egui::Color32::from_rgb(36, 81, 166),
+            fill: egui::Color32::from_rgb(238, 244, 255),
+            stroke: egui::Color32::from_rgb(195, 208, 232),
+        },
+        NativeStatusTone::Muted => NativeToneColors {
+            text: egui::Color32::from_rgb(104, 114, 105),
+            fill: egui::Color32::from_rgb(238, 241, 236),
+            stroke: egui::Color32::from_rgb(213, 220, 209),
+        },
+    }
+}
+
+fn native_app_background() -> egui::Color32 {
+    egui::Color32::from_rgb(245, 246, 242)
+}
+
+fn native_panel_background() -> egui::Color32 {
+    egui::Color32::from_rgb(251, 252, 248)
+}
+
+fn native_canvas_background() -> egui::Color32 {
+    egui::Color32::from_rgb(247, 248, 244)
+}
+
+fn native_subtle_background() -> egui::Color32 {
+    egui::Color32::from_rgb(248, 250, 246)
+}
+
+fn native_panel_stroke() -> egui::Color32 {
+    egui::Color32::from_rgb(221, 227, 218)
+}
+
+fn native_primary_text() -> egui::Color32 {
+    egui::Color32::from_rgb(31, 41, 35)
+}
+
+fn native_muted_text() -> egui::Color32 {
+    egui::Color32::from_rgb(105, 115, 108)
+}
+
+fn native_info_text() -> egui::Color32 {
+    egui::Color32::from_rgb(36, 81, 166)
 }
 
 fn empty_dash(value: &str) -> String {
@@ -1074,6 +1649,16 @@ mod tests {
     }
 
     #[test]
+    fn native_redesign_panel_widths_prioritize_topology_canvas() {
+        let lower = native_lower_panel_widths(1080.0);
+
+        assert!(lower.primary > lower.secondary);
+        assert!(lower.primary >= 620.0);
+        assert!(lower.secondary >= 360.0);
+        assert!(lower.total_width(16.0) <= 1080.0);
+    }
+
+    #[test]
     fn native_lan_ip_popup_opens_next_to_more_button() {
         let button_rect =
             egui::Rect::from_min_size(egui::pos2(320.0, 180.0), egui::vec2(44.0, 20.0));
@@ -1167,6 +1752,72 @@ mod tests {
     }
 
     #[test]
+    fn native_layout_slot_views_match_topology_card_states() {
+        let state = DesktopState {
+            devices: vec![
+                DesktopPeerState {
+                    id: "right-device".to_string(),
+                    name: "Right PC".to_string(),
+                    os: "windows".to_string(),
+                    online: true,
+                    lan_ips: vec!["192.168.1.21".to_string()],
+                    public_ip: None,
+                    listen_port: Some(24_800),
+                    last_seen_at: None,
+                },
+                DesktopPeerState {
+                    id: "bottom-device".to_string(),
+                    name: "Bottom PC".to_string(),
+                    os: "linux".to_string(),
+                    online: false,
+                    lan_ips: vec!["192.168.1.30".to_string()],
+                    public_ip: None,
+                    listen_port: Some(24_800),
+                    last_seen_at: None,
+                },
+            ],
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_slot_view(&state, None),
+            NativeLayoutSlotView {
+                device_name: "未配置设备".to_string(),
+                status_label: "未配置".to_string(),
+                route_hint: "该边缘保持本机控制".to_string(),
+                tone: NativeStatusTone::Muted,
+            }
+        );
+        assert_eq!(
+            native_layout_slot_view(&state, Some("right-device")),
+            NativeLayoutSlotView {
+                device_name: "Right PC".to_string(),
+                status_label: "在线".to_string(),
+                route_hint: "LAN：192.168.1.21".to_string(),
+                tone: NativeStatusTone::Success,
+            }
+        );
+        assert_eq!(
+            native_layout_slot_view(&state, Some("bottom-device")),
+            NativeLayoutSlotView {
+                device_name: "Bottom PC".to_string(),
+                status_label: "离线".to_string(),
+                route_hint: "保留配置，等待心跳".to_string(),
+                tone: NativeStatusTone::Muted,
+            }
+        );
+        assert_eq!(
+            native_layout_slot_view(&state, Some("missing-device")),
+            NativeLayoutSlotView {
+                device_name: "未知设备".to_string(),
+                status_label: "未知".to_string(),
+                route_hint: "missing-device".to_string(),
+                tone: NativeStatusTone::Warning,
+            }
+        );
+    }
+
+    #[test]
     fn native_layout_options_exclude_current_device() {
         let state = DesktopState {
             device: DesktopDeviceState {
@@ -1210,6 +1861,29 @@ mod tests {
     }
 
     #[test]
+    fn native_layout_deduplicates_device_when_new_direction_selects_existing_target() {
+        let mut layout = DesktopLayout {
+            left: Some("device-a".to_string()),
+            right: None,
+            top: Some("device-b".to_string()),
+            bottom: None,
+        };
+
+        layout.right = Some("device-a".to_string());
+        native_layout_clear_duplicate_targets(&mut layout, NativeLayoutDirection::Right);
+
+        assert_eq!(layout.left, None);
+        assert_eq!(layout.right.as_deref(), Some("device-a"));
+        assert_eq!(layout.top.as_deref(), Some("device-b"));
+
+        layout.bottom = Some("device-b".to_string());
+        native_layout_clear_duplicate_targets(&mut layout, NativeLayoutDirection::Bottom);
+
+        assert_eq!(layout.top, None);
+        assert_eq!(layout.bottom.as_deref(), Some("device-b"));
+    }
+
+    #[test]
     fn native_desktop_connection_status_uses_semantic_colors() {
         assert_eq!(
             connection_state_tone(&DesktopConnectionState::Connected),
@@ -1231,7 +1905,7 @@ mod tests {
             native_action_button_labels(),
             [
                 "保存服务器配置",
-                "刷新状态",
+                "刷新",
                 "保存当前电脑配置",
                 "保存设备位置",
                 "刷新"
@@ -1303,15 +1977,17 @@ mod tests {
             vec![
                 NativeDeviceListRow {
                     name: "Renamed PC".to_string(),
+                    detail: "windows，本机".to_string(),
                     status: "当前电脑".to_string(),
+                    status_tone: NativeStatusTone::Info,
                     lan_ips: vec!["192.168.1.20".to_string()],
-                    public_ip: None,
                 },
                 NativeDeviceListRow {
                     name: "Right PC".to_string(),
+                    detail: "macos".to_string(),
                     status: "在线".to_string(),
+                    status_tone: NativeStatusTone::Success,
                     lan_ips: vec!["192.168.1.21".to_string()],
-                    public_ip: None,
                 }
             ]
         );
