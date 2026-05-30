@@ -5,13 +5,18 @@ use eframe::egui;
 use kmsync_core::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopState};
 
 const NATIVE_CJK_FONT_NAME: &str = "kmsync_cjk";
-const NATIVE_WINDOW_SIZE: [f32; 2] = [1120.0, 880.0];
-const NATIVE_WINDOW_MIN_SIZE: [f32; 2] = [900.0, 700.0];
-const NATIVE_TOP_PANEL_MIN_HEIGHT: f32 = 190.0;
-const NATIVE_LOWER_PANEL_MIN_HEIGHT: f32 = 480.0;
-const NATIVE_PANEL_SPACING: f32 = 16.0;
+const NATIVE_WINDOW_SIZE: [f32; 2] = [1440.0, 1000.0];
+const NATIVE_WINDOW_MIN_SIZE: [f32; 2] = [1120.0, 780.0];
+const NATIVE_PAGE_MARGIN_X: i8 = 40;
+const NATIVE_PAGE_MARGIN_Y: i8 = 28;
+const NATIVE_AFTER_HEADER_GAP: f32 = 24.0;
+const NATIVE_ROW_GAP: f32 = 28.0;
+const NATIVE_TOP_PANEL_MIN_HEIGHT: f32 = 226.0;
+const NATIVE_LOWER_PANEL_MIN_HEIGHT: f32 = 548.0;
+const NATIVE_PANEL_SPACING: f32 = 20.0;
 const NATIVE_LAYOUT_GRID_MIN_COL_WIDTH: f32 = 96.0;
-const NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING: f32 = 12.0;
+const NATIVE_LAYOUT_GRID_MAX_COL_WIDTH: f32 = 220.0;
+const NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING: f32 = 34.0;
 const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 92.0;
 #[cfg(test)]
 const NATIVE_DEVICES_GRID_NAME_MIN_WIDTH: f32 = 86.0;
@@ -24,10 +29,12 @@ const NATIVE_DEVICES_GRID_PUBLIC_IP_MIN_WIDTH: f32 = 86.0;
 #[cfg(test)]
 const NATIVE_DEVICES_GRID_HORIZONTAL_SPACING: f32 = 12.0;
 const NATIVE_ACTION_BUTTON_WIDTH: f32 = 150.0;
-const NATIVE_ACTION_BUTTON_HEIGHT: f32 = 34.0;
+const NATIVE_COMPACT_ACTION_BUTTON_WIDTH: f32 = 120.0;
+const NATIVE_ACTION_BUTTON_HEIGHT: f32 = 38.0;
 const NATIVE_LAN_IP_POPUP_VERTICAL_OFFSET: f32 = 6.0;
 const NATIVE_LAYOUT_SLOT_HEIGHT: f32 = 112.0;
 const NATIVE_LAYOUT_CENTER_HEIGHT: f32 = 118.0;
+const NATIVE_LAYOUT_CANVAS_CONTENT_HEIGHT: f32 = 372.0;
 const NATIVE_DEVICE_ROW_HEIGHT: f32 = 72.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +84,28 @@ impl NativeDeviceGridColumnWidths {
 struct NativeSplitPanelWidths {
     primary: f32,
     secondary: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NativeServerFormWidths {
+    host: f32,
+    port: f32,
+    pre_button_gap: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NativeCurrentDeviceFormWidths {
+    name: f32,
+    id: f32,
+    pre_button_gap: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NativeCurrentDeviceMetricWidths {
+    lan_ip: f32,
+    listen_port: f32,
+    master: f32,
+    pre_refresh_gap: f32,
 }
 
 impl NativeSplitPanelWidths {
@@ -422,17 +451,22 @@ impl eframe::App for NativeDesktopApp {
             .frame(
                 egui::Frame::new()
                     .fill(native_app_background())
-                    .inner_margin(egui::Margin::symmetric(18, 18)),
+                    .inner_margin(egui::Margin::symmetric(
+                        NATIVE_PAGE_MARGIN_X,
+                        NATIVE_PAGE_MARGIN_Y,
+                    )),
             )
             .show(ctx, |ui| {
                 native_app_header(ui, &self.state, &self.status_message);
-                ui.add_space(14.0);
+                ui.add_space(NATIVE_AFTER_HEADER_GAP);
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let metrics = native_desktop_layout_metrics();
                         let top_widths = native_top_panel_widths(ui.available_width());
+                        let previous_spacing = ui.spacing().item_spacing;
+                        ui.spacing_mut().item_spacing.x = NATIVE_PANEL_SPACING;
                         ui.horizontal_top(|ui| {
                             native_panel(
                                 ui,
@@ -451,8 +485,11 @@ impl eframe::App for NativeDesktopApp {
                                 },
                             );
                         });
-                        ui.add_space(NATIVE_PANEL_SPACING);
+                        ui.spacing_mut().item_spacing = previous_spacing;
+                        ui.add_space(NATIVE_ROW_GAP);
                         let lower_widths = native_lower_panel_widths(ui.available_width());
+                        let previous_spacing = ui.spacing().item_spacing;
+                        ui.spacing_mut().item_spacing.x = NATIVE_PANEL_SPACING;
                         ui.horizontal_top(|ui| {
                             native_panel(
                                 ui,
@@ -471,6 +508,7 @@ impl eframe::App for NativeDesktopApp {
                                 },
                             );
                         });
+                        ui.spacing_mut().item_spacing = previous_spacing;
                     });
             });
         self.lan_ip_popup_window(ctx);
@@ -488,17 +526,21 @@ impl NativeDesktopApp {
             )),
         );
         ui.add_space(12.0);
+        let widths = native_server_form_widths(ui.available_width());
         ui.horizontal_top(|ui| {
-            native_labeled_text_edit(ui, "服务器 IP / 域名", &mut self.server_host, 220.0);
-            ui.add_space(8.0);
-            native_labeled_text_edit(ui, "端口", &mut self.server_port, 90.0);
-            ui.add_space(10.0);
+            let previous_spacing = ui.spacing().item_spacing;
+            ui.spacing_mut().item_spacing.x = 0.0;
+            native_labeled_text_edit(ui, "服务器 IP / 域名", &mut self.server_host, widths.host);
+            ui.add_space(14.0);
+            native_labeled_text_edit(ui, "端口", &mut self.server_port, widths.port);
+            ui.add_space(widths.pre_button_gap);
             ui.vertical(|ui| {
                 ui.add_space(23.0);
                 if native_action_button(ui, "保存服务器配置").clicked() {
                     self.save_server_endpoint();
                 }
             });
+            ui.spacing_mut().item_spacing = previous_spacing;
         });
         ui.add_space(16.0);
         ui.monospace(format!("完整地址：{}", self.server_url_preview()));
@@ -520,33 +562,40 @@ impl NativeDesktopApp {
             )),
         );
         ui.add_space(12.0);
+        let form_widths = native_current_device_form_widths(ui.available_width());
         ui.horizontal_top(|ui| {
-            native_labeled_text_edit(ui, "设备名称", &mut self.device_name, 220.0);
-            ui.add_space(8.0);
+            let previous_spacing = ui.spacing().item_spacing;
+            ui.spacing_mut().item_spacing.x = 0.0;
+            native_labeled_text_edit(ui, "设备名称", &mut self.device_name, form_widths.name);
+            ui.add_space(14.0);
             native_readonly_field(
                 ui,
                 "设备 ID",
                 self.state.device.id.as_deref().unwrap_or("-"),
-                140.0,
+                form_widths.id,
             );
-            ui.add_space(10.0);
+            ui.add_space(form_widths.pre_button_gap);
             ui.vertical(|ui| {
                 ui.add_space(23.0);
                 if native_action_button(ui, "保存当前电脑配置").clicked() {
                     self.save_current_device_config();
                 }
             });
+            ui.spacing_mut().item_spacing = previous_spacing;
         });
         ui.add_space(14.0);
+        let metric_widths = native_current_device_metric_widths(ui.available_width());
         ui.horizontal_top(|ui| {
+            let previous_spacing = ui.spacing().item_spacing;
+            ui.spacing_mut().item_spacing.x = 0.0;
             native_metric_card(
                 ui,
                 native_current_device_fact_labels()[0],
                 &empty_dash(&self.state.network.lan_ips.join(", ")),
                 NativeStatusTone::Success,
-                140.0,
+                metric_widths.lan_ip,
             );
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             native_metric_card(
                 ui,
                 native_current_device_fact_labels()[1],
@@ -556,9 +605,9 @@ impl NativeDesktopApp {
                     .listen_port
                     .map_or_else(|| "-".to_string(), |port| port.to_string()),
                 NativeStatusTone::Muted,
-                90.0,
+                metric_widths.listen_port,
             );
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             native_metric_card(
                 ui,
                 "主电脑配置",
@@ -568,15 +617,16 @@ impl NativeDesktopApp {
                 } else {
                     NativeStatusTone::Muted
                 },
-                130.0,
+                metric_widths.master,
             );
-            ui.add_space(8.0);
+            ui.add_space(metric_widths.pre_refresh_gap);
             ui.vertical(|ui| {
                 ui.add_space(10.0);
-                if native_action_button(ui, "刷新").clicked() {
+                if native_compact_action_button(ui, "刷新").clicked() {
                     self.reload_state("状态已刷新");
                 }
             });
+            ui.spacing_mut().item_spacing = previous_spacing;
         });
         ui.add_space(8.0);
         ui.checkbox(&mut self.is_master, "将当前电脑作为主电脑");
@@ -609,7 +659,6 @@ impl NativeDesktopApp {
             });
         });
         ui.add_space(14.0);
-        ui.set_min_height(native_desktop_layout_metrics().layout_panel_min_height);
         let devices = native_layout_device_options(&self.state);
         let center_device_name = native_layout_center_device_name(&self.state, &self.device_name);
         let combo_width = native_layout_combo_width((ui.available_width() - 48.0).max(1.0));
@@ -619,72 +668,76 @@ impl NativeDesktopApp {
         let right_view = native_layout_slot_view(&self.state, edited_layout.right.as_deref());
         let bottom_view = native_layout_slot_view(&self.state, edited_layout.bottom.as_deref());
         native_layout_canvas(ui, |ui| {
-            egui::Grid::new("native_layout_grid")
-                .num_columns(3)
-                .spacing([native_layout_grid_horizontal_spacing(), 12.0])
-                .min_col_width(combo_width)
-                .show(ui, |ui| {
-                    ui.label("");
-                    if layout_slot_card(
-                        ui,
-                        "上方",
-                        &mut edited_layout.top,
-                        &devices,
-                        combo_width,
-                        &top_view,
-                    ) {
-                        native_layout_clear_duplicate_targets(
-                            &mut edited_layout,
-                            NativeLayoutDirection::Top,
-                        );
-                    }
-                    ui.label("");
-                    ui.end_row();
-                    if layout_slot_card(
-                        ui,
-                        "左侧",
-                        &mut edited_layout.left,
-                        &devices,
-                        combo_width,
-                        &left_view,
-                    ) {
-                        native_layout_clear_duplicate_targets(
-                            &mut edited_layout,
-                            NativeLayoutDirection::Left,
-                        );
-                    }
-                    master_device_cell(ui, &center_device_name, self.is_master, combo_width);
-                    if layout_slot_card(
-                        ui,
-                        "右侧",
-                        &mut edited_layout.right,
-                        &devices,
-                        combo_width,
-                        &right_view,
-                    ) {
-                        native_layout_clear_duplicate_targets(
-                            &mut edited_layout,
-                            NativeLayoutDirection::Right,
-                        );
-                    }
-                    ui.end_row();
-                    ui.label("");
-                    if layout_slot_card(
-                        ui,
-                        "下方",
-                        &mut edited_layout.bottom,
-                        &devices,
-                        combo_width,
-                        &bottom_view,
-                    ) {
-                        native_layout_clear_duplicate_targets(
-                            &mut edited_layout,
-                            NativeLayoutDirection::Bottom,
-                        );
-                    }
-                    ui.label("");
-                    ui.end_row();
-                });
+            let leading_space = native_layout_grid_leading_space(ui.available_width(), combo_width);
+            ui.horizontal_top(|ui| {
+                ui.add_space(leading_space);
+                egui::Grid::new("native_layout_grid")
+                    .num_columns(3)
+                    .spacing([native_layout_grid_horizontal_spacing(), 12.0])
+                    .min_col_width(combo_width)
+                    .show(ui, |ui| {
+                        ui.label("");
+                        if layout_slot_card(
+                            ui,
+                            "上方",
+                            &mut edited_layout.top,
+                            &devices,
+                            combo_width,
+                            &top_view,
+                        ) {
+                            native_layout_clear_duplicate_targets(
+                                &mut edited_layout,
+                                NativeLayoutDirection::Top,
+                            );
+                        }
+                        ui.label("");
+                        ui.end_row();
+                        if layout_slot_card(
+                            ui,
+                            "左侧",
+                            &mut edited_layout.left,
+                            &devices,
+                            combo_width,
+                            &left_view,
+                        ) {
+                            native_layout_clear_duplicate_targets(
+                                &mut edited_layout,
+                                NativeLayoutDirection::Left,
+                            );
+                        }
+                        master_device_cell(ui, &center_device_name, self.is_master, combo_width);
+                        if layout_slot_card(
+                            ui,
+                            "右侧",
+                            &mut edited_layout.right,
+                            &devices,
+                            combo_width,
+                            &right_view,
+                        ) {
+                            native_layout_clear_duplicate_targets(
+                                &mut edited_layout,
+                                NativeLayoutDirection::Right,
+                            );
+                        }
+                        ui.end_row();
+                        ui.label("");
+                        if layout_slot_card(
+                            ui,
+                            "下方",
+                            &mut edited_layout.bottom,
+                            &devices,
+                            combo_width,
+                            &bottom_view,
+                        ) {
+                            native_layout_clear_duplicate_targets(
+                                &mut edited_layout,
+                                NativeLayoutDirection::Bottom,
+                            );
+                        }
+                        ui.label("");
+                        ui.end_row();
+                    });
+            });
         });
         self.layout = edited_layout;
     }
@@ -696,7 +749,6 @@ impl NativeDesktopApp {
             "同账号下设备，名称和 IP 会随心跳刷新。",
         );
         ui.add_space(14.0);
-        ui.set_min_height(native_desktop_layout_metrics().devices_panel_min_height);
         let rows = native_device_list_rows(&self.state, &self.device_name);
         let row_width = ui.available_width();
         let mut next_lan_ip_popup = None;
@@ -714,9 +766,9 @@ impl NativeDesktopApp {
             ui,
             "提示：离线设备会保留位置配置，重新上线后自动刷新连接信息。",
         );
-        ui.add_space(10.0);
+        ui.add_space(native_devices_footer_top_space(ui.available_height()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if native_action_button(ui, "刷新").clicked() {
+            if native_compact_action_button(ui, "刷新").clicked() {
                 self.reload_state("设备列表已刷新");
             }
         });
@@ -757,10 +809,11 @@ fn native_app_header(ui: &mut egui::Ui, state: &DesktopState, status_message: &s
     egui::Frame::new()
         .fill(native_panel_background())
         .stroke(egui::Stroke::new(1.0, native_panel_stroke()))
-        .corner_radius(egui::CornerRadius::same(8))
+        .corner_radius(egui::CornerRadius::same(10))
         .inner_margin(egui::Margin::symmetric(22, 14))
         .show(ui, |ui| {
             ui.set_min_width((width - 46.0).max(1.0));
+            ui.set_min_height(58.0);
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
@@ -774,18 +827,19 @@ fn native_app_header(ui: &mut egui::Ui, state: &DesktopState, status_message: &s
                         format!("桌面端控制台，状态：{status_message}"),
                     );
                 });
-                ui.add_space((ui.available_width() - 360.0).max(12.0));
-                native_status_chip(
-                    ui,
-                    &format!(
-                        "{} {}",
-                        native_top_status_labels()[0],
-                        connection_state_label(&state.server_state)
-                    ),
-                    connection_state_tone(&state.server_state),
-                );
-                native_status_chip(ui, "LAN 优先", NativeStatusTone::Info);
-                native_status_chip(ui, "刚刚刷新", NativeStatusTone::Muted);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    native_status_chip(ui, "刚刚刷新", NativeStatusTone::Muted);
+                    native_status_chip(ui, "LAN 优先", NativeStatusTone::Info);
+                    native_status_chip(
+                        ui,
+                        &format!(
+                            "{} {}",
+                            native_top_status_labels()[0],
+                            connection_state_label(&state.server_state)
+                        ),
+                        connection_state_tone(&state.server_state),
+                    );
+                });
             });
         });
 }
@@ -890,7 +944,7 @@ fn native_layout_canvas(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::
         .inner_margin(egui::Margin::symmetric(24, 24))
         .show(ui, |ui| {
             ui.set_min_width((ui.available_width() - 48.0).max(1.0));
-            ui.set_min_height(360.0);
+            ui.set_min_height(NATIVE_LAYOUT_CANVAS_CONTENT_HEIGHT);
             add_contents(ui);
         });
 }
@@ -1268,17 +1322,34 @@ fn master_device_cell(ui: &mut egui::Ui, device_name: &str, is_master: bool, wid
 }
 
 fn native_layout_combo_width(available_width: f32) -> f32 {
-    native_fit_grid_column_width(
-        available_width,
+    if native_grid_total_width(
+        NATIVE_LAYOUT_GRID_MAX_COL_WIDTH,
         3,
         native_layout_grid_horizontal_spacing(),
-        NATIVE_LAYOUT_GRID_MIN_COL_WIDTH,
-    )
+    ) <= available_width
+    {
+        NATIVE_LAYOUT_GRID_MAX_COL_WIDTH
+    } else {
+        native_fit_grid_column_width(
+            available_width,
+            3,
+            native_layout_grid_horizontal_spacing(),
+            NATIVE_LAYOUT_GRID_MIN_COL_WIDTH,
+        )
+        .min(NATIVE_LAYOUT_GRID_MAX_COL_WIDTH)
+    }
+}
+
+fn native_layout_grid_leading_space(available_width: f32, column_width: f32) -> f32 {
+    ((available_width
+        - native_grid_total_width(column_width, 3, native_layout_grid_horizontal_spacing()))
+        / 2.0)
+        .max(0.0)
 }
 
 fn native_top_panel_widths(available_width: f32) -> NativeSplitPanelWidths {
     let content_width = (available_width - NATIVE_PANEL_SPACING).max(1.0);
-    let primary = (content_width * 0.47).max(1.0);
+    let primary = native_design_split_primary(content_width, 640.0, 700.0);
     NativeSplitPanelWidths {
         primary,
         secondary: (content_width - primary).max(1.0),
@@ -1287,9 +1358,167 @@ fn native_top_panel_widths(available_width: f32) -> NativeSplitPanelWidths {
 
 fn native_lower_panel_widths(available_width: f32) -> NativeSplitPanelWidths {
     let content_width = (available_width - NATIVE_PANEL_SPACING).max(1.0);
-    let secondary = (content_width * 0.36).clamp(320.0, 440.0);
-    let primary = (content_width - secondary).max(1.0);
-    NativeSplitPanelWidths { primary, secondary }
+    let primary = native_design_split_primary(content_width, 860.0, 480.0);
+    NativeSplitPanelWidths {
+        primary,
+        secondary: (content_width - primary).max(1.0),
+    }
+}
+
+fn native_design_split_primary(
+    content_width: f32,
+    design_primary: f32,
+    design_secondary: f32,
+) -> f32 {
+    let design_total = (design_primary + design_secondary).max(1.0);
+    (content_width * design_primary / design_total).max(1.0)
+}
+
+fn native_server_form_widths(available_width: f32) -> NativeServerFormWidths {
+    let first_gap = 14.0;
+    let min_pre_button_gap = 16.0;
+    let button = NATIVE_ACTION_BUTTON_WIDTH;
+    let port = if available_width >= 560.0 {
+        118.0
+    } else {
+        90.0
+    };
+    let field_budget = (available_width - button - first_gap - min_pre_button_gap).max(1.0);
+    let host = (field_budget - port).clamp(180.0, 266.0);
+    let used = host + first_gap + port + button;
+    NativeServerFormWidths {
+        host,
+        port,
+        pre_button_gap: (available_width - used).max(min_pre_button_gap),
+    }
+}
+
+fn native_current_device_form_widths(available_width: f32) -> NativeCurrentDeviceFormWidths {
+    let first_gap = 14.0;
+    let min_pre_button_gap = 16.0;
+    let button = NATIVE_ACTION_BUTTON_WIDTH;
+    let id = if available_width >= 620.0 {
+        178.0
+    } else {
+        140.0
+    };
+    let field_budget = (available_width - button - first_gap - min_pre_button_gap).max(1.0);
+    let name = (field_budget - id).clamp(200.0, 260.0);
+    let used = name + first_gap + id + button;
+    NativeCurrentDeviceFormWidths {
+        name,
+        id,
+        pre_button_gap: (available_width - used).max(min_pre_button_gap),
+    }
+}
+
+fn native_current_device_metric_widths(available_width: f32) -> NativeCurrentDeviceMetricWidths {
+    let gap = 10.0;
+    let min_pre_refresh_gap = 16.0;
+    let refresh = NATIVE_COMPACT_ACTION_BUTTON_WIDTH;
+    let mut lan_ip = 180.0;
+    let mut listen_port = 130.0;
+    let mut master = 150.0;
+    let desired = lan_ip + listen_port + master + refresh + gap * 2.0 + min_pre_refresh_gap;
+    if desired > available_width {
+        lan_ip = 140.0;
+        listen_port = 90.0;
+        master = 130.0;
+    }
+    let used = lan_ip + gap + listen_port + gap + master + refresh;
+    NativeCurrentDeviceMetricWidths {
+        lan_ip,
+        listen_port,
+        master,
+        pre_refresh_gap: (available_width - used).max(min_pre_refresh_gap),
+    }
+}
+
+fn native_devices_footer_top_space(available_height: f32) -> f32 {
+    (available_height - NATIVE_ACTION_BUTTON_HEIGHT).max(10.0)
+}
+
+fn native_compact_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized(
+        egui::vec2(
+            NATIVE_COMPACT_ACTION_BUTTON_WIDTH,
+            NATIVE_ACTION_BUTTON_HEIGHT,
+        ),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .strong()
+                .color(egui::Color32::from_rgb(30, 64, 175)),
+        )
+        .fill(egui::Color32::from_rgb(239, 246, 255))
+        .corner_radius(egui::CornerRadius::same(7))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(147, 197, 253),
+        )),
+    )
+}
+
+#[cfg(test)]
+fn native_compact_action_button_size() -> egui::Vec2 {
+    egui::vec2(
+        NATIVE_COMPACT_ACTION_BUTTON_WIDTH,
+        NATIVE_ACTION_BUTTON_HEIGHT,
+    )
+}
+
+#[cfg(test)]
+fn native_page_content_width() -> f32 {
+    NATIVE_WINDOW_SIZE[0] - f32::from(NATIVE_PAGE_MARGIN_X) * 2.0
+}
+
+#[cfg(test)]
+fn native_default_top_panel_widths() -> NativeSplitPanelWidths {
+    native_top_panel_widths(native_page_content_width())
+}
+
+#[cfg(test)]
+fn native_default_lower_panel_widths() -> NativeSplitPanelWidths {
+    native_lower_panel_widths(native_page_content_width())
+}
+
+#[cfg(test)]
+fn native_default_lower_panel_content_widths() -> NativeSplitPanelWidths {
+    let lower = native_default_lower_panel_widths();
+    NativeSplitPanelWidths {
+        primary: (lower.primary - 42.0).max(1.0),
+        secondary: (lower.secondary - 42.0).max(1.0),
+    }
+}
+
+#[cfg(test)]
+fn native_default_layout_canvas_content_width() -> f32 {
+    let lower_content = native_default_lower_panel_content_widths();
+    (lower_content.primary - 48.0).max(1.0)
+}
+
+#[cfg(test)]
+fn native_default_layout_grid_leading_space() -> f32 {
+    let canvas_content = native_default_layout_canvas_content_width();
+    let combo_width = native_layout_combo_width(canvas_content);
+    native_layout_grid_leading_space(canvas_content, combo_width)
+}
+
+#[cfg(test)]
+fn native_default_server_form_widths() -> NativeServerFormWidths {
+    let top = native_default_top_panel_widths();
+    native_server_form_widths((top.primary - 42.0).max(1.0))
+}
+
+#[cfg(test)]
+fn native_default_current_device_form_widths() -> NativeCurrentDeviceFormWidths {
+    let top = native_default_top_panel_widths();
+    native_current_device_form_widths((top.secondary - 42.0).max(1.0))
+}
+
+#[cfg(test)]
+fn native_default_current_device_metric_widths() -> NativeCurrentDeviceMetricWidths {
+    let top = native_default_top_panel_widths();
+    native_current_device_metric_widths((top.secondary - 42.0).max(1.0))
 }
 
 #[cfg(test)]
@@ -1605,15 +1834,15 @@ mod tests {
     fn native_desktop_layout_uses_wide_full_width_panels() {
         let metrics = native_desktop_layout_metrics();
 
-        assert_eq!(metrics.window_size, [1120.0, 880.0]);
-        assert_eq!(metrics.min_window_size, [900.0, 700.0]);
-        assert!(metrics.top_panel_min_height <= 220.0);
+        assert_eq!(metrics.window_size, [1440.0, 1000.0]);
+        assert_eq!(metrics.min_window_size, [1120.0, 780.0]);
+        assert_eq!(metrics.top_panel_min_height, 226.0);
         assert_eq!(metrics.lower_panel_columns, 2);
         assert_eq!(
             metrics.layout_panel_min_height,
             metrics.devices_panel_min_height
         );
-        assert!(metrics.layout_panel_min_height >= 280.0);
+        assert_eq!(metrics.layout_panel_min_height, 548.0);
         assert!(metrics.devices_grid_min_col_width <= 96.0);
     }
 
@@ -1646,6 +1875,7 @@ mod tests {
             device_widths.total_width(native_devices_grid_horizontal_spacing())
                 <= lower_column_content_width
         );
+        assert_eq!(native_layout_combo_width(800.0), 220.0);
     }
 
     #[test]
@@ -1655,7 +1885,42 @@ mod tests {
         assert!(lower.primary > lower.secondary);
         assert!(lower.primary >= 620.0);
         assert!(lower.secondary >= 360.0);
-        assert!(lower.total_width(16.0) <= 1080.0);
+        assert!(lower.total_width(20.0) <= 1080.0);
+
+        let design_top = native_top_panel_widths(1360.0);
+        assert_eq!(design_top.primary.round(), 640.0);
+        assert_eq!(design_top.secondary.round(), 700.0);
+        assert_eq!(design_top.total_width(20.0).round(), 1360.0);
+
+        let design_lower = native_lower_panel_widths(1360.0);
+        assert_eq!(design_lower.primary.round(), 860.0);
+        assert_eq!(design_lower.secondary.round(), 480.0);
+        assert_eq!(design_lower.total_width(20.0).round(), 1360.0);
+    }
+
+    #[test]
+    fn native_default_design_grid_aligns_buttons_and_topology() {
+        assert_eq!(native_page_content_width(), 1360.0);
+
+        let server = native_default_server_form_widths();
+        assert_eq!(server.host, 266.0);
+        assert_eq!(server.port, 118.0);
+        assert_eq!(server.pre_button_gap, 50.0);
+
+        let current = native_default_current_device_form_widths();
+        assert_eq!(current.name, 260.0);
+        assert_eq!(current.id, 178.0);
+        assert_eq!(current.pre_button_gap, 56.0);
+
+        let metrics = native_default_current_device_metric_widths();
+        assert_eq!(metrics.lan_ip, 180.0);
+        assert_eq!(metrics.listen_port, 130.0);
+        assert_eq!(metrics.master, 150.0);
+        assert_eq!(metrics.pre_refresh_gap, 58.0);
+
+        assert_eq!(native_default_layout_canvas_content_width(), 770.0);
+        assert_eq!(native_default_layout_grid_leading_space(), 21.0);
+        assert_eq!(native_compact_action_button_size(), egui::vec2(120.0, 38.0));
     }
 
     #[test]
@@ -1911,7 +2176,7 @@ mod tests {
                 "刷新"
             ]
         );
-        assert_eq!(native_action_button_size(), egui::vec2(150.0, 34.0));
+        assert_eq!(native_action_button_size(), egui::vec2(150.0, 38.0));
     }
 
     #[test]
