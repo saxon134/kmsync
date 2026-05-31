@@ -1,22 +1,29 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use kmsync_core::{CompiledProfile, DesktopLayout, DesktopRole, Profile};
+use kmsync_core::{
+    CompiledProfile, DesktopLayout, DesktopRole, InputEventEnvelope, Profile, ProtocolEvent,
+    ProtocolFrame, ProtocolPayload,
+};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{connect, Message, WebSocket};
 
 use crate::transport::QuicEventSender;
 
 const MDNS_SERVICE_TYPE: &str = "_kmsync._udp.local";
 const MDNS_MULTICAST_ENDPOINT: &str = "224.0.0.251:5353";
 const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(350);
+const RELAY_FRAME_MAGIC: &[u8; 4] = b"KMR1";
+const RELAY_TARGET_DEVICE_ID_LEN: usize = 36;
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_PTR: u16 = 12;
 const DNS_TYPE_TXT: u16 = 16;
@@ -831,6 +838,136 @@ pub struct NatTraversalCandidate {
 pub struct RelayCandidate {
     pub device_id: String,
     pub relay_url: String,
+}
+
+pub struct RelayFrameSender {
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+}
+
+impl RelayFrameSender {
+    pub fn connect(server_url: &str, source_device_id: &str) -> Result<Self, String> {
+        let url = relay_websocket_url(server_url, source_device_id, RelayWebSocketMode::Tx)?;
+        let (socket, _) = connect(url.as_str())
+            .map_err(|error| format!("failed to connect relay websocket {url}: {error}"))?;
+        Ok(Self { socket })
+    }
+
+    pub fn send_event(
+        &mut self,
+        target_device_id: &str,
+        event: ProtocolEvent,
+    ) -> Result<(), String> {
+        let frame = ProtocolFrame {
+            sequence: event.sequence,
+            timestamp_micros: event.timestamp_micros,
+            payload: ProtocolPayload::Input(InputEventEnvelope::current(0, 0, event.event)),
+        };
+        self.send_frame(target_device_id, &frame)
+    }
+
+    pub fn send_frame(
+        &mut self,
+        target_device_id: &str,
+        frame: &ProtocolFrame,
+    ) -> Result<(), String> {
+        let payload = encode_relay_client_frame(target_device_id, frame)?;
+        self.socket
+            .send(Message::Binary(payload.into()))
+            .map_err(|error| format!("failed to send relay frame: {error}"))
+    }
+}
+
+pub struct RelayFrameReceiver {
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+}
+
+impl RelayFrameReceiver {
+    pub fn connect(server_url: &str, device_id: &str) -> Result<Self, String> {
+        let url = relay_websocket_url(server_url, device_id, RelayWebSocketMode::Rx)?;
+        let (socket, _) = connect(url.as_str())
+            .map_err(|error| format!("failed to connect relay websocket {url}: {error}"))?;
+        Ok(Self { socket })
+    }
+
+    pub fn recv_frame(&mut self) -> Result<ProtocolFrame, String> {
+        loop {
+            match self.socket.read() {
+                Ok(Message::Binary(payload)) => {
+                    return ProtocolFrame::decode(payload.as_ref())
+                        .map_err(|error| format!("failed to decode relay frame: {error:?}"));
+                }
+                Ok(Message::Ping(payload)) => {
+                    self.socket
+                        .send(Message::Pong(payload))
+                        .map_err(|error| format!("failed to respond relay ping: {error}"))?;
+                }
+                Ok(Message::Close(_)) => return Err("relay websocket closed".to_string()),
+                Ok(Message::Text(_) | Message::Pong(_) | Message::Frame(_)) => {}
+                Err(error) => return Err(format!("failed to read relay websocket: {error}")),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayWebSocketMode {
+    Rx,
+    Tx,
+}
+
+impl RelayWebSocketMode {
+    const fn as_query_value(self) -> &'static str {
+        match self {
+            Self::Rx => "rx",
+            Self::Tx => "tx",
+        }
+    }
+}
+
+fn relay_websocket_url(
+    server_url: &str,
+    device_id: &str,
+    mode: RelayWebSocketMode,
+) -> Result<String, String> {
+    let server_url = server_url.trim().trim_end_matches('/');
+    let Some((scheme, rest)) = server_url.split_once("://") else {
+        return Err("server_url must include http://, https://, ws://, or wss://".to_string());
+    };
+    let ws_scheme = match scheme {
+        "http" => "ws",
+        "https" => "wss",
+        "ws" => "ws",
+        "wss" => "wss",
+        other => {
+            return Err(format!(
+                "unsupported relay websocket server_url scheme '{other}'"
+            ));
+        }
+    };
+    Ok(format!(
+        "{ws_scheme}://{rest}/v1/relay/ws?device_id={}&mode={}",
+        encode_query_component(device_id),
+        mode.as_query_value()
+    ))
+}
+
+fn encode_relay_client_frame(
+    target_device_id: &str,
+    frame: &ProtocolFrame,
+) -> Result<Vec<u8>, String> {
+    if target_device_id.len() != RELAY_TARGET_DEVICE_ID_LEN {
+        return Err(format!(
+            "relay target device id must be a UUID string, got '{target_device_id}'"
+        ));
+    }
+    let frame_bytes = frame.encode_vec();
+    let mut payload = Vec::with_capacity(
+        RELAY_FRAME_MAGIC.len() + RELAY_TARGET_DEVICE_ID_LEN + frame_bytes.len(),
+    );
+    payload.extend_from_slice(RELAY_FRAME_MAGIC);
+    payload.extend_from_slice(target_device_id.as_bytes());
+    payload.extend_from_slice(&frame_bytes);
+    Ok(payload)
 }
 
 #[allow(dead_code)]
@@ -2084,7 +2221,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmsync_core::{DesktopLayout, DesktopRole, InputEvent, Key, KeyEvent, KeyState, Modifiers};
+    use kmsync_core::{
+        DesktopLayout, DesktopRole, InputEvent, InputEventEnvelope, Key, KeyEvent, KeyState,
+        Modifiers, ProtocolFrame, ProtocolPayload,
+    };
 
     #[test]
     fn mdns_query_requests_kmsync_ptr_records() {
@@ -3382,6 +3522,54 @@ mod tests {
             candidate.relay_url,
             "relay://relay.kmsync.local:443?token=relay-token"
         );
+    }
+
+    #[test]
+    fn relay_websocket_url_converts_http_server_to_mode_specific_ws_endpoint() {
+        assert_eq!(
+            relay_websocket_url(
+                "http://47.114.107.118:24888/",
+                "11111111-1111-4111-8111-111111111111",
+                RelayWebSocketMode::Rx
+            )
+            .expect("rx relay url"),
+            "ws://47.114.107.118:24888/v1/relay/ws?device_id=11111111-1111-4111-8111-111111111111&mode=rx"
+        );
+        assert_eq!(
+            relay_websocket_url(
+                "https://kmsync.example.com",
+                "22222222-2222-4222-8222-222222222222",
+                RelayWebSocketMode::Tx
+            )
+            .expect("tx relay url"),
+            "wss://kmsync.example.com/v1/relay/ws?device_id=22222222-2222-4222-8222-222222222222&mode=tx"
+        );
+    }
+
+    #[test]
+    fn relay_client_frame_wraps_target_uuid_and_protocol_frame() {
+        let target_device_id = "22222222-2222-4222-8222-222222222222";
+        let frame = ProtocolFrame {
+            sequence: 7,
+            timestamp_micros: 123,
+            payload: ProtocolPayload::Input(InputEventEnvelope::legacy(InputEvent::Key(
+                KeyEvent {
+                    key: Key::A,
+                    state: KeyState::Pressed,
+                    modifiers: Modifiers::CONTROL,
+                },
+            ))),
+        };
+
+        let payload =
+            encode_relay_client_frame(target_device_id, &frame).expect("relay client frame");
+
+        assert_eq!(&payload[..4], RELAY_FRAME_MAGIC);
+        assert_eq!(
+            std::str::from_utf8(&payload[4..40]).expect("target id utf8"),
+            target_device_id
+        );
+        assert_eq!(ProtocolFrame::decode(&payload[40..]), Ok(frame));
     }
 
     #[test]

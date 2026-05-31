@@ -2151,6 +2151,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tungstenite",
  "ureq",
  "uuid",
  "windows-sys 0.61.2",

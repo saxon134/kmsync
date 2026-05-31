@@ -1046,9 +1046,12 @@ fn run_core_service(config_path: &Path) -> Result<(), String> {
     let (result_tx, result_rx) = std::sync::mpsc::channel();
 
     let bind = plan.bind;
+    let data_plane_config = config.clone();
     let data_plane_result_tx = result_tx.clone();
     thread::spawn(move || {
-        let _ = data_plane_result_tx.send(CoreServiceThreadResult::DataPlane(run_listener(bind)));
+        let _ = data_plane_result_tx.send(CoreServiceThreadResult::DataPlane(
+            run_listener_with_relay(bind, Some(data_plane_config)),
+        ));
     });
 
     let heartbeat_result_tx = result_tx.clone();
@@ -1295,6 +1298,13 @@ fn input_event_log_type(event: &InputEvent) -> &'static str {
 }
 
 fn run_listener(bind: SocketAddr) -> Result<(), String> {
+    run_listener_with_relay(bind, None)
+}
+
+fn run_listener_with_relay(
+    bind: SocketAddr,
+    relay_config: Option<client::ClientConfig>,
+) -> Result<(), String> {
     let receiver = QuicEventReceiver::bind(bind)?;
     let (input_tx, input_rx) = sync_channel(1024);
     let (clipboard_tx, clipboard_rx) = sync_channel(16);
@@ -1303,19 +1313,38 @@ fn run_listener(bind: SocketAddr) -> Result<(), String> {
     let latency_stats = ListenerLatencyStats::default();
     println!("listening on {bind}");
 
+    let receive_input_tx = input_tx.clone();
+    let receive_clipboard_tx = clipboard_tx.clone();
+    let receive_control_tx = control_tx.clone();
     let receive_result_tx = result_tx.clone();
     let receive_latency_stats = latency_stats.clone();
     thread::spawn(move || {
         let mut receiver = receiver;
         let result = receive_remote_frames(
             &mut receiver,
-            input_tx,
-            clipboard_tx,
-            control_tx,
+            receive_input_tx,
+            receive_clipboard_tx,
+            receive_control_tx,
             receive_latency_stats,
         );
         let _ = receive_result_tx.send(ListenerThreadResult::Receive(result));
     });
+
+    if let Some(config) = relay_config {
+        let relay_input_tx = input_tx.clone();
+        let relay_clipboard_tx = clipboard_tx.clone();
+        let relay_control_tx = control_tx.clone();
+        let relay_latency_stats = latency_stats.clone();
+        thread::spawn(move || {
+            run_relay_receive_loop(
+                config,
+                relay_input_tx,
+                relay_clipboard_tx,
+                relay_control_tx,
+                relay_latency_stats,
+            );
+        });
+    }
 
     let injection_result_tx = result_tx.clone();
     let injection_latency_stats = latency_stats.clone();
@@ -1419,6 +1448,51 @@ trait ProtocolFrameReceiver {
 impl ProtocolFrameReceiver for QuicEventReceiver {
     fn recv_frame(&mut self) -> Result<ProtocolFrame, String> {
         QuicEventReceiver::recv_frame(self)
+    }
+}
+
+impl ProtocolFrameReceiver for client::RelayFrameReceiver {
+    fn recv_frame(&mut self) -> Result<ProtocolFrame, String> {
+        client::RelayFrameReceiver::recv_frame(self)
+    }
+}
+
+fn run_relay_receive_loop(
+    config: client::ClientConfig,
+    input_tx: SyncSender<ReceivedInputFrame>,
+    clipboard_tx: SyncSender<ReceivedClipboardFrame>,
+    control_tx: SyncSender<ReceivedControlFrame>,
+    stats: ListenerLatencyStats,
+) {
+    loop {
+        let identity = match client::DeviceIdentity::load_or_generate(&config.identity_path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                eprintln!("relay receive unavailable; identity failed: {error}");
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        let mut receiver =
+            match client::RelayFrameReceiver::connect(&config.server_url, &identity.device_id) {
+                Ok(receiver) => receiver,
+                Err(error) => {
+                    eprintln!("relay receive unavailable; reconnecting: {error}");
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+        println!("relay receive connected for {}", identity.device_id);
+        if let Err(error) = receive_remote_frames(
+            &mut receiver,
+            input_tx.clone(),
+            clipboard_tx.clone(),
+            control_tx.clone(),
+            stats.clone(),
+        ) {
+            eprintln!("relay receive disconnected; reconnecting: {error}");
+            thread::sleep(Duration::from_secs(2));
+        }
     }
 }
 
@@ -2915,8 +2989,22 @@ fn transmit_captured_events(
     Ok(())
 }
 
+enum DesktopTargetTransport {
+    Direct(QuicEventSender),
+    Relay(client::RelayFrameSender),
+}
+
+impl DesktopTargetTransport {
+    fn send_event(&mut self, target_device_id: &str, event: ProtocolEvent) -> Result<(), String> {
+        match self {
+            Self::Direct(sender) => sender.send(event),
+            Self::Relay(sender) => sender.send_event(target_device_id, event),
+        }
+    }
+}
+
 struct DesktopTargetSender {
-    sender: QuicEventSender,
+    transport: DesktopTargetTransport,
     compiled: CompiledProfile,
     sequence: u64,
 }
@@ -2941,15 +3029,14 @@ fn transmit_desktop_capture_event(
     queued: TargetedQueuedInputEvent,
 ) -> Result<(), String> {
     if !senders.contains_key(&queued.target_device_id) {
-        let config = client::ClientConfig::load(config_path)?;
-        let connection =
-            client::resolve_target_direct_lan_connection(config, &queued.target_device_id)?;
         let profile = queued.profile_name.profile();
         let compiled = CompiledProfile::compile(&profile).map_err(|error| format!("{error:?}"))?;
+        let config = client::ClientConfig::load(config_path)?;
+        let transport = connect_desktop_target_transport(config, &queued.target_device_id)?;
         senders.insert(
             queued.target_device_id.clone(),
             DesktopTargetSender {
-                sender: QuicEventSender::connect(connection.address)?,
+                transport,
                 compiled,
                 sequence: 1,
             },
@@ -2961,11 +3048,14 @@ fn transmit_desktop_capture_event(
         .get_mut(&queued.target_device_id)
         .ok_or_else(|| "desktop capture sender missing after connect".to_string())?;
     let mapped = target.compiled.transform(queued.event);
-    let result = target.sender.send(ProtocolEvent {
-        sequence: target.sequence,
-        timestamp_micros: now_micros()?,
-        event: mapped,
-    });
+    let result = target.transport.send_event(
+        &target_id,
+        ProtocolEvent {
+            sequence: target.sequence,
+            timestamp_micros: now_micros()?,
+            event: mapped,
+        },
+    );
     match result {
         Ok(()) => {
             target.sequence = target.sequence.saturating_add(1);
@@ -2974,6 +3064,29 @@ fn transmit_desktop_capture_event(
         Err(error) => {
             senders.remove(&target_id);
             Err(error)
+        }
+    }
+}
+
+fn connect_desktop_target_transport(
+    config: client::ClientConfig,
+    target_device_id: &str,
+) -> Result<DesktopTargetTransport, String> {
+    match client::resolve_target_direct_lan_connection(config.clone(), target_device_id) {
+        Ok(connection) => {
+            println!(
+                "desktop capture direct connection selected {:?} {} for {}",
+                connection.candidate.kind, connection.address, target_device_id
+            );
+            QuicEventSender::connect(connection.address).map(DesktopTargetTransport::Direct)
+        }
+        Err(direct_error) => {
+            eprintln!(
+                "desktop capture direct connection unavailable for {target_device_id}; using server relay: {direct_error}"
+            );
+            let identity = client::DeviceIdentity::load_or_generate(&config.identity_path)?;
+            client::RelayFrameSender::connect(&config.server_url, &identity.device_id)
+                .map(DesktopTargetTransport::Relay)
         }
     }
 }

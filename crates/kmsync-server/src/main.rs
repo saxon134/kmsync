@@ -13,11 +13,14 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 const PRESENCE_TTL_SECONDS: u64 = 60;
+const RELAY_FRAME_MAGIC: &[u8; 4] = b"KMR1";
+const RELAY_TARGET_DEVICE_ID_LEN: usize = 36;
+const RELAY_CLIENT_FRAME_HEADER_LEN: usize = RELAY_FRAME_MAGIC.len() + RELAY_TARGET_DEVICE_ID_LEN;
 
 #[tokio::main]
 async fn main() {
@@ -67,6 +70,7 @@ fn build_app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/releases/check", get(check_release))
         .route("/v1/relay/token", post(issue_relay_token))
+        .route("/v1/relay/ws", get(relay_ws))
         .route("/v1/signal/connect.request", post(signal_connect_request))
         .route("/v1/signal/connect.accept", post(signal_connect_accept))
         .route("/v1/signal/connect.reject", post(signal_connect_reject))
@@ -101,6 +105,59 @@ struct AppState {
     inner: Arc<Mutex<Store>>,
     persistence: StorePersistence,
     events: broadcast::Sender<ServerEvent>,
+    relay: RelayHub,
+}
+
+#[derive(Clone, Default)]
+struct RelayHub {
+    inner: Arc<Mutex<HashMap<Uuid, RelayPeer>>>,
+}
+
+struct RelayPeer {
+    connection_id: Uuid,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayRouteError {
+    TargetOffline,
+    TargetReceiverClosed,
+}
+
+impl RelayHub {
+    fn register(&self, device_id: Uuid, connection_id: Uuid) -> mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(device_id, RelayPeer { connection_id, tx });
+        rx
+    }
+
+    fn unregister_if_current(&self, device_id: Uuid, connection_id: Uuid) {
+        let mut peers = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if peers
+            .get(&device_id)
+            .is_some_and(|peer| peer.connection_id == connection_id)
+        {
+            peers.remove(&device_id);
+        }
+    }
+
+    fn send_frame(&self, target_device_id: Uuid, frame: Vec<u8>) -> Result<(), RelayRouteError> {
+        let tx = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&target_device_id)
+            .map(|peer| peer.tx.clone())
+            .ok_or(RelayRouteError::TargetOffline)?;
+        tx.send(frame)
+            .map_err(|_| RelayRouteError::TargetReceiverClosed)
+    }
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -856,6 +913,173 @@ async fn stream_events(
 }
 
 #[derive(Debug, Deserialize)]
+struct RelayWsQuery {
+    device_id: Uuid,
+    access_token: Option<String>,
+    mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayWsMode {
+    Rx,
+    Tx,
+}
+
+impl RelayWsMode {
+    fn parse(value: Option<&str>) -> Result<Self, ApiError> {
+        match value.unwrap_or("rx") {
+            "rx" => Ok(Self::Rx),
+            "tx" => Ok(Self::Tx),
+            _ => Err(ApiError::bad_request("relay mode must be rx or tx")),
+        }
+    }
+}
+
+async fn relay_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RelayWsQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let user_id = match query.access_token {
+        Some(token) => authorize_access_token(&state, &token)?,
+        None => authorize_or_default(&state, &headers)?,
+    };
+    let mode = RelayWsMode::parse(query.mode.as_deref())?;
+    assert_relay_device_enabled(&state, user_id, query.device_id)?;
+
+    let connection_id = Uuid::new_v4();
+    let outbound = match mode {
+        RelayWsMode::Rx => Some(state.relay.register(query.device_id, connection_id)),
+        RelayWsMode::Tx => None,
+    };
+    Ok(ws.on_upgrade(move |socket| {
+        stream_relay(
+            socket,
+            state,
+            user_id,
+            query.device_id,
+            connection_id,
+            outbound,
+        )
+    }))
+}
+
+async fn stream_relay(
+    mut socket: WebSocket,
+    state: AppState,
+    user_id: Uuid,
+    source_device_id: Uuid,
+    connection_id: Uuid,
+    mut outbound: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+) {
+    loop {
+        if let Some(outbound) = outbound.as_mut() {
+            tokio::select! {
+                Some(payload) = outbound.recv() => {
+                    if socket.send(Message::Binary(payload.into())).await.is_err() {
+                        break;
+                    }
+                }
+                incoming = socket.recv() => {
+                    if !handle_relay_socket_message(incoming, &mut socket, &state, user_id, source_device_id).await {
+                        break;
+                    }
+                }
+            }
+        } else if !handle_relay_socket_message(
+            socket.recv().await,
+            &mut socket,
+            &state,
+            user_id,
+            source_device_id,
+        )
+        .await
+        {
+            break;
+        }
+    }
+
+    state
+        .relay
+        .unregister_if_current(source_device_id, connection_id);
+}
+
+async fn handle_relay_socket_message(
+    incoming: Option<Result<Message, axum::Error>>,
+    socket: &mut WebSocket,
+    state: &AppState,
+    user_id: Uuid,
+    source_device_id: Uuid,
+) -> bool {
+    match incoming {
+        Some(Ok(Message::Binary(payload))) => {
+            if let Err(error) =
+                route_relay_client_frame(state, user_id, source_device_id, payload.as_ref())
+            {
+                let _ = socket
+                    .send(Message::Text(format!("relay_error={error}").into()))
+                    .await;
+            }
+            true
+        }
+        Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await.is_ok(),
+        Some(Ok(Message::Close(_))) | None => false,
+        Some(Ok(Message::Text(_) | Message::Pong(_))) => true,
+        Some(Err(_)) => false,
+    }
+}
+
+fn route_relay_client_frame(
+    state: &AppState,
+    user_id: Uuid,
+    source_device_id: Uuid,
+    payload: &[u8],
+) -> Result<(), String> {
+    assert_relay_device_enabled(state, user_id, source_device_id).map_err(|error| error.message)?;
+    let (target_device_id, frame) = parse_relay_client_frame(payload)?;
+    assert_relay_device_enabled(state, user_id, target_device_id).map_err(|error| error.message)?;
+    state
+        .relay
+        .send_frame(target_device_id, frame.to_vec())
+        .map_err(|error| format!("relay route failed: {error:?}"))
+}
+
+fn parse_relay_client_frame(payload: &[u8]) -> Result<(Uuid, &[u8]), String> {
+    if payload.len() <= RELAY_CLIENT_FRAME_HEADER_LEN {
+        return Err("relay frame is too short".to_string());
+    }
+    if &payload[..RELAY_FRAME_MAGIC.len()] != RELAY_FRAME_MAGIC {
+        return Err("relay frame has invalid magic".to_string());
+    }
+    let target_id_start = RELAY_FRAME_MAGIC.len();
+    let target_id_end = target_id_start + RELAY_TARGET_DEVICE_ID_LEN;
+    let target_device_id = std::str::from_utf8(&payload[target_id_start..target_id_end])
+        .map_err(|error| format!("relay target device id is not utf8: {error}"))?;
+    let target_device_id = Uuid::parse_str(target_device_id)
+        .map_err(|error| format!("relay target device id is not a uuid: {error}"))?;
+    Ok((target_device_id, &payload[target_id_end..]))
+}
+
+fn assert_relay_device_enabled(
+    state: &AppState,
+    user_id: Uuid,
+    device_id: Uuid,
+) -> Result<(), ApiError> {
+    let store = state.lock()?;
+    let Some(device) = store.devices.get(&device_id) else {
+        return Err(ApiError::not_found("device not found"));
+    };
+    if device.user_id != user_id {
+        return Err(ApiError::not_found("device not found"));
+    }
+    if device.disabled {
+        return Err(ApiError::forbidden("device disabled"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
 struct RegisterDeviceRequest {
     device_id: Option<Uuid>,
     name: String,
@@ -1590,6 +1814,7 @@ impl AppState {
             inner: Arc::new(Mutex::new(store)),
             persistence,
             events: broadcast::channel(256).0,
+            relay: RelayHub::default(),
         })
     }
 
@@ -1706,6 +1931,45 @@ mod tests {
 
     fn test_app() -> Router {
         build_app(AppState::load(None).expect("in-memory state"))
+    }
+
+    #[test]
+    fn relay_client_frame_parser_extracts_target_uuid_and_payload() {
+        let target = Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("uuid");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(RELAY_FRAME_MAGIC);
+        payload.extend_from_slice(target.to_string().as_bytes());
+        payload.extend_from_slice(b"encoded-protocol-frame");
+
+        let (parsed_target, frame) =
+            parse_relay_client_frame(&payload).expect("relay client frame");
+
+        assert_eq!(parsed_target, target);
+        assert_eq!(frame, b"encoded-protocol-frame");
+    }
+
+    #[tokio::test]
+    async fn relay_hub_routes_payload_to_registered_target_and_unregisters_stale_connection() {
+        let hub = RelayHub::default();
+        let target = Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("uuid");
+        let connection_id =
+            Uuid::parse_str("33333333-3333-4333-8333-333333333333").expect("connection uuid");
+        let mut rx = hub.register(target, connection_id);
+
+        hub.send_frame(target, b"frame".to_vec())
+            .expect("route relay frame");
+
+        assert_eq!(rx.recv().await, Some(b"frame".to_vec()));
+        hub.unregister_if_current(
+            target,
+            Uuid::parse_str("44444444-4444-4444-8444-444444444444").expect("stale uuid"),
+        );
+        assert!(hub.send_frame(target, b"still-online".to_vec()).is_ok());
+        hub.unregister_if_current(target, connection_id);
+        assert_eq!(
+            hub.send_frame(target, b"offline".to_vec()),
+            Err(RelayRouteError::TargetOffline)
+        );
     }
 
     async fn json_request(

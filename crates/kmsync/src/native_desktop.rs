@@ -291,6 +291,7 @@ struct NativeDeviceListRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeLayoutSlotView {
+    device_name: String,
     status_label: String,
     route_hint: String,
     tone: NativeStatusTone,
@@ -1300,15 +1301,6 @@ fn layout_slot_card(
     view: &NativeLayoutSlotView,
 ) -> bool {
     let before = selected.clone();
-    let selected_text = selected
-        .as_deref()
-        .and_then(|selected_id| {
-            devices
-                .iter()
-                .find(|(id, _)| id == selected_id)
-                .map(|(_, name)| name.as_str())
-        })
-        .unwrap_or("未配置");
     native_tinted_card(ui, width, NATIVE_LAYOUT_SLOT_HEIGHT, view.tone, |ui| {
         ui.horizontal(|ui| {
             ui.label(
@@ -1328,7 +1320,7 @@ fn layout_slot_card(
         ui.add_space(2.0);
         egui::ComboBox::from_id_salt(("native_layout_combo", direction))
             .width((width - 24.0).max(1.0))
-            .selected_text(selected_text)
+            .selected_text(&view.device_name)
             .show_ui(ui, |ui| {
                 ui.selectable_value(selected, None, "未配置");
                 for (id, name) in devices {
@@ -1409,13 +1401,28 @@ fn native_layout_direction_value(
     }
 }
 
-fn native_layout_center_device_name(state: &DesktopState, edited_device_name: &str) -> String {
+fn native_current_device_name(state: &DesktopState, edited_device_name: &str) -> String {
     let edited_device_name = edited_device_name.trim();
     if edited_device_name.is_empty() {
         state.device.name.clone()
     } else {
         edited_device_name.to_string()
     }
+}
+
+fn native_layout_center_device_name(state: &DesktopState, edited_device_name: &str) -> String {
+    let Some(master_device_id) = state.master_device_id.as_deref() else {
+        return "未配置主电脑".to_string();
+    };
+    if state.device.id.as_deref() == Some(master_device_id) {
+        return native_current_device_name(state, edited_device_name);
+    }
+    state
+        .devices
+        .iter()
+        .find(|device| device.id == master_device_id)
+        .map(|device| device.name.clone())
+        .unwrap_or_else(|| format!("未知主电脑 {master_device_id}"))
 }
 
 #[cfg(test)]
@@ -1458,27 +1465,39 @@ fn native_layout_slot_view(
 ) -> NativeLayoutSlotView {
     let Some(selected_device_id) = selected_device_id else {
         return NativeLayoutSlotView {
+            device_name: "未配置".to_string(),
             status_label: "未配置".to_string(),
             route_hint: "该边缘保持本机控制".to_string(),
             tone: NativeStatusTone::Muted,
         };
     };
+    if state.device.id.as_deref() == Some(selected_device_id) {
+        return NativeLayoutSlotView {
+            device_name: state.device.name.clone(),
+            status_label: connection_state_label(&state.master_state).to_string(),
+            route_hint: format!("{}，当前电脑", state.device.name),
+            tone: connection_state_tone(&state.master_state),
+        };
+    }
     match state
         .devices
         .iter()
         .find(|device| device.id == selected_device_id)
     {
         Some(device) if device.online => NativeLayoutSlotView {
+            device_name: device.name.clone(),
             status_label: "已连接".to_string(),
             route_hint: "已连接主电脑".to_string(),
             tone: NativeStatusTone::Success,
         },
-        Some(_) => NativeLayoutSlotView {
+        Some(device) => NativeLayoutSlotView {
+            device_name: device.name.clone(),
             status_label: "未连接".to_string(),
             route_hint: "未连接主电脑".to_string(),
             tone: NativeStatusTone::Muted,
         },
         None => NativeLayoutSlotView {
+            device_name: "未知设备".to_string(),
             status_label: "未知".to_string(),
             route_hint: selected_device_id.to_string(),
             tone: NativeStatusTone::Warning,
@@ -1492,7 +1511,7 @@ fn native_device_list_rows(
 ) -> Vec<NativeDeviceListRow> {
     let mut rows = vec![NativeDeviceListRow {
         id: state.device.id.clone(),
-        name: native_layout_center_device_name(state, edited_device_name),
+        name: native_current_device_name(state, edited_device_name),
         detail: format!("{}，本机", state.device.os),
         status: "当前电脑".to_string(),
         status_tone: NativeStatusTone::Info,
@@ -1681,11 +1700,7 @@ fn native_current_device_form_widths(available_width: f32) -> NativeCurrentDevic
 fn native_current_device_metric_widths(available_width: f32) -> NativeCurrentDeviceMetricWidths {
     let min_pre_refresh_gap = 12.0;
     let refresh = NATIVE_COMPACT_ACTION_BUTTON_WIDTH;
-    let lan_ip = if available_width >= 250.0 {
-        154.0
-    } else {
-        (available_width - refresh - min_pre_refresh_gap).clamp(98.0, 154.0)
-    };
+    let lan_ip = (available_width - refresh - min_pre_refresh_gap).clamp(130.0, 260.0);
     let used = lan_ip + refresh;
     NativeCurrentDeviceMetricWidths {
         lan_ip,
@@ -2261,8 +2276,8 @@ mod tests {
         assert_eq!(current.pre_button_gap.round(), 37.0);
 
         let metrics = native_default_current_device_metric_widths();
-        assert_eq!(metrics.lan_ip, 154.0);
-        assert_eq!(metrics.pre_refresh_gap.round(), 218.0);
+        assert_eq!(metrics.lan_ip, 260.0);
+        assert_eq!(metrics.pre_refresh_gap.round(), 112.0);
 
         assert_eq!(native_default_layout_canvas_content_width().round(), 401.0);
         assert_eq!(native_default_layout_grid_leading_space().round(), 0.0);
@@ -2413,6 +2428,7 @@ mod tests {
         assert_eq!(
             native_layout_slot_view(&state, None),
             NativeLayoutSlotView {
+                device_name: "未配置".to_string(),
                 status_label: "未配置".to_string(),
                 route_hint: "该边缘保持本机控制".to_string(),
                 tone: NativeStatusTone::Muted,
@@ -2421,6 +2437,7 @@ mod tests {
         assert_eq!(
             native_layout_slot_view(&state, Some("right-device")),
             NativeLayoutSlotView {
+                device_name: "Right PC".to_string(),
                 status_label: "已连接".to_string(),
                 route_hint: "已连接主电脑".to_string(),
                 tone: NativeStatusTone::Success,
@@ -2429,6 +2446,7 @@ mod tests {
         assert_eq!(
             native_layout_slot_view(&state, Some("bottom-device")),
             NativeLayoutSlotView {
+                device_name: "Bottom PC".to_string(),
                 status_label: "未连接".to_string(),
                 route_hint: "未连接主电脑".to_string(),
                 tone: NativeStatusTone::Muted,
@@ -2437,12 +2455,56 @@ mod tests {
         assert_eq!(
             native_layout_slot_view(&state, Some("missing-device")),
             NativeLayoutSlotView {
+                device_name: "未知设备".to_string(),
                 status_label: "未知".to_string(),
                 route_hint: "missing-device".to_string(),
                 tone: NativeStatusTone::Warning,
             }
         );
         assert!(!native_layout_peer_status_has_border());
+    }
+
+    #[test]
+    fn native_client_topology_shows_master_center_and_current_device_slot() {
+        let state = DesktopState {
+            device: DesktopDeviceState {
+                id: Some("client-device".to_string()),
+                name: "Client PC".to_string(),
+                os: "windows".to_string(),
+                app_version: "0.1.0".to_string(),
+                role: DesktopRole::Client,
+            },
+            master_device_id: Some("master-device".to_string()),
+            master_state: DesktopConnectionState::Connected,
+            layout: DesktopLayout {
+                right: Some("client-device".to_string()),
+                ..DesktopLayout::default()
+            },
+            devices: vec![DesktopPeerState {
+                id: "master-device".to_string(),
+                name: "Master PC".to_string(),
+                os: "macos".to_string(),
+                online: true,
+                lan_ips: vec!["192.168.1.10".to_string()],
+                public_ip: None,
+                listen_port: Some(24_800),
+                last_seen_at: None,
+            }],
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_center_device_name(&state, "Client Edited"),
+            "Master PC"
+        );
+
+        let right_view = native_layout_slot_view(&state, state.layout.right.as_deref());
+        assert_eq!(
+            right_view.status_label,
+            connection_state_label(&DesktopConnectionState::Connected)
+        );
+        assert!(right_view.route_hint.contains("Client PC"));
+        assert_eq!(right_view.tone, NativeStatusTone::Success);
     }
 
     #[test]
@@ -2624,7 +2686,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            native_layout_center_device_name(&state, "Renamed PC"),
+            native_current_device_name(&state, "Renamed PC"),
             "Renamed PC"
         );
     }
