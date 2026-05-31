@@ -222,9 +222,9 @@ button.primary {{
         </div>
       </section>
       <section class="panel">
-        <h2>当前电脑</h2>
+        <h2>本机</h2>
         <div class="body">
-          <label class="role"><input type="checkbox" {master_checked}> 将当前电脑作为主电脑</label>
+          <label class="role"><input type="checkbox" {master_checked}> 将本机作为主电脑</label>
           <div class="fact"><span>设备 ID</span><strong>{device_id}</strong></div>
           <div class="fact"><span>系统</span><strong>{device_os}</strong></div>
           <div class="fact"><span>内网 IP</span><strong>{lan_ips}</strong></div>
@@ -396,7 +396,7 @@ fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
         DesktopConnectionState::Connected => "已连接",
         DesktopConnectionState::Disconnected => "未连接",
         DesktopConnectionState::Retrying => "正在重试",
-        DesktopConnectionState::SelfDevice => "当前电脑",
+        DesktopConnectionState::SelfDevice => "本机",
     }
 }
 
@@ -498,7 +498,7 @@ mod tests {
         assert!(html.contains("内网 IP"));
         assert!(!html.contains("<div class=\"fact\"><span>公网 IP</span>"));
         assert!(html.contains("连接中"));
-        assert!(html.contains("将当前电脑作为主电脑"));
+        assert!(html.contains("将本机作为主电脑"));
         assert!(html.contains("左边电脑"));
         assert!(html.contains("右边电脑"));
         assert!(html.contains("192.168.1.20"));
@@ -507,7 +507,7 @@ mod tests {
         assert!(!html.contains("legacy daemon"));
 
         let current_device_section = html
-            .split("<h2>当前电脑</h2>")
+            .split("<h2>本机</h2>")
             .nth(1)
             .expect("current computer section");
         assert!(current_device_section.contains("内网 IP"));

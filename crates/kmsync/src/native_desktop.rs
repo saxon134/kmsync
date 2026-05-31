@@ -398,17 +398,16 @@ impl NativeDesktopApp {
                     self.sync_topology_to_server(master_device_id.clone())
                 }) {
                     Ok(_) => {
-                        self.reload_state("当前电脑配置已保存并同步");
+                        self.reload_state("本机配置已保存并同步");
                     }
                     Err(error) => {
-                        self.reload_state("当前电脑配置已保存");
-                        self.status_message =
-                            format!("当前电脑配置已保存，设备名称同步失败：{error}");
+                        self.reload_state("本机配置已保存");
+                        self.status_message = format!("本机配置已保存，设备名称同步失败：{error}");
                     }
                 }
             }
             Err(error) => {
-                self.status_message = format!("当前电脑配置保存失败：{error}");
+                self.status_message = format!("本机配置保存失败：{error}");
             }
         }
     }
@@ -448,7 +447,7 @@ impl NativeDesktopApp {
 
     fn delete_device(&mut self, device_id: &str) {
         if self.state.device.id.as_deref() == Some(device_id) {
-            self.status_message = "不能删除当前电脑".to_string();
+            self.status_message = "不能删除本机".to_string();
             return;
         }
         let config = match crate::client::ClientConfig::load(&self.config_path) {
@@ -644,7 +643,7 @@ impl NativeDesktopApp {
     fn current_device_section(&mut self, ui: &mut egui::Ui) {
         native_section_title(
             ui,
-            "当前电脑",
+            "本机",
             Some((
                 if self.is_master {
                     "主电脑"
@@ -670,7 +669,7 @@ impl NativeDesktopApp {
             ui.add_space(form_widths.pre_button_gap);
             ui.vertical(|ui| {
                 ui.add_space(19.0);
-                if native_action_button(ui, "保存当前电脑配置").clicked() {
+                if native_action_button(ui, "保存本机配置").clicked() {
                     self.save_current_device_config();
                 }
             });
@@ -1431,7 +1430,7 @@ fn native_master_assignment_text(state: &DesktopState) -> String {
         return "当前未配置主电脑".to_string();
     };
     if state.device.id.as_deref() == Some(master_device_id) {
-        return "当前电脑是主电脑".to_string();
+        return "本机是主电脑".to_string();
     }
     match state
         .devices
@@ -1475,7 +1474,7 @@ fn native_layout_slot_view(
         return NativeLayoutSlotView {
             device_name: state.device.name.clone(),
             status_label: connection_state_label(&state.master_state).to_string(),
-            route_hint: format!("{}，当前电脑", state.device.name),
+            route_hint: format!("{}，本机", state.device.name),
             tone: connection_state_tone(&state.master_state),
         };
     }
@@ -1513,7 +1512,7 @@ fn native_device_list_rows(
         id: state.device.id.clone(),
         name: native_current_device_name(state, edited_device_name),
         detail: format!("{}，本机", state.device.os),
-        status: "当前电脑".to_string(),
+        status: "本机".to_string(),
         status_tone: NativeStatusTone::Info,
         lan_ips: state.network.lan_ips.clone(),
         can_delete: false,
@@ -1578,7 +1577,7 @@ fn master_device_cell(ui: &mut egui::Ui, device_name: &str, is_master: bool, wid
                     native_status_chip(
                         ui,
                         if is_master {
-                            "当前电脑"
+                            "本机"
                         } else {
                             "已配置主电脑"
                         },
@@ -2005,7 +2004,7 @@ fn native_action_button_labels() -> [&'static str; 5] {
     [
         "保存服务器配置",
         "刷新",
-        "保存当前电脑配置",
+        "保存本机配置",
         "保存设备位置",
         "刷新",
     ]
@@ -2035,7 +2034,7 @@ fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
         DesktopConnectionState::Connected => "已连接",
         DesktopConnectionState::Disconnected => "未连接",
         DesktopConnectionState::Retrying => "正在重试",
-        DesktopConnectionState::SelfDevice => "当前电脑",
+        DesktopConnectionState::SelfDevice => "本机",
     }
 }
 
@@ -2318,7 +2317,7 @@ mod tests {
         assert_eq!(native_header_total_height(), 62.0);
         assert_eq!(native_header_content_height(), 42.0);
         assert_eq!(labels[0].0, "服务器 已连接");
-        assert_eq!(labels[1].0, "同步通道 当前电脑");
+        assert_eq!(labels[1].0, "同步通道 本机");
         assert_eq!(labels[2].0, "LAN 优先");
         assert_eq!(labels[3].0, "刚刚刷新");
         assert_eq!(native_status_chip_size("服务器 已连接").y, 26.0);
@@ -2596,7 +2595,7 @@ mod tests {
             [
                 "保存服务器配置",
                 "刷新",
-                "保存当前电脑配置",
+                "保存本机配置",
                 "保存设备位置",
                 "刷新"
             ]
@@ -2669,7 +2668,7 @@ mod tests {
                     id: Some("current".to_string()),
                     name: "Renamed PC".to_string(),
                     detail: "windows，本机".to_string(),
-                    status: "当前电脑".to_string(),
+                    status: "本机".to_string(),
                     status_tone: NativeStatusTone::Info,
                     lan_ips: vec!["192.168.1.20".to_string()],
                     can_delete: false,

@@ -9,6 +9,7 @@ SCRIPTS_DIR="${STAGING_DIR}/scripts"
 APP_ROOT="${PKG_ROOT}/Applications/KMSync.app"
 IDENTIFIER="com.kmsync.mvp"
 LAUNCH_AGENT_ID="com.kmsync.mvp"
+APP_EXECUTABLE="/Applications/KMSync.app/Contents/MacOS/kmsync"
 VERSION="$(grep -m1 '^version' "${ROOT_DIR}/crates/kmsync/Cargo.toml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 PKG_SIGN_IDENTITY="${PKG_SIGN_IDENTITY:-}"
@@ -143,7 +144,7 @@ cat > "${PKG_ROOT}/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist" <<PLIST
   <string>${LAUNCH_AGENT_ID}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/kmsync</string>
+    <string>${APP_EXECUTABLE}</string>
     <string>core-service</string>
   </array>
   <key>RunAtLoad</key>
@@ -175,8 +176,26 @@ cat > "${SCRIPTS_DIR}/postinstall" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "KMSync installed to /usr/local/bin/kmsync"
+launch_agent="/Library/LaunchAgents/com.kmsync.mvp.plist"
+label="com.kmsync.mvp"
+console_user="$(stat -f %Su /dev/console 2>/dev/null || true)"
+if [[ -n "${console_user}" && "${console_user}" != "root" && "${console_user}" != "loginwindow" ]]; then
+  uid="$(id -u "${console_user}" 2>/dev/null || true)"
+  if [[ -n "${uid}" ]]; then
+    launchctl bootout "gui/$uid" "${launch_agent}" >/dev/null 2>&1 || true
+    if launchctl bootstrap "gui/$uid" "${launch_agent}" >/dev/null 2>&1; then
+      launchctl enable "gui/$uid/${label}" >/dev/null 2>&1 || true
+      launchctl kickstart -k "gui/$uid/${label}" >/dev/null 2>&1 || true
+      echo "KMSync LaunchAgent started for ${console_user}"
+    else
+      echo "KMSync LaunchAgent installed; log out and back in if it is not running yet."
+    fi
+  fi
+fi
+
+echo "KMSync installed to /Applications/KMSync.app and /usr/local/bin/kmsync"
 echo "LaunchAgent installed to /Library/LaunchAgents/com.kmsync.mvp.plist for login startup"
+echo "Grant Accessibility and Input Monitoring permissions to KMSync.app, then restart KMSync."
 echo "Runtime config is created in ~/Library/Application Support/KMSync/daemon.example.json"
 echo "Permission guide installed to /usr/local/share/kmsync/docs/USER_GUIDE.md"
 echo "Uninstall cleanup script installed to /usr/local/share/kmsync/uninstall-macos.sh"

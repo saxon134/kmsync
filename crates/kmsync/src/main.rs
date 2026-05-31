@@ -5510,6 +5510,9 @@ mod tests {
             .expect("read Windows packaging script");
 
         assert!(macos.contains("<string>core-service</string>"));
+        assert!(macos.contains("APP_EXECUTABLE=\"/Applications/KMSync.app/Contents/MacOS/kmsync\""));
+        assert!(macos.contains("<string>${APP_EXECUTABLE}</string>"));
+        assert!(!macos.contains("<string>/usr/local/bin/kmsync</string>"));
         assert!(
             !macos.contains("<string>/usr/local/share/kmsync/configs/daemon.example.json</string>")
         );
@@ -7687,6 +7690,10 @@ mod packaging_tests {
         assert!(macos.contains("USER_GUIDE.md"));
         assert!(macos.contains("uninstall-macos.sh"));
         assert!(macos.contains("launchctl bootout"));
+        assert!(macos.contains("stat -f %Su /dev/console"));
+        assert!(macos.contains("label=\"com.kmsync.mvp\""));
+        assert!(macos.contains("launchctl bootstrap \"gui/$uid\""));
+        assert!(macos.contains("launchctl kickstart -k \"gui/$uid/${label}\""));
 
         assert!(windows.contains("Software\\Microsoft\\Windows\\CurrentVersion\\Run"));
         assert!(windows.contains("DeleteRegValue HKLM"));
