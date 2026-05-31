@@ -441,6 +441,18 @@ impl ControlClient {
         )
     }
 
+    pub fn delete_device(&self, device_id: &str) -> Result<(), String> {
+        let response: DeleteDeviceResponse = delete_json_without_auth(
+            &self.agent,
+            &format!("{}/v1/devices/{}", self.server_url, device_id),
+        )?;
+        if response.deleted {
+            Ok(())
+        } else {
+            Err("server did not delete device".to_string())
+        }
+    }
+
     pub fn list_profiles(&self) -> Result<Vec<DeviceProfile>, String> {
         get_json_without_auth(&self.agent, &format!("{}/v1/profiles", self.server_url))
     }
@@ -551,6 +563,11 @@ pub struct RegisterDeviceResponse {
 #[derive(Debug, Serialize)]
 struct UpdateDeviceNameRequest {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteDeviceResponse {
+    deleted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2399,6 +2416,21 @@ mod tests {
     }
 
     #[test]
+    fn deleting_device_calls_server_delete_endpoint_without_auth() {
+        let server = MockJsonServer::spawn([r#"{"deleted":true}"#]);
+        let client = ControlClient::new(server.url());
+
+        client
+            .delete_device("55555555-5555-4555-8555-555555555555")
+            .expect("delete device");
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("DELETE /v1/devices/55555555-5555-4555-8555-555555555555 "));
+        assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[test]
     fn release_check_url_encodes_device_rollout_identity() {
         let request = ReleaseCheckRequest {
             platform: "windows".to_string(),
@@ -3575,6 +3607,20 @@ where
 {
     let mut response = agent
         .get(url)
+        .call()
+        .map_err(|error| format!("request failed: {error}"))?;
+    response
+        .body_mut()
+        .read_json()
+        .map_err(|error| format!("invalid json response: {error}"))
+}
+
+fn delete_json_without_auth<R>(agent: &ureq::Agent, url: &str) -> Result<R, String>
+where
+    R: for<'de> Deserialize<'de>,
+{
+    let mut response = agent
+        .delete(url)
         .call()
         .map_err(|error| format!("request failed: {error}"))?;
     response

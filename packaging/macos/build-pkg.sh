@@ -6,6 +6,7 @@ DIST_DIR="${ROOT_DIR}/dist/macos"
 STAGING_DIR="${DIST_DIR}/staging"
 PKG_ROOT="${STAGING_DIR}/pkg-root"
 SCRIPTS_DIR="${STAGING_DIR}/scripts"
+APP_ROOT="${PKG_ROOT}/Applications/KMSync.app"
 IDENTIFIER="com.kmsync.mvp"
 LAUNCH_AGENT_ID="com.kmsync.mvp"
 VERSION="$(grep -m1 '^version' "${ROOT_DIR}/crates/kmsync/Cargo.toml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')"
@@ -67,6 +68,9 @@ mkdir -p \
   "${PKG_ROOT}/usr/local/bin" \
   "${PKG_ROOT}/usr/local/share/kmsync/configs" \
   "${PKG_ROOT}/usr/local/share/kmsync/docs" \
+  "${APP_ROOT}/Contents/MacOS" \
+  "${APP_ROOT}/Contents/Resources" \
+  "${APP_ROOT}/Contents/configs" \
   "${PKG_ROOT}/Library/LaunchAgents" \
   "${SCRIPTS_DIR}"
 
@@ -83,11 +87,51 @@ else
 fi
 
 install -m 0755 "${STAGING_DIR}/kmsync" "${PKG_ROOT}/usr/local/bin/kmsync"
+install -m 0755 "${STAGING_DIR}/kmsync" "${APP_ROOT}/Contents/MacOS/kmsync"
 sign_binary_if_configured "${PKG_ROOT}/usr/local/bin/kmsync"
+sign_binary_if_configured "${APP_ROOT}/Contents/MacOS/kmsync"
 install -m 0644 "${ROOT_DIR}/configs/mac-to-windows.profile.json" "${PKG_ROOT}/usr/local/share/kmsync/configs/mac-to-windows.profile.json"
 install -m 0644 "${ROOT_DIR}/configs/windows-to-mac.profile.json" "${PKG_ROOT}/usr/local/share/kmsync/configs/windows-to-mac.profile.json"
 install -m 0644 "${ROOT_DIR}/configs/daemon.example.json" "${PKG_ROOT}/usr/local/share/kmsync/configs/daemon.example.json"
 install -m 0644 "${ROOT_DIR}/docs/USER_GUIDE.md" "${PKG_ROOT}/usr/local/share/kmsync/docs/USER_GUIDE.md"
+install -m 0644 "${ROOT_DIR}/configs/mac-to-windows.profile.json" "${APP_ROOT}/Contents/configs/mac-to-windows.profile.json"
+install -m 0644 "${ROOT_DIR}/configs/windows-to-mac.profile.json" "${APP_ROOT}/Contents/configs/windows-to-mac.profile.json"
+install -m 0644 "${ROOT_DIR}/configs/daemon.example.json" "${APP_ROOT}/Contents/configs/daemon.example.json"
+install -m 0644 "${ROOT_DIR}/assets/macos/KMSync.icns" "${APP_ROOT}/Contents/Resources/KMSync.icns"
+
+cat > "${APP_ROOT}/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>KMSync</string>
+  <key>CFBundleExecutable</key>
+  <string>kmsync</string>
+  <key>CFBundleIconFile</key>
+  <string>KMSync</string>
+  <key>CFBundleIdentifier</key>
+  <string>${IDENTIFIER}</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>KMSync</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${VERSION}</string>
+  <key>CFBundleVersion</key>
+  <string>${VERSION}</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+PLIST
 
 cat > "${PKG_ROOT}/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

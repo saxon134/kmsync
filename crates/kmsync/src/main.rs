@@ -7568,6 +7568,9 @@ mod packaging_tests {
 
         assert!(macos.contains("Library/LaunchAgents"));
         assert!(macos.contains("com.kmsync.mvp.plist"));
+        assert!(macos.contains("Applications/KMSync.app"));
+        assert!(macos.contains("CFBundleIconFile"));
+        assert!(macos.contains("KMSync.icns"));
         assert!(macos.contains("USER_GUIDE.md"));
         assert!(macos.contains("uninstall-macos.sh"));
         assert!(macos.contains("launchctl bootout"));
