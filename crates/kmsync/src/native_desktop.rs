@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use kmsync_core::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopState};
@@ -24,6 +25,7 @@ const NATIVE_LAYOUT_GRID_MIN_COL_WIDTH: f32 = 68.0;
 const NATIVE_LAYOUT_GRID_MAX_COL_WIDTH: f32 = 154.0;
 const NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING: f32 = 24.0;
 const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 64.0;
+const NATIVE_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const NATIVE_DEVICES_GRID_NAME_MIN_WIDTH: f32 = 60.0;
 #[cfg(test)]
@@ -113,6 +115,8 @@ struct NativeCurrentDeviceFormWidths {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct NativeCurrentDeviceMetricWidths {
+    server: f32,
+    metric_gap: f32,
     lan_ip: f32,
     pre_refresh_gap: f32,
 }
@@ -262,6 +266,7 @@ struct NativeDesktopApp {
     status_message: String,
     lan_ip_popup: Option<NativeLanIpPopup>,
     logo_texture: Option<egui::TextureHandle>,
+    next_auto_refresh_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,25 +331,44 @@ impl NativeDesktopApp {
             status_message,
             lan_ip_popup: None,
             logo_texture: None,
+            next_auto_refresh_at: Instant::now() + NATIVE_AUTO_REFRESH_INTERVAL,
         })
     }
 
     fn reload_state(&mut self, success_message: &str) {
         match crate::build_local_desktop_state(&self.config_path) {
             Ok(state) => {
-                let view_model = NativeDesktopViewModel::from_state(&state);
                 let status_message = status_message_for_state(&state, success_message);
-                self.state = state;
-                self.server_host = view_model.server_host;
-                self.server_port = view_model.server_port;
-                self.device_name = view_model.device_name;
-                self.is_master = view_model.is_master;
-                self.layout = view_model.layout;
+                self.apply_state(state);
                 self.status_message = status_message;
             }
             Err(error) => {
                 self.status_message = format!("刷新失败：{error}");
             }
+        }
+        self.next_auto_refresh_at = Instant::now() + NATIVE_AUTO_REFRESH_INTERVAL;
+    }
+
+    fn reload_state_quietly(&mut self) {
+        if let Ok(state) = crate::build_local_desktop_state(&self.config_path) {
+            self.apply_state(state);
+        }
+    }
+
+    fn apply_state(&mut self, state: DesktopState) {
+        let view_model = NativeDesktopViewModel::from_state(&state);
+        self.state = state;
+        self.server_host = view_model.server_host;
+        self.server_port = view_model.server_port;
+        self.device_name = view_model.device_name;
+        self.is_master = view_model.is_master;
+        self.layout = view_model.layout;
+    }
+
+    fn refresh_if_due(&mut self, now: Instant) {
+        if now >= self.next_auto_refresh_at {
+            self.reload_state_quietly();
+            self.next_auto_refresh_at = now + NATIVE_AUTO_REFRESH_INTERVAL;
         }
     }
 
@@ -515,6 +539,14 @@ impl NativeDesktopApp {
             .map(|_| ())
     }
 
+    fn mark_current_device_offline(&self) {
+        let result = crate::client::ClientConfig::load(&self.config_path)
+            .and_then(|config| crate::client::mark_current_device_offline(&config).map(|_| ()));
+        if let Err(error) = result {
+            eprintln!("failed to mark current device offline: {error}");
+        }
+    }
+
     fn server_url_preview(&self) -> String {
         let scheme = self
             .state
@@ -534,7 +566,13 @@ impl NativeDesktopApp {
 }
 
 impl eframe::App for NativeDesktopApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.mark_current_device_offline();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.refresh_if_due(Instant::now());
+        ctx.request_repaint_after(NATIVE_AUTO_REFRESH_INTERVAL);
         if self.logo_texture.is_none() {
             self.logo_texture = native_logo_texture(ctx);
         }
@@ -683,6 +721,14 @@ impl NativeDesktopApp {
             native_metric_card(
                 ui,
                 native_current_device_fact_labels()[0],
+                connection_state_label(&self.state.server_state),
+                connection_state_tone(&self.state.server_state),
+                metric_widths.server,
+            );
+            ui.add_space(metric_widths.metric_gap);
+            native_metric_card(
+                ui,
+                native_current_device_fact_labels()[1],
                 &empty_dash(&self.state.network.lan_ips.join(", ")),
                 NativeStatusTone::Success,
                 metric_widths.lan_ip,
@@ -710,7 +756,11 @@ impl NativeDesktopApp {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.set_max_width(header_text_width);
-                    ui.heading("设备位置");
+                    ui.horizontal(|ui| {
+                        ui.heading("设备位置");
+                        let (label, tone) = native_layout_section_status(&self.state);
+                        native_status_chip(ui, &label, tone);
+                    });
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(
@@ -1424,6 +1474,13 @@ fn native_layout_center_device_name(state: &DesktopState, edited_device_name: &s
         .unwrap_or_else(|| format!("未知主电脑 {master_device_id}"))
 }
 
+fn native_layout_section_status(state: &DesktopState) -> (String, NativeStatusTone) {
+    (
+        format!("同步通道 {}", connection_state_label(&state.master_state)),
+        connection_state_tone(&state.master_state),
+    )
+}
+
 #[cfg(test)]
 fn native_master_assignment_text(state: &DesktopState) -> String {
     let Some(master_device_id) = state.master_device_id.as_deref() else {
@@ -1698,10 +1755,19 @@ fn native_current_device_form_widths(available_width: f32) -> NativeCurrentDevic
 
 fn native_current_device_metric_widths(available_width: f32) -> NativeCurrentDeviceMetricWidths {
     let min_pre_refresh_gap = 12.0;
+    let metric_gap = 10.0;
     let refresh = NATIVE_COMPACT_ACTION_BUTTON_WIDTH;
-    let lan_ip = (available_width - refresh - min_pre_refresh_gap).clamp(130.0, 260.0);
-    let used = lan_ip + refresh;
+    let server = if available_width >= 430.0 {
+        108.0
+    } else {
+        96.0
+    };
+    let lan_ip =
+        (available_width - server - metric_gap - refresh - min_pre_refresh_gap).clamp(130.0, 230.0);
+    let used = server + metric_gap + lan_ip + refresh;
     NativeCurrentDeviceMetricWidths {
+        server,
+        metric_gap,
         lan_ip,
         pre_refresh_gap: (available_width - used).max(min_pre_refresh_gap),
     }
@@ -1737,26 +1803,16 @@ fn native_header_logo_background() -> egui::Color32 {
     egui::Color32::from_rgb(238, 244, 255)
 }
 
-fn native_header_status_labels(state: &DesktopState) -> Vec<(String, NativeStatusTone)> {
+fn native_header_status_labels(_state: &DesktopState) -> Vec<(String, NativeStatusTone)> {
     vec![
         (
-            format!(
-                "{} {}",
-                native_top_status_labels()[0],
-                connection_state_label(&state.server_state)
-            ),
-            connection_state_tone(&state.server_state),
+            native_top_status_labels()[0].to_string(),
+            NativeStatusTone::Info,
         ),
         (
-            format!(
-                "{} {}",
-                native_top_status_labels()[1],
-                connection_state_label(&state.master_state)
-            ),
-            connection_state_tone(&state.master_state),
+            native_top_status_labels()[1].to_string(),
+            NativeStatusTone::Muted,
         ),
-        ("LAN 优先".to_string(), NativeStatusTone::Info),
-        ("刚刚刷新".to_string(), NativeStatusTone::Muted),
     ]
 }
 
@@ -2020,12 +2076,12 @@ fn status_message_for_state(state: &DesktopState, fallback: &str) -> String {
     fallback.to_string()
 }
 
-fn native_current_device_fact_labels() -> [&'static str; 1] {
-    ["内网 IP"]
+fn native_current_device_fact_labels() -> [&'static str; 2] {
+    ["服务器", "内网 IP"]
 }
 
 fn native_top_status_labels() -> [&'static str; 2] {
-    ["服务器", "同步通道"]
+    ["LAN 优先", "自动刷新"]
 }
 
 fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
@@ -2275,8 +2331,10 @@ mod tests {
         assert_eq!(current.pre_button_gap.round(), 37.0);
 
         let metrics = native_default_current_device_metric_widths();
-        assert_eq!(metrics.lan_ip, 260.0);
-        assert_eq!(metrics.pre_refresh_gap.round(), 112.0);
+        assert_eq!(metrics.server, 108.0);
+        assert_eq!(metrics.metric_gap, 10.0);
+        assert_eq!(metrics.lan_ip, 230.0);
+        assert_eq!(metrics.pre_refresh_gap.round(), 24.0);
 
         assert_eq!(native_default_layout_canvas_content_width().round(), 401.0);
         assert_eq!(native_default_layout_grid_leading_space().round(), 0.0);
@@ -2297,12 +2355,42 @@ mod tests {
 
     #[test]
     fn native_current_device_facts_do_not_show_public_ip() {
-        assert_eq!(native_current_device_fact_labels().as_slice(), ["内网 IP"]);
+        assert_eq!(
+            native_current_device_fact_labels().as_slice(),
+            ["服务器", "内网 IP"]
+        );
     }
 
     #[test]
-    fn native_top_status_labels_match_header_design() {
-        assert_eq!(native_top_status_labels(), ["服务器", "同步通道"]);
+    fn native_header_status_labels_do_not_mix_connection_states() {
+        let state = DesktopState {
+            server_state: DesktopConnectionState::Connected,
+            master_state: DesktopConnectionState::Connected,
+            ..DesktopState::default()
+        };
+        let labels = native_header_status_labels(&state);
+
+        assert_eq!(native_top_status_labels(), ["LAN 优先", "自动刷新"]);
+        assert_eq!(
+            labels,
+            vec![
+                ("LAN 优先".to_string(), NativeStatusTone::Info),
+                ("自动刷新".to_string(), NativeStatusTone::Muted)
+            ]
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_reports_sync_channel() {
+        let state = DesktopState {
+            master_state: DesktopConnectionState::Connected,
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 已连接".to_string(), NativeStatusTone::Success)
+        );
     }
 
     #[test]
@@ -2316,11 +2404,9 @@ mod tests {
 
         assert_eq!(native_header_total_height(), 62.0);
         assert_eq!(native_header_content_height(), 42.0);
-        assert_eq!(labels[0].0, "服务器 已连接");
-        assert_eq!(labels[1].0, "同步通道 本机");
-        assert_eq!(labels[2].0, "LAN 优先");
-        assert_eq!(labels[3].0, "刚刚刷新");
-        assert_eq!(native_status_chip_size("服务器 已连接").y, 26.0);
+        assert_eq!(labels[0].0, "LAN 优先");
+        assert_eq!(labels[1].0, "自动刷新");
+        assert_eq!(native_status_chip_size("LAN 优先").y, 26.0);
         assert!(native_header_status_row_width(&labels) < 430.0);
         assert!(native_logo_icon_data().is_some());
         assert_eq!(native_header_logo_corner_radius(), 10);

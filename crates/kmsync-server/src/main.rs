@@ -93,6 +93,7 @@ fn build_app(state: AppState) -> Router {
             post(reauthorize_device),
         )
         .route("/v1/devices/{device_id}/heartbeat", post(heartbeat))
+        .route("/v1/devices/{device_id}/offline", post(mark_device_offline))
         .route("/v1/profiles/changes", get(list_profile_changes))
         .route("/v1/profiles/rollback", post(rollback_profile))
         .route("/v1/profiles", get(list_profiles).put(upsert_profile))
@@ -1440,6 +1441,49 @@ async fn heartbeat(
     }))
 }
 
+async fn mark_device_offline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(device_id): AxumPath<Uuid>,
+) -> Result<Json<HeartbeatResponse>, ApiError> {
+    let user_id = authorize_or_default(&state, &headers)?;
+    let mut store = state.lock()?;
+    let Some(device) = store.devices.get(&device_id) else {
+        return Err(ApiError::not_found("device not found"));
+    };
+    if device.user_id != user_id {
+        return Err(ApiError::not_found("device not found"));
+    }
+
+    let now = now_seconds();
+    let Some(presence) = store.presence.get_mut(&device_id) else {
+        return Ok(Json(HeartbeatResponse {
+            online: false,
+            last_seen_at: now,
+            presence_version: 1,
+        }));
+    };
+    let was_online = presence_is_online_at(presence, now);
+    presence.online = false;
+    presence.expires_at = now;
+    presence.presence_version = presence.presence_version.saturating_add(1);
+    let response = HeartbeatResponse {
+        online: false,
+        last_seen_at: presence.last_seen_at,
+        presence_version: presence.presence_version,
+    };
+    if was_online {
+        state.publish_event(ServerEvent::DevicePresenceChanged {
+            user_id,
+            device_id,
+            online: false,
+            presence_version: presence.presence_version,
+        });
+    }
+    state.save_locked(&store)?;
+    Ok(Json(response))
+}
+
 #[derive(Debug, Deserialize)]
 struct UpsertTopologyRequest {
     master_device_id: Option<Uuid>,
@@ -2611,6 +2655,65 @@ mod tests {
         assert_eq!(devices.as_array().expect("devices").len(), 1);
         assert_eq!(devices[0]["presence"]["online"], false);
         assert_eq!(devices[0]["presence"]["lan_ips"][0], "192.168.1.10");
+    }
+
+    #[tokio::test]
+    async fn device_offline_endpoint_marks_presence_offline_immediately() {
+        let state = AppState::load(None).expect("in-memory state");
+        let app = build_app(state.clone());
+        let login = login_with_body(app.clone()).await;
+        let token = login["access_token"].as_str().expect("token").to_string();
+        let user_id = Uuid::parse_str(login["user_id"].as_str().expect("user id")).expect("uuid");
+        let device_id = register_device(app.clone(), &token, "desktop").await;
+        let device_uuid = Uuid::parse_str(&device_id).expect("device uuid");
+        let (heartbeat_status, _) = send_heartbeat(
+            app.clone(),
+            &token,
+            &device_id,
+            vec!["192.168.1.10"],
+            24800,
+            "open",
+            "127.0.0.1:40000",
+        )
+        .await;
+        assert_eq!(heartbeat_status, StatusCode::OK);
+        let mut events = state.subscribe_events();
+
+        let (offline_status, offline) = json_request(
+            app.clone(),
+            Method::POST,
+            format!("/v1/devices/{device_id}/offline"),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+
+        assert_eq!(offline_status, StatusCode::OK);
+        assert_eq!(offline["online"], false);
+        assert_eq!(offline["presence_version"], 2);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("offline event")
+                .expect("event"),
+            ServerEvent::DevicePresenceChanged {
+                user_id,
+                device_id: device_uuid,
+                online: false,
+                presence_version: 2,
+            }
+        );
+
+        let (list_status, devices) = json_request(
+            app,
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(devices[0]["presence"]["online"], false);
     }
 
     #[tokio::test]

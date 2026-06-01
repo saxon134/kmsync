@@ -434,6 +434,14 @@ impl ControlClient {
         )
     }
 
+    pub fn mark_device_offline(&self, device_id: &str) -> Result<HeartbeatResponse, String> {
+        post_json(
+            &self.agent,
+            &format!("{}/v1/devices/{}/offline", self.server_url, device_id),
+            &EmptyRequest {},
+        )
+    }
+
     pub fn list_devices(&self) -> Result<Vec<DeviceWithPresence>, String> {
         get_json_without_auth(&self.agent, &format!("{}/v1/devices", self.server_url))
     }
@@ -576,6 +584,9 @@ struct UpdateDeviceNameRequest {
 struct DeleteDeviceResponse {
     deleted: bool,
 }
+
+#[derive(Debug, Serialize)]
+struct EmptyRequest {}
 
 #[derive(Debug, Serialize)]
 pub struct HeartbeatRequest {
@@ -1615,6 +1626,11 @@ pub fn sync_current_device_name(config: &ClientConfig) -> Result<Device, String>
     sync_current_device_name_with_identity(config, &identity)
 }
 
+pub fn mark_current_device_offline(config: &ClientConfig) -> Result<HeartbeatResponse, String> {
+    let identity = DeviceIdentity::load_or_generate(&config.identity_path)?;
+    mark_current_device_offline_with_identity(config, &identity)
+}
+
 fn sync_current_device_name_with_identity(
     config: &ClientConfig,
     identity: &DeviceIdentity,
@@ -1626,6 +1642,14 @@ fn sync_current_device_name_with_identity(
     let client = ControlClient::new(config.server_url.clone());
     let registered = client.register_device(&build_register_device_request(config, identity))?;
     client.update_device_name(&registered.device_id, name)
+}
+
+fn mark_current_device_offline_with_identity(
+    config: &ClientConfig,
+    identity: &DeviceIdentity,
+) -> Result<HeartbeatResponse, String> {
+    let client = ControlClient::new(config.server_url.clone());
+    client.mark_device_offline(&identity.device_id)
 }
 
 fn load_desktop_device_inventory_with_identity(
@@ -2567,6 +2591,34 @@ mod tests {
         let requests = server.finish();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("DELETE /v1/devices/55555555-5555-4555-8555-555555555555 "));
+        assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[test]
+    fn marking_current_device_offline_posts_offline_endpoint_without_auth() {
+        let current_device_id = "66666666-6666-4666-8666-666666666666";
+        let server =
+            MockJsonServer::spawn([r#"{"online":false,"last_seen_at":456,"presence_version":2}"#]);
+        let config = ClientConfig {
+            server_url: server.url(),
+            device_name: "Development Mac".to_string(),
+            role: DesktopRole::Client,
+            listen_port: 24_800,
+            heartbeat_interval_seconds: 15,
+            identity_path: PathBuf::from("identity.json"),
+        };
+        let identity = DeviceIdentity {
+            device_id: current_device_id.to_string(),
+            public_key: "ed25519:current".to_string(),
+            private_key: "ed25519:private".to_string(),
+        };
+
+        mark_current_device_offline_with_identity(&config, &identity).expect("mark offline");
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .starts_with("POST /v1/devices/66666666-6666-4666-8666-666666666666/offline "));
         assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
     }
 
