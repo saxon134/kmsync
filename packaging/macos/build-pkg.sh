@@ -24,7 +24,11 @@ fi
 sign_binary_if_configured() {
   local binary="$1"
   if [[ -z "${CODESIGN_IDENTITY}" ]]; then
-    echo "CODESIGN_IDENTITY not set; leaving ${binary} unsigned"
+    echo "CODESIGN_IDENTITY not set; ad-hoc signing ${binary}"
+    codesign \
+      --force \
+      --sign - \
+      "${binary}"
     return 0
   fi
 
@@ -34,6 +38,27 @@ sign_binary_if_configured() {
     --options runtime \
     --sign "${CODESIGN_IDENTITY}" \
     "${binary}"
+}
+
+sign_app_bundle_if_configured() {
+  local app="$1"
+  if [[ -z "${CODESIGN_IDENTITY}" ]]; then
+    echo "CODESIGN_IDENTITY not set; ad-hoc signing ${app}"
+    codesign \
+      --force \
+      --deep \
+      --sign - \
+      "${app}"
+    return 0
+  fi
+
+  codesign \
+    --force \
+    --deep \
+    --timestamp \
+    --options runtime \
+    --sign "${CODESIGN_IDENTITY}" \
+    "${app}"
 }
 
 sign_pkg_if_configured() {
@@ -130,9 +155,13 @@ cat > "${APP_ROOT}/Contents/Info.plist" <<PLIST
   <string>11.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>KMSync needs Input Monitoring to capture keyboard and mouse events when this Mac controls another device.</string>
 </dict>
 </plist>
 PLIST
+
+sign_app_bundle_if_configured "${APP_ROOT}"
 
 cat > "${PKG_ROOT}/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

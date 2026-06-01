@@ -7721,4 +7721,17 @@ mod packaging_tests {
         assert!(windows.contains("TimestampUrl"));
         assert!(windows.contains("Sign-AuthenticodeFile"));
     }
+
+    #[test]
+    fn macos_packaging_ad_hoc_signs_local_builds_for_tcc_permissions() {
+        let root = workspace_root();
+        let macos = std::fs::read_to_string(root.join("packaging/macos/build-pkg.sh"))
+            .expect("read macOS packaging script");
+
+        assert!(macos.contains("CODESIGN_IDENTITY not set; ad-hoc signing"));
+        assert!(macos.contains("--sign -"));
+        assert!(macos.contains("sign_app_bundle_if_configured"));
+        assert!(macos.contains("\"${APP_ROOT}\""));
+        assert!(macos.contains("NSInputMonitoringUsageDescription"));
+    }
 }

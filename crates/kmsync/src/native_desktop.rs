@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+#[cfg(test)]
+use kmsync_core::DesktopPermissionState;
 use kmsync_core::{DesktopConnectionState, DesktopLayout, DesktopRole, DesktopState};
 
 const NATIVE_CJK_FONT_NAME: &str = "kmsync_cjk";
@@ -318,6 +320,7 @@ struct NativeToneColors {
 impl NativeDesktopApp {
     fn load(config_path: PathBuf) -> Result<Self, String> {
         let state = crate::build_local_desktop_state(&config_path)?;
+        maybe_request_platform_permissions(&state);
         let view_model = NativeDesktopViewModel::from_state(&state);
         let status_message = status_message_for_state(&state, "就绪");
         Ok(Self {
@@ -339,6 +342,7 @@ impl NativeDesktopApp {
         match crate::build_local_desktop_state(&self.config_path) {
             Ok(state) => {
                 let status_message = status_message_for_state(&state, success_message);
+                maybe_request_platform_permissions(&state);
                 self.apply_state(state);
                 self.status_message = status_message;
             }
@@ -643,6 +647,22 @@ impl eframe::App for NativeDesktopApp {
             });
         self.lan_ip_popup_window(ctx);
     }
+}
+
+fn maybe_request_platform_permissions(state: &DesktopState) {
+    if native_should_request_platform_permissions(state) {
+        crate::platform::request_platform_permissions();
+    }
+}
+
+fn native_should_request_platform_permissions(state: &DesktopState) -> bool {
+    state.permissions.iter().any(|permission| {
+        permission.status == "missing"
+            && matches!(
+                permission.key.as_str(),
+                "macos.accessibility" | "macos.input_monitoring"
+            )
+    })
 }
 
 impl NativeDesktopApp {
@@ -2408,6 +2428,36 @@ mod tests {
             native_layout_section_status(&state),
             ("同步通道 需处理".to_string(), NativeStatusTone::Danger)
         );
+    }
+
+    #[test]
+    fn native_desktop_requests_missing_macos_input_permissions() {
+        let state = DesktopState {
+            permissions: vec![DesktopPermissionState {
+                key: "macos.input_monitoring".to_string(),
+                status: "missing".to_string(),
+                label: "macOS Input Monitoring".to_string(),
+                guidance: None,
+            }],
+            ..DesktopState::default()
+        };
+
+        assert!(native_should_request_platform_permissions(&state));
+    }
+
+    #[test]
+    fn native_desktop_skips_platform_permission_request_when_granted() {
+        let state = DesktopState {
+            permissions: vec![DesktopPermissionState {
+                key: "macos.input_monitoring".to_string(),
+                status: "granted".to_string(),
+                label: "macOS Input Monitoring".to_string(),
+                guidance: None,
+            }],
+            ..DesktopState::default()
+        };
+
+        assert!(!native_should_request_platform_permissions(&state));
     }
 
     #[test]

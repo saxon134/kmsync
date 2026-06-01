@@ -253,6 +253,11 @@ pub fn active_application_id() -> Option<String> {
     current_platform().active_application_id()
 }
 
+pub fn request_platform_permissions() {
+    #[cfg(target_os = "macos")]
+    macos::request_platform_permissions();
+}
+
 pub fn hide_local_pointer() {
     #[cfg(target_os = "macos")]
     macos::hide_local_pointer();

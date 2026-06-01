@@ -9,8 +9,11 @@ use std::time::Duration;
 
 use arboard::ImageData;
 use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::mach_port::{CFMachPort, CFMachPortInvalidate, CFMachPortRef};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -69,6 +72,11 @@ pub fn restore_local_pointer(position: Option<PointerPosition>) {
         let _ = CGDisplay::warp_mouse_cursor_position(pointer_to_point(position));
     }
     let _ = CGDisplay::main().show_cursor();
+}
+
+pub fn request_platform_permissions() {
+    let _ = request_macos_accessibility_permission();
+    let _ = request_macos_input_monitoring_permission();
 }
 
 impl PlatformAdapter for MacOsPlatform {
@@ -143,10 +151,29 @@ fn macos_input_monitoring_granted() -> bool {
 }
 
 #[allow(unsafe_code)]
+fn request_macos_accessibility_permission() -> bool {
+    unsafe {
+        let prompt_key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+        let prompt_value = CFBoolean::true_value();
+        let options = CFDictionary::from_CFType_pairs(&[(prompt_key, prompt_value)]);
+        AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef())
+    }
+}
+
+#[allow(unsafe_code)]
+fn request_macos_input_monitoring_permission() -> bool {
+    unsafe { CGRequestListenEventAccess() }
+}
+
+#[allow(unsafe_code)]
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
+    #[allow(non_upper_case_globals)]
+    static kAXTrustedCheckOptionPrompt: CFStringRef;
     fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
     fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
 }
 
 fn macos_display_layout() -> Option<DisplayLayout> {
