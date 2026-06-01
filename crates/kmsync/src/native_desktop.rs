@@ -1475,6 +1475,9 @@ fn native_layout_center_device_name(state: &DesktopState, edited_device_name: &s
 }
 
 fn native_layout_section_status(state: &DesktopState) -> (String, NativeStatusTone) {
+    if state.master_error.is_some() {
+        return ("同步通道 需处理".to_string(), NativeStatusTone::Danger);
+    }
     (
         format!("同步通道 {}", connection_state_label(&state.master_state)),
         connection_state_tone(&state.master_state),
@@ -2390,6 +2393,20 @@ mod tests {
         assert_eq!(
             native_layout_section_status(&state),
             ("同步通道 已连接".to_string(), NativeStatusTone::Success)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_surfaces_sync_errors() {
+        let state = DesktopState {
+            master_state: DesktopConnectionState::SelfDevice,
+            master_error: Some("缺少 macOS Input Monitoring 权限".to_string()),
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 需处理".to_string(), NativeStatusTone::Danger)
         );
     }
 

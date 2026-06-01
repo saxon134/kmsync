@@ -7,7 +7,7 @@ use kmsync_core::{
 
 use crate::client::DeviceWithPresence;
 use crate::desktop_config::DesktopConfig;
-use crate::platform::PlatformPermissionCheck;
+use crate::platform::{PermissionStatus, PlatformPermissionCheck};
 
 pub(crate) struct DesktopStateBuildInput<'a> {
     pub(crate) config_path: &'a Path,
@@ -61,7 +61,7 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
         name: input.device_name.to_string(),
         os: std::env::consts::OS.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
-        role: effective_role,
+        role: effective_role.clone(),
     };
 
     let master_state = master_connection_state(
@@ -70,6 +70,14 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
         &input.desktop_config.layout,
         input.devices,
     );
+    let master_error = input.master_error.or_else(|| {
+        desktop_sync_permission_error(
+            &effective_role,
+            &master_state,
+            &input.desktop_config.layout,
+            input.permissions,
+        )
+    });
 
     DesktopState {
         config_path: Some(input.config_path.display().to_string()),
@@ -79,7 +87,7 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
         server_error: input.server_error,
         master_state,
         master_device_id: input.desktop_config.master_device_id.clone(),
-        master_error: input.master_error,
+        master_error,
         layout: input.desktop_config.layout.clone(),
         devices: peer_states(input.current_device_id, input.devices),
         permissions: input
@@ -97,6 +105,61 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
             })
             .collect(),
     }
+}
+
+fn desktop_sync_permission_error(
+    role: &DesktopRole,
+    master_state: &DesktopConnectionState,
+    layout: &DesktopLayout,
+    permissions: &[PlatformPermissionCheck],
+) -> Option<String> {
+    let sync_configured = match role {
+        DesktopRole::Master => !layout.target_device_ids().is_empty(),
+        DesktopRole::Client => !matches!(master_state, DesktopConnectionState::Disconnected),
+    };
+    if !sync_configured {
+        return None;
+    }
+
+    let (permission, action) = match role {
+        DesktopRole::Master => missing_permission_for(
+            permissions,
+            &["input_monitoring", "input monitoring", "capture"],
+        )
+        .map(|permission| (permission, "捕获本机鼠标键盘"))?,
+        DesktopRole::Client => missing_permission_for(
+            permissions,
+            &[
+                "accessibility",
+                "interactive_desktop",
+                "input_injection",
+                "injection",
+            ],
+        )
+        .map(|permission| (permission, "接收主电脑输入"))?,
+    };
+
+    Some(format!(
+        "缺少 {} 权限，无法{}。请在系统设置里给 KMSync.app 开启该权限后重启应用。",
+        permission.label, action
+    ))
+}
+
+fn missing_permission_for<'a>(
+    permissions: &'a [PlatformPermissionCheck],
+    needles: &[&str],
+) -> Option<&'a PlatformPermissionCheck> {
+    permissions.iter().find(|permission| {
+        permission.status == PermissionStatus::Missing && permission_matches(permission, needles)
+    })
+}
+
+fn permission_matches(permission: &PlatformPermissionCheck, needles: &[&str]) -> bool {
+    let id = permission.id.to_ascii_lowercase();
+    let label = permission.label.to_ascii_lowercase();
+    needles
+        .iter()
+        .any(|needle| id.contains(needle) || label.contains(needle))
 }
 
 fn server_endpoint_parts(server_url: &str) -> (Option<String>, Option<u16>) {
@@ -424,5 +487,52 @@ mod tests {
         assert_eq!(state.device.role, DesktopRole::Master);
         assert_eq!(state.master_device_id.as_deref(), Some("current-device"));
         assert_eq!(state.master_state, DesktopConnectionState::SelfDevice);
+    }
+
+    #[test]
+    fn desktop_state_reports_missing_master_capture_permission() {
+        let config = DesktopConfig {
+            role: DesktopRole::Master,
+            master_device_id: Some("current-device".to_string()),
+            layout: DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..DesktopLayout::default()
+            },
+            profile_path: None,
+        };
+        let permission = PlatformPermissionCheck {
+            id: "macos.input_monitoring",
+            label: "macOS Input Monitoring",
+            status: PermissionStatus::Missing,
+            guidance: "Grant Input Monitoring permission.",
+        };
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "Master Mac",
+            server_url: "http://kmsync.example.com:24888",
+            listen_port: 24_800,
+            current_device_id: Some("current-device"),
+            local_lan_ips: vec!["10.0.0.4".to_string()],
+            desktop_config: &config,
+            devices: &[device_with_presence(
+                "right-device",
+                "Right PC",
+                true,
+                &["10.0.0.5"],
+                "203.0.113.45",
+            )],
+            permissions: &[permission],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        let error = state
+            .master_error
+            .as_deref()
+            .expect("missing capture permission should be surfaced");
+        assert!(error.contains("macOS Input Monitoring"));
+        assert!(error.contains("无法捕获"));
     }
 }
