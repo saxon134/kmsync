@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use kmsync_core::{
     DesktopConnectionState, DesktopDeviceState, DesktopLayout, DesktopNetworkState,
@@ -8,6 +9,8 @@ use kmsync_core::{
 use crate::client::DeviceWithPresence;
 use crate::desktop_config::DesktopConfig;
 use crate::platform::{PermissionStatus, PlatformPermissionCheck};
+
+const PRESENCE_TTL_SECONDS: u64 = 60;
 
 pub(crate) struct DesktopStateBuildInput<'a> {
     pub(crate) config_path: &'a Path,
@@ -25,6 +28,7 @@ pub(crate) struct DesktopStateBuildInput<'a> {
 }
 
 pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopState {
+    let now = now_seconds();
     let current_presence = input
         .current_device_id
         .and_then(|current_device_id| {
@@ -69,6 +73,7 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
         input.desktop_config.master_device_id.as_deref(),
         &input.desktop_config.layout,
         input.devices,
+        now,
     );
     let master_error = input.master_error.or_else(|| {
         desktop_sync_permission_error(
@@ -89,7 +94,7 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
         master_device_id: input.desktop_config.master_device_id.clone(),
         master_error,
         layout: input.desktop_config.layout.clone(),
-        devices: peer_states(input.current_device_id, input.devices),
+        devices: peer_states(input.current_device_id, input.devices, now),
         permissions: input
             .permissions
             .iter()
@@ -204,6 +209,7 @@ fn master_connection_state(
     master_device_id: Option<&str>,
     layout: &DesktopLayout,
     devices: &[DeviceWithPresence],
+    now: u64,
 ) -> DesktopConnectionState {
     let Some(master_device_id) = master_device_id else {
         return DesktopConnectionState::Disconnected;
@@ -217,7 +223,7 @@ fn master_connection_state(
         .iter()
         .find(|item| item.device.id == master_device_id)
         .and_then(|item| item.presence.as_ref())
-        .filter(|presence| presence.online)
+        .filter(|presence| presence_is_online_at(presence, now))
         .map_or(DesktopConnectionState::Disconnected, |_| {
             if current_device_id.is_some_and(|device_id| {
                 layout
@@ -235,6 +241,7 @@ fn master_connection_state(
 fn peer_states(
     current_device_id: Option<&str>,
     devices: &[DeviceWithPresence],
+    now: u64,
 ) -> Vec<DesktopPeerState> {
     devices
         .iter()
@@ -245,7 +252,7 @@ fn peer_states(
                 id: item.device.id.clone(),
                 name: item.device.name.clone(),
                 os: item.device.os_type.clone(),
-                online: presence.is_some_and(|presence| presence.online),
+                online: presence.is_some_and(|presence| presence_is_online_at(presence, now)),
                 lan_ips: presence
                     .map(|presence| presence.lan_ips.clone())
                     .unwrap_or_default(),
@@ -255,6 +262,16 @@ fn peer_states(
             }
         })
         .collect()
+}
+
+fn presence_is_online_at(presence: &crate::client::Presence, now: u64) -> bool {
+    presence.online && now <= presence.last_seen_at.saturating_add(PRESENCE_TTL_SECONDS)
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -289,7 +306,7 @@ mod tests {
                 public_ip: public_ip.to_string(),
                 listen_port: 24_800,
                 nat_type: "unknown".to_string(),
-                last_seen_at: 123,
+                last_seen_at: now_seconds(),
             }),
         }
     }
@@ -429,6 +446,51 @@ mod tests {
 
         assert_eq!(state.master_device_id.as_deref(), Some("master-device"));
         assert_eq!(state.master_state, DesktopConnectionState::Connected);
+    }
+
+    #[test]
+    fn desktop_state_treats_stale_online_master_presence_as_disconnected() {
+        let config = DesktopConfig {
+            role: DesktopRole::Client,
+            master_device_id: Some("master-device".to_string()),
+            layout: DesktopLayout {
+                right: Some("client-device".to_string()),
+                ..DesktopLayout::default()
+            },
+            profile_path: None,
+        };
+        let mut stale_master = device_with_presence(
+            "master-device",
+            "Master PC",
+            true,
+            &["10.0.0.4"],
+            "203.0.113.44",
+        );
+        stale_master
+            .presence
+            .as_mut()
+            .expect("presence")
+            .last_seen_at = 1;
+        let devices = [stale_master];
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "Client PC",
+            server_url: "http://kmsync.example.com:24888",
+            listen_port: 24_800,
+            current_device_id: Some("client-device"),
+            local_lan_ips: vec!["10.0.0.5".to_string()],
+            desktop_config: &config,
+            devices: &devices,
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert_eq!(state.master_state, DesktopConnectionState::Disconnected);
+        assert_eq!(state.devices[0].id, "master-device");
+        assert!(!state.devices[0].online);
     }
 
     #[test]
