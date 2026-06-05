@@ -376,6 +376,11 @@ impl NativeDesktopApp {
         }
     }
 
+    fn request_platform_permissions(&mut self) {
+        crate::platform::request_platform_permissions();
+        self.reload_state("已请求系统权限");
+    }
+
     fn save_server_endpoint(&mut self) {
         let port = match self.server_port.trim().parse::<u16>() {
             Ok(port) if port > 0 => port,
@@ -650,12 +655,16 @@ impl eframe::App for NativeDesktopApp {
 }
 
 fn maybe_request_platform_permissions(state: &DesktopState) {
-    if native_should_request_platform_permissions(state) {
+    if native_should_auto_request_platform_permissions(state) {
         crate::platform::request_platform_permissions();
     }
 }
 
-fn native_should_request_platform_permissions(state: &DesktopState) -> bool {
+fn native_should_auto_request_platform_permissions(_state: &DesktopState) -> bool {
+    false
+}
+
+fn native_should_show_permission_request_button(state: &DesktopState) -> bool {
     state.permissions.iter().any(|permission| {
         permission.status == "missing"
             && matches!(
@@ -735,6 +744,7 @@ impl NativeDesktopApp {
         });
         ui.add_space(10.0);
         let metric_widths = native_current_device_metric_widths(ui.available_width());
+        let show_permission_request = native_should_show_permission_request_button(&self.state);
         ui.horizontal_top(|ui| {
             let previous_spacing = ui.spacing().item_spacing;
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -755,7 +765,13 @@ impl NativeDesktopApp {
             );
             ui.add_space(metric_widths.pre_refresh_gap);
             ui.vertical(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(if show_permission_request { 0.0 } else { 8.0 });
+                if show_permission_request {
+                    if native_compact_action_button(ui, "申请权限").clicked() {
+                        self.request_platform_permissions();
+                    }
+                    ui.add_space(4.0);
+                }
                 if native_compact_action_button(ui, "刷新").clicked() {
                     self.reload_state("状态已刷新");
                 }
@@ -2079,11 +2095,12 @@ fn native_action_button_size() -> egui::Vec2 {
 }
 
 #[cfg(test)]
-fn native_action_button_labels() -> [&'static str; 5] {
+fn native_action_button_labels() -> [&'static str; 6] {
     [
         "保存服务器配置",
         "刷新",
         "保存本机配置",
+        "申请权限",
         "保存设备位置",
         "刷新",
     ]
@@ -2431,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn native_desktop_requests_missing_macos_input_permissions() {
+    fn native_desktop_shows_permission_button_without_auto_prompting() {
         let state = DesktopState {
             permissions: vec![DesktopPermissionState {
                 key: "macos.input_monitoring".to_string(),
@@ -2442,11 +2459,12 @@ mod tests {
             ..DesktopState::default()
         };
 
-        assert!(native_should_request_platform_permissions(&state));
+        assert!(native_should_show_permission_request_button(&state));
+        assert!(!native_should_auto_request_platform_permissions(&state));
     }
 
     #[test]
-    fn native_desktop_skips_platform_permission_request_when_granted() {
+    fn native_desktop_hides_permission_button_when_granted() {
         let state = DesktopState {
             permissions: vec![DesktopPermissionState {
                 key: "macos.input_monitoring".to_string(),
@@ -2457,7 +2475,8 @@ mod tests {
             ..DesktopState::default()
         };
 
-        assert!(!native_should_request_platform_permissions(&state));
+        assert!(!native_should_show_permission_request_button(&state));
+        assert!(!native_should_auto_request_platform_permissions(&state));
     }
 
     #[test]
@@ -2749,6 +2768,7 @@ mod tests {
                 "保存服务器配置",
                 "刷新",
                 "保存本机配置",
+                "申请权限",
                 "保存设备位置",
                 "刷新"
             ]

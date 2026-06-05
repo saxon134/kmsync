@@ -3469,9 +3469,10 @@ impl Args {
     }
 
     fn parse_with_default_config(
-        mut args: impl Iterator<Item = String>,
+        args: impl Iterator<Item = String>,
         default_config_path: PathBuf,
     ) -> Result<Self, String> {
+        let mut args = args.filter(|arg| !is_macos_process_serial_number_arg(arg));
         let Some(command) = args.next() else {
             return Ok(Self {
                 command: Command::Desktop {
@@ -4059,6 +4060,10 @@ fn parse_clipboard_enabled(value: &str) -> Result<bool, String> {
             "invalid clipboard sync switch '{value}', expected enabled or disabled"
         )),
     }
+}
+
+fn is_macos_process_serial_number_arg(arg: &str) -> bool {
+    arg.starts_with("-psn_")
 }
 
 fn parse_local_ipc_endpoint(address: Option<String>) -> local_ipc::LocalIpcEndpoint {
@@ -5102,6 +5107,25 @@ mod tests {
     }
 
     #[test]
+    fn args_parse_ignores_macos_process_serial_number_before_command() {
+        let default_config = PathBuf::from("configs/daemon.example.json");
+        let args = Args::parse_with_default_config(
+            ["-psn_0_12345", "core-service"]
+                .into_iter()
+                .map(String::from),
+            default_config.clone(),
+        )
+        .expect("parse LaunchServices core service");
+
+        match args.command {
+            Command::CoreService { config_path } => {
+                assert_eq!(config_path, default_config);
+            }
+            _ => panic!("expected core service command"),
+        }
+    }
+
+    #[test]
     fn args_parse_without_arguments_starts_core_service_for_desktop_launch() {
         let default_config = PathBuf::from("portable/config/daemon.example.json");
         let args = Args::parse_with_default_config(std::iter::empty(), default_config.clone())
@@ -5510,8 +5534,15 @@ mod tests {
             .expect("read Windows packaging script");
 
         assert!(macos.contains("<string>core-service</string>"));
-        assert!(macos.contains("APP_EXECUTABLE=\"/Applications/KMSync.app/Contents/MacOS/kmsync\""));
-        assert!(macos.contains("<string>${APP_EXECUTABLE}</string>"));
+        assert!(macos.contains("APP_BUNDLE=\"/Applications/KMSync.app\""));
+        assert!(macos.contains("<string>/usr/bin/open</string>"));
+        assert!(macos.contains("<string>-W</string>"));
+        assert!(macos.contains("<string>-n</string>"));
+        assert!(macos.contains("<string>-g</string>"));
+        assert!(macos.contains("<string>-a</string>"));
+        assert!(macos.contains("<string>${APP_BUNDLE}</string>"));
+        assert!(macos.contains("<string>--args</string>"));
+        assert!(!macos.contains("<string>${APP_EXECUTABLE}</string>"));
         assert!(!macos.contains("<string>/usr/local/bin/kmsync</string>"));
         assert!(
             !macos.contains("<string>/usr/local/share/kmsync/configs/daemon.example.json</string>")

@@ -9,7 +9,7 @@ SCRIPTS_DIR="${STAGING_DIR}/scripts"
 APP_ROOT="${PKG_ROOT}/Applications/KMSync.app"
 IDENTIFIER="com.kmsync.mvp"
 LAUNCH_AGENT_ID="com.kmsync.mvp"
-APP_EXECUTABLE="/Applications/KMSync.app/Contents/MacOS/kmsync"
+APP_BUNDLE="/Applications/KMSync.app"
 VERSION="$(grep -m1 '^version' "${ROOT_DIR}/crates/kmsync/Cargo.toml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 PKG_SIGN_IDENTITY="${PKG_SIGN_IDENTITY:-}"
@@ -173,7 +173,13 @@ cat > "${PKG_ROOT}/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist" <<PLIST
   <string>${LAUNCH_AGENT_ID}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${APP_EXECUTABLE}</string>
+    <string>/usr/bin/open</string>
+    <string>-W</string>
+    <string>-n</string>
+    <string>-g</string>
+    <string>-a</string>
+    <string>${APP_BUNDLE}</string>
+    <string>--args</string>
     <string>core-service</string>
   </array>
   <key>RunAtLoad</key>
