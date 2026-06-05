@@ -70,10 +70,23 @@ impl QuicEventSender {
     }
 
     pub fn send(&mut self, event: ProtocolEvent) -> Result<(), String> {
+        self.send_input_event(0, 0, event)
+    }
+
+    pub fn send_input_event(
+        &mut self,
+        source_device_id: DeviceId,
+        target_device_id: DeviceId,
+        event: ProtocolEvent,
+    ) -> Result<(), String> {
         let frame = ProtocolFrame {
             sequence: event.sequence,
             timestamp_micros: event.timestamp_micros,
-            payload: ProtocolPayload::Input(InputEventEnvelope::current(0, 0, event.event)),
+            payload: ProtocolPayload::Input(InputEventEnvelope::current(
+                source_device_id,
+                target_device_id,
+                event.event,
+            )),
         };
         self.send_frame(&frame)
     }

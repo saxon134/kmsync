@@ -2995,10 +2995,23 @@ enum DesktopTargetTransport {
 }
 
 impl DesktopTargetTransport {
-    fn send_event(&mut self, target_device_id: &str, event: ProtocolEvent) -> Result<(), String> {
+    fn send_event(
+        &mut self,
+        relay_target_device_id: &str,
+        source_device_id: DeviceId,
+        target_device_id: DeviceId,
+        event: ProtocolEvent,
+    ) -> Result<(), String> {
         match self {
-            Self::Direct(sender) => sender.send(event),
-            Self::Relay(sender) => sender.send_event(target_device_id, event),
+            Self::Direct(sender) => {
+                sender.send_input_event(source_device_id, target_device_id, event)
+            }
+            Self::Relay(sender) => sender.send_input_event(
+                relay_target_device_id,
+                source_device_id,
+                target_device_id,
+                event,
+            ),
         }
     }
 }
@@ -3006,6 +3019,8 @@ impl DesktopTargetTransport {
 struct DesktopTargetSender {
     transport: DesktopTargetTransport,
     compiled: CompiledProfile,
+    source_device_id: DeviceId,
+    target_device_id: DeviceId,
     sequence: u64,
 }
 
@@ -3032,12 +3047,21 @@ fn transmit_desktop_capture_event(
         let profile = queued.profile_name.profile();
         let compiled = CompiledProfile::compile(&profile).map_err(|error| format!("{error:?}"))?;
         let config = client::ClientConfig::load(config_path)?;
-        let transport = connect_desktop_target_transport(config, &queued.target_device_id)?;
+        let identity = client::DeviceIdentity::load_or_generate(&config.identity_path)?;
+        let source_device_id = protocol_device_id_from_uuid(&identity.device_id)?;
+        let target_device_id = protocol_device_id_from_uuid(&queued.target_device_id)?;
+        let transport = connect_desktop_target_transport(
+            config,
+            &identity.device_id,
+            &queued.target_device_id,
+        )?;
         senders.insert(
             queued.target_device_id.clone(),
             DesktopTargetSender {
                 transport,
                 compiled,
+                source_device_id,
+                target_device_id,
                 sequence: 1,
             },
         );
@@ -3050,6 +3074,8 @@ fn transmit_desktop_capture_event(
     let mapped = target.compiled.transform(queued.event);
     let result = target.transport.send_event(
         &target_id,
+        target.source_device_id,
+        target.target_device_id,
         ProtocolEvent {
             sequence: target.sequence,
             timestamp_micros: now_micros()?,
@@ -3070,6 +3096,7 @@ fn transmit_desktop_capture_event(
 
 fn connect_desktop_target_transport(
     config: client::ClientConfig,
+    source_device_id: &str,
     target_device_id: &str,
 ) -> Result<DesktopTargetTransport, String> {
     match client::resolve_target_direct_lan_connection(config.clone(), target_device_id) {
@@ -3084,11 +3111,16 @@ fn connect_desktop_target_transport(
             eprintln!(
                 "desktop capture direct connection unavailable for {target_device_id}; using server relay: {direct_error}"
             );
-            let identity = client::DeviceIdentity::load_or_generate(&config.identity_path)?;
-            client::RelayFrameSender::connect(&config.server_url, &identity.device_id)
+            client::RelayFrameSender::connect(&config.server_url, source_device_id)
                 .map(DesktopTargetTransport::Relay)
         }
     }
+}
+
+fn protocol_device_id_from_uuid(device_id: &str) -> Result<DeviceId, String> {
+    uuid::Uuid::parse_str(device_id)
+        .map(|uuid| uuid.as_u128())
+        .map_err(|error| format!("device id '{device_id}' is not a UUID: {error}"))
 }
 
 fn next_transmit_event(
@@ -5503,6 +5535,47 @@ mod tests {
     }
 
     #[test]
+    fn desktop_direct_transport_preserves_target_device_id_in_input_envelope() {
+        let source_device_id = "11111111-1111-4111-8111-111111111111";
+        let target_device_id = "22222222-2222-4222-8222-222222222222";
+        let expected_source_id = uuid::Uuid::parse_str(source_device_id)
+            .expect("source uuid")
+            .as_u128();
+        let expected_target_id = uuid::Uuid::parse_str(target_device_id)
+            .expect("target uuid")
+            .as_u128();
+        let mut receiver = QuicEventReceiver::bind("127.0.0.1:0".parse().expect("bind address"))
+            .expect("bind receiver");
+        let sender = QuicEventSender::connect(receiver.local_addr().expect("local address"))
+            .expect("connect sender");
+        let mut transport = DesktopTargetTransport::Direct(sender);
+
+        transport
+            .send_event(
+                target_device_id,
+                expected_source_id,
+                expected_target_id,
+                ProtocolEvent {
+                    sequence: 7,
+                    timestamp_micros: 123,
+                    event: InputEvent::Key(KeyEvent {
+                        key: Key::A,
+                        state: KeyState::Pressed,
+                        modifiers: Modifiers::NONE,
+                    }),
+                },
+            )
+            .expect("send desktop event");
+
+        let frame = receiver.recv_frame().expect("receive frame");
+        let ProtocolPayload::Input(input) = frame.payload else {
+            panic!("expected input payload");
+        };
+        assert_eq!(input.source_device_id, expected_source_id);
+        assert_eq!(input.target_device_id, expected_target_id);
+    }
+
+    #[test]
     fn core_service_keeps_running_when_heartbeat_temporarily_fails() {
         let action = core_service_action_for_worker_result(CoreServiceThreadResult::Heartbeat(
             Err("request failed: connection refused".to_string()),
@@ -5530,24 +5603,24 @@ mod tests {
             .expect("workspace root");
         let macos = std::fs::read_to_string(root.join("packaging/macos/build-pkg.sh"))
             .expect("read macOS packaging script");
+        let normalized_macos = macos.replace("\r\n", "\n");
         let windows = std::fs::read_to_string(root.join("packaging/windows/kmsync.nsi"))
             .expect("read Windows packaging script");
 
-        assert!(macos.contains("<string>core-service</string>"));
-        assert!(macos.contains("APP_BUNDLE=\"/Applications/KMSync.app\""));
-        assert!(macos.contains("<string>/usr/bin/open</string>"));
-        assert!(macos.contains("<string>-W</string>"));
-        assert!(macos.contains("<string>-n</string>"));
-        assert!(macos.contains("<string>-g</string>"));
-        assert!(macos.contains("<string>-a</string>"));
-        assert!(macos.contains("<string>${APP_BUNDLE}</string>"));
-        assert!(macos.contains("<string>--args</string>"));
-        assert!(!macos.contains("<string>${APP_EXECUTABLE}</string>"));
-        assert!(!macos.contains("<string>/usr/local/bin/kmsync</string>"));
-        assert!(
-            !macos.contains("<string>/usr/local/share/kmsync/configs/daemon.example.json</string>")
-        );
-        assert!(macos.contains("<key>KeepAlive</key>\n  <true/>"));
+        assert!(normalized_macos.contains("<string>core-service</string>"));
+        assert!(normalized_macos.contains("APP_BUNDLE=\"/Applications/KMSync.app\""));
+        assert!(normalized_macos.contains("<string>/usr/bin/open</string>"));
+        assert!(normalized_macos.contains("<string>-W</string>"));
+        assert!(normalized_macos.contains("<string>-n</string>"));
+        assert!(normalized_macos.contains("<string>-g</string>"));
+        assert!(normalized_macos.contains("<string>-a</string>"));
+        assert!(normalized_macos.contains("<string>${APP_BUNDLE}</string>"));
+        assert!(normalized_macos.contains("<string>--args</string>"));
+        assert!(!normalized_macos.contains("<string>${APP_EXECUTABLE}</string>"));
+        assert!(!normalized_macos.contains("<string>/usr/local/bin/kmsync</string>"));
+        assert!(!normalized_macos
+            .contains("<string>/usr/local/share/kmsync/configs/daemon.example.json</string>"));
+        assert!(normalized_macos.contains("<key>KeepAlive</key>\n  <true/>"));
         assert!(windows.contains("\"$INSTDIR\\${APP_EXE}\" core-service"));
     }
 

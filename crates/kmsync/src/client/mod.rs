@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use kmsync_core::{
-    CompiledProfile, DesktopLayout, DesktopRole, InputEventEnvelope, Profile, ProtocolEvent,
-    ProtocolFrame, ProtocolPayload,
+    CompiledProfile, DesktopLayout, DesktopRole, DeviceId, InputEventEnvelope, Profile,
+    ProtocolEvent, ProtocolFrame, ProtocolPayload,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -863,17 +863,23 @@ impl RelayFrameSender {
         Ok(Self { socket })
     }
 
-    pub fn send_event(
+    pub fn send_input_event(
         &mut self,
-        target_device_id: &str,
+        relay_target_device_id: &str,
+        source_device_id: DeviceId,
+        target_device_id: DeviceId,
         event: ProtocolEvent,
     ) -> Result<(), String> {
         let frame = ProtocolFrame {
             sequence: event.sequence,
             timestamp_micros: event.timestamp_micros,
-            payload: ProtocolPayload::Input(InputEventEnvelope::current(0, 0, event.event)),
+            payload: ProtocolPayload::Input(InputEventEnvelope::current(
+                source_device_id,
+                target_device_id,
+                event.event,
+            )),
         };
-        self.send_frame(target_device_id, &frame)
+        self.send_frame(relay_target_device_id, &frame)
     }
 
     pub fn send_frame(
