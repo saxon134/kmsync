@@ -221,6 +221,13 @@ impl InputCaptureBackend for MacOsPlatform {
     where
         F: FnMut(CapturedInput) -> CaptureDecision + Send + 'static,
     {
+        if !macos_input_monitoring_granted() {
+            return Err(macos_input_monitoring_required_error());
+        }
+        if !macos_accessibility_trusted() {
+            return Err(macos_event_tap_required_error());
+        }
+
         let callback = RefCell::new(callback);
         with_enabled_macos_capture_tap(
             CGEventTapLocation::HID,
@@ -237,10 +244,16 @@ impl InputCaptureBackend for MacOsPlatform {
             },
             CFRunLoop::run_current,
         )
-        .map_err(|()| {
-            "failed to install macOS event tap; check Input Monitoring permission".to_string()
-        })
+        .map_err(|()| macos_event_tap_required_error())
     }
+}
+
+fn macos_input_monitoring_required_error() -> String {
+    "macOS Input Monitoring permission is missing for KMSync.app; open KMSync, click 申请权限, grant Input Monitoring, then restart KMSync".to_string()
+}
+
+fn macos_event_tap_required_error() -> String {
+    "failed to install macOS event tap; grant Accessibility and Input Monitoring to KMSync.app, make sure the core service is launched from /Applications/KMSync.app, then restart KMSync".to_string()
 }
 
 const MACOS_CAPTURE_EVENT_MASK: CGEventMask = event_mask_bit(CGEventType::KeyDown)
@@ -999,6 +1012,23 @@ mod tests {
             permission_status_from_bool(false),
             PermissionStatus::Missing
         );
+    }
+
+    #[test]
+    fn macos_input_monitoring_error_names_app_permission() {
+        let error = macos_input_monitoring_required_error();
+
+        assert!(error.contains("Input Monitoring"));
+        assert!(error.contains("KMSync.app"));
+    }
+
+    #[test]
+    fn macos_event_tap_error_names_both_privacy_permissions() {
+        let error = macos_event_tap_required_error();
+
+        assert!(error.contains("Accessibility"));
+        assert!(error.contains("Input Monitoring"));
+        assert!(error.contains("restart KMSync"));
     }
 
     #[test]

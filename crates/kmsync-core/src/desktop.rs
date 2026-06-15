@@ -136,6 +136,46 @@ pub struct DesktopPermissionState {
     pub guidance: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopSyncRuntimeKind {
+    Unknown,
+    Idle,
+    Listening,
+    Armed,
+    Failed,
+}
+
+impl Default for DesktopSyncRuntimeKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DesktopSyncRuntimeState {
+    #[serde(default)]
+    pub state: DesktopSyncRuntimeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+    #[serde(default)]
+    pub sent_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sent_at: Option<u64>,
+    #[serde(default)]
+    pub received_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_received_at: Option<u64>,
+    #[serde(default)]
+    pub injected_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_injected_at: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DesktopState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +195,8 @@ pub struct DesktopState {
     pub devices: Vec<DesktopPeerState>,
     #[serde(default)]
     pub permissions: Vec<DesktopPermissionState>,
+    #[serde(default)]
+    pub sync_runtime: DesktopSyncRuntimeState,
 }
 
 #[cfg(test)]
@@ -174,6 +216,88 @@ mod tests {
             layout.validate(Some("current-device")),
             Err(DesktopLayoutError::DuplicateTarget("device-a".to_string()))
         );
+    }
+
+    #[test]
+    fn desktop_state_defaults_missing_sync_runtime_to_unknown() {
+        let state: DesktopState = serde_json::from_str(
+            r#"{
+                "device": {
+                    "id": "client-device",
+                    "name": "Client",
+                    "os": "windows",
+                    "app_version": "0.1.0",
+                    "role": "client"
+                },
+                "network": {},
+                "server_state": "connected",
+                "master_state": "connecting",
+                "layout": {}
+            }"#,
+        )
+        .expect("deserialize desktop state");
+
+        assert_eq!(state.sync_runtime.state, DesktopSyncRuntimeKind::Unknown);
+        assert_eq!(state.sync_runtime.error, None);
+    }
+
+    #[test]
+    fn desktop_sync_runtime_serializes_failed_capture_status() {
+        let runtime = DesktopSyncRuntimeState {
+            state: DesktopSyncRuntimeKind::Failed,
+            error: Some("missing Input Monitoring".to_string()),
+            targets: vec!["right-device".to_string()],
+            updated_at: Some(123),
+            ..DesktopSyncRuntimeState::default()
+        };
+
+        let json = serde_json::to_string(&runtime).expect("serialize runtime");
+
+        assert!(json.contains(r#""state":"failed""#));
+        assert!(json.contains("missing Input Monitoring"));
+        assert!(json.contains("right-device"));
+    }
+
+    #[test]
+    fn desktop_sync_runtime_serializes_input_listener_status() {
+        let runtime = DesktopSyncRuntimeState {
+            state: DesktopSyncRuntimeKind::Listening,
+            error: None,
+            targets: Vec::new(),
+            updated_at: Some(123),
+            ..DesktopSyncRuntimeState::default()
+        };
+
+        let json = serde_json::to_string(&runtime).expect("serialize runtime");
+
+        assert!(json.contains(r#""state":"listening""#));
+    }
+
+    #[test]
+    fn desktop_sync_runtime_serializes_transfer_progress() {
+        let runtime = DesktopSyncRuntimeState {
+            state: DesktopSyncRuntimeKind::Armed,
+            error: None,
+            targets: vec!["right-device".to_string()],
+            updated_at: Some(123),
+            sent_events: 7,
+            last_sent_at: Some(120),
+            received_events: 5,
+            last_received_at: Some(121),
+            injected_events: 4,
+            last_injected_at: Some(122),
+        };
+
+        let json = serde_json::to_string(&runtime).expect("serialize runtime");
+        let decoded: DesktopSyncRuntimeState =
+            serde_json::from_str(&json).expect("deserialize runtime");
+
+        assert_eq!(decoded.sent_events, 7);
+        assert_eq!(decoded.last_sent_at, Some(120));
+        assert_eq!(decoded.received_events, 5);
+        assert_eq!(decoded.last_received_at, Some(121));
+        assert_eq!(decoded.injected_events, 4);
+        assert_eq!(decoded.last_injected_at, Some(122));
     }
 
     #[test]

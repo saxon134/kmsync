@@ -207,6 +207,26 @@ SCRIPT
 
 chmod 0755 "${PKG_ROOT}/usr/local/share/kmsync/uninstall-macos.sh"
 
+cat > "${SCRIPTS_DIR}/preinstall" <<SCRIPT
+#!/usr/bin/env bash
+set -euo pipefail
+
+launch_agent="/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist"
+console_user="\$(stat -f %Su /dev/console 2>/dev/null || true)"
+if [[ -n "\${console_user}" && "\${console_user}" != "root" && "\${console_user}" != "loginwindow" ]]; then
+  uid="\$(id -u "\${console_user}" 2>/dev/null || true)"
+  if [[ -n "\${uid}" ]]; then
+    launchctl bootout "gui/\${uid}" "\${launch_agent}" >/dev/null 2>&1 || true
+  fi
+fi
+
+pkill -f "/Applications/KMSync.app/Contents/MacOS/kmsync" >/dev/null 2>&1 || true
+rm -rf "/Applications/KMSync.app"
+rm -f "/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist"
+SCRIPT
+
+chmod 0755 "${SCRIPTS_DIR}/preinstall"
+
 cat > "${SCRIPTS_DIR}/postinstall" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail

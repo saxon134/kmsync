@@ -37,6 +37,7 @@ Section "Install"
   CreateShortCut "$SMPROGRAMS\KMSync\KMSync info.lnk" "$INSTDIR\${APP_EXE}" "info"
   nsExec::ExecToLog 'sc.exe create "${SERVICE_NAME}" binPath= "\"$INSTDIR\${APP_EXE}\" windows-service" DisplayName= "${SERVICE_DISPLAY_NAME}" start= auto'
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "KMSync" '"$INSTDIR\${APP_EXE}" core-service'
+  ExecShell "open" "$INSTDIR\${APP_EXE}" "core-service" SW_HIDE
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KMSync" "DisplayName" "${APP_NAME}"

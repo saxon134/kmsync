@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -356,7 +357,12 @@ fn run_with_args(args: impl Iterator<Item = String>) -> Result<(), DaemonError> 
 fn run_desktop(config_path: &Path, output_path: Option<&Path>) -> Result<(), String> {
     ensure_daemon_config_file(config_path)?;
     match desktop_launch_mode(output_path) {
-        DesktopLaunchMode::NativeWindow => return native_desktop::run_native_desktop(config_path),
+        DesktopLaunchMode::NativeWindow => {
+            if let Err(error) = ensure_core_service_for_desktop(config_path) {
+                eprintln!("desktop core-service autostart failed: {error}");
+            }
+            return native_desktop::run_native_desktop(config_path);
+        }
         DesktopLaunchMode::HtmlExport(output_path) => {
             let state = build_local_desktop_state(config_path)?;
             let html = kmsync_ui::desktop_panel::render_desktop_panel(&state)?;
@@ -378,6 +384,244 @@ fn desktop_launch_mode(output_path: Option<&Path>) -> DesktopLaunchMode {
         return DesktopLaunchMode::NativeWindow;
     };
     DesktopLaunchMode::HtmlExport(output_path.to_path_buf())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoreServiceAutostartCommand {
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CoreServiceAutostartAction {
+    AlreadyRunning,
+    Start(CoreServiceAutostartCommand),
+    Restart {
+        stop: CoreServiceAutostartCommand,
+        start: CoreServiceAutostartCommand,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoreServiceHealth {
+    version: String,
+    input_hot_path: String,
+}
+
+fn ensure_core_service_for_desktop(config_path: &Path) -> Result<(), String> {
+    let endpoint = local_ipc::default_local_ipc_endpoint();
+    let health_result = read_core_service_health(&endpoint);
+    let exe_path =
+        env::current_exe().map_err(|error| format!("failed to locate kmsync: {error}"))?;
+    match desktop_core_service_autostart_action(
+        health_result,
+        &exe_path,
+        config_path,
+        env::consts::OS,
+    ) {
+        CoreServiceAutostartAction::AlreadyRunning => Ok(()),
+        CoreServiceAutostartAction::Start(command) => spawn_core_service_autostart(command),
+        CoreServiceAutostartAction::Restart { stop, start } => {
+            run_core_service_stop_command(stop)?;
+            thread::sleep(Duration::from_millis(200));
+            spawn_core_service_autostart(start)
+        }
+    }
+}
+
+fn desktop_core_service_autostart_action(
+    core_service_health: Result<CoreServiceHealth, String>,
+    exe_path: &Path,
+    config_path: &Path,
+    os: &str,
+) -> CoreServiceAutostartAction {
+    if core_service_health
+        .as_ref()
+        .is_ok_and(core_service_health_is_compatible)
+    {
+        return CoreServiceAutostartAction::AlreadyRunning;
+    }
+
+    if os == "macos" {
+        if let Some(app_bundle) = macos_app_bundle_path_from_executable(exe_path) {
+            let start = macos_app_core_service_start_command(&app_bundle, config_path);
+            if core_service_health.as_ref().is_ok() {
+                return CoreServiceAutostartAction::Restart {
+                    stop: macos_app_core_service_stop_command(&app_bundle),
+                    start,
+                };
+            }
+            return CoreServiceAutostartAction::Start(start);
+        }
+    }
+
+    if os == "windows" && is_windows_installed_package_executable(exe_path) {
+        let start = portable_core_service_start_command(exe_path, config_path);
+        if core_service_health.as_ref().is_ok() {
+            return CoreServiceAutostartAction::Restart {
+                stop: windows_installed_core_service_stop_command(exe_path),
+                start,
+            };
+        }
+        return CoreServiceAutostartAction::Start(start);
+    }
+
+    let start = portable_core_service_start_command(exe_path, config_path);
+    if os == "windows" && core_service_health.as_ref().is_ok() {
+        return CoreServiceAutostartAction::Restart {
+            stop: windows_installed_core_service_stop_command(exe_path),
+            start,
+        };
+    }
+
+    CoreServiceAutostartAction::Start(start)
+}
+
+fn portable_core_service_start_command(
+    exe_path: &Path,
+    config_path: &Path,
+) -> CoreServiceAutostartCommand {
+    CoreServiceAutostartCommand {
+        program: exe_path.to_path_buf(),
+        args: vec![
+            "core-service".to_string(),
+            config_path.display().to_string(),
+        ],
+    }
+}
+
+fn core_service_health_is_compatible(health: &CoreServiceHealth) -> bool {
+    health.version == env!("CARGO_PKG_VERSION") && health.input_hot_path == "daemon_data_plane"
+}
+
+fn macos_app_core_service_start_command(
+    app_bundle: &Path,
+    config_path: &Path,
+) -> CoreServiceAutostartCommand {
+    CoreServiceAutostartCommand {
+        program: PathBuf::from("/usr/bin/open"),
+        args: vec![
+            "-n".to_string(),
+            "-g".to_string(),
+            "-a".to_string(),
+            app_bundle.display().to_string(),
+            "--args".to_string(),
+            "core-service".to_string(),
+            config_path.display().to_string(),
+        ],
+    }
+}
+
+fn macos_app_core_service_stop_command(app_bundle: &Path) -> CoreServiceAutostartCommand {
+    let binary_pattern = pkill_regex_escape(
+        &app_bundle
+            .join("Contents")
+            .join("MacOS")
+            .join("kmsync")
+            .display()
+            .to_string(),
+    );
+    CoreServiceAutostartCommand {
+        program: PathBuf::from("/usr/bin/pkill"),
+        args: vec!["-f".to_string(), format!("{binary_pattern} .*core-service")],
+    }
+}
+
+fn pkill_regex_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(
+            character,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn windows_installed_core_service_stop_command(exe_path: &Path) -> CoreServiceAutostartCommand {
+    let exe_path = powershell_single_quoted(&exe_path.display().to_string());
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -eq {exe_path} -and $_.CommandLine -match '(^|\\s)core-service(\\s|$)' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
+    );
+    CoreServiceAutostartCommand {
+        program: PathBuf::from("powershell.exe"),
+        args: vec![
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-Command".to_string(),
+            script,
+        ],
+    }
+}
+
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn read_core_service_health(
+    endpoint: &local_ipc::LocalIpcEndpoint,
+) -> Result<CoreServiceHealth, String> {
+    let mut client =
+        local_ipc::LocalIpcClient::connect(endpoint).map_err(|error| error.to_string())?;
+    match client
+        .request(&local_ipc::LocalIpcRequest::Status)
+        .map_err(|error| error.to_string())?
+    {
+        local_ipc::LocalIpcResponse::Status {
+            service,
+            version,
+            input_hot_path,
+            ..
+        } if service == "kmsync" => Ok(CoreServiceHealth {
+            version,
+            input_hot_path,
+        }),
+        local_ipc::LocalIpcResponse::Status { service, .. } => {
+            Err(format!("unexpected local IPC service '{service}'"))
+        }
+        local_ipc::LocalIpcResponse::Error { code, message } => {
+            Err(format!("local IPC error {code}: {message}"))
+        }
+        response => Err(format!("unexpected local IPC response: {response:?}")),
+    }
+}
+
+fn spawn_core_service_autostart(command: CoreServiceAutostartCommand) -> Result<(), String> {
+    std::process::Command::new(&command.program)
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "failed to start {} {}: {error}",
+                command.program.display(),
+                command.args.join(" ")
+            )
+        })
+}
+
+fn run_core_service_stop_command(command: CoreServiceAutostartCommand) -> Result<(), String> {
+    std::process::Command::new(&command.program)
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "failed to stop existing core-service with {} {}: {error}",
+                command.program.display(),
+                command.args.join(" ")
+            )
+        })
 }
 
 fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopState, String> {
@@ -421,22 +665,72 @@ fn build_local_desktop_state(config_path: &Path) -> Result<kmsync_core::DesktopS
         server_error = Some("服务器未连接，无法刷新设备列表".to_string());
     }
     let permissions = platform::current_platform().permission_checks();
-    Ok(desktop_state::build_desktop_state(
-        desktop_state::DesktopStateBuildInput {
-            config_path,
-            device_name: &client_config.device_name,
-            server_url: &client_config.server_url,
-            listen_port: client_config.listen_port,
-            current_device_id: current_device_id.as_deref(),
-            local_lan_ips,
-            desktop_config: &desktop_config,
-            devices: &devices,
-            permissions: &permissions,
-            server_state,
-            server_error,
-            master_error,
-        },
-    ))
+    let mut state = desktop_state::build_desktop_state(desktop_state::DesktopStateBuildInput {
+        config_path,
+        device_name: &client_config.device_name,
+        server_url: &client_config.server_url,
+        listen_port: client_config.listen_port,
+        current_device_id: current_device_id.as_deref(),
+        local_lan_ips,
+        desktop_config: &desktop_config,
+        devices: &devices,
+        permissions: &permissions,
+        server_state,
+        server_error,
+        master_error,
+    });
+    attach_desktop_sync_runtime_status(config_path, &mut state)?;
+    Ok(state)
+}
+
+fn attach_desktop_sync_runtime_status(
+    config_path: &Path,
+    state: &mut kmsync_core::DesktopState,
+) -> Result<(), String> {
+    let runtime = read_desktop_sync_runtime_status(config_path)?;
+    if runtime.state == kmsync_core::DesktopSyncRuntimeKind::Failed {
+        let error = runtime
+            .error
+            .clone()
+            .unwrap_or_else(|| "同步通道运行失败".to_string());
+        if state.master_error.is_none() {
+            state.master_error = Some(format!("同步通道失败：{error}"));
+        }
+    }
+    state.sync_runtime = runtime;
+    Ok(())
+}
+
+pub(crate) fn attach_current_core_service_health_status(state: &mut kmsync_core::DesktopState) {
+    let endpoint = local_ipc::default_local_ipc_endpoint();
+    attach_core_service_health_status(state, read_core_service_health(&endpoint));
+}
+
+fn attach_core_service_health_status(
+    state: &mut kmsync_core::DesktopState,
+    health: Result<CoreServiceHealth, String>,
+) {
+    let Ok(health) = health else {
+        return;
+    };
+    if core_service_health_is_compatible(&health) {
+        return;
+    }
+    if state.master_error.is_none() {
+        state.master_error = Some(core_service_health_issue_message(&health));
+    }
+}
+
+fn core_service_health_issue_message(health: &CoreServiceHealth) -> String {
+    let issue = if health.input_hot_path == "daemon_data_plane" {
+        "后台服务版本不兼容"
+    } else {
+        "检测到旧后台服务或非同步热路径"
+    };
+    format!(
+        "{issue}，同步通道无法工作，请重新安装或重启 KMSync。version={} input_hot_path={}",
+        health.version, health.input_hot_path
+    )
 }
 
 fn load_and_cache_server_topology(
@@ -551,6 +845,16 @@ fn run_local_ipc_serve_once(endpoint: &local_ipc::LocalIpcEndpoint) -> Result<()
 }
 
 fn run_local_ipc_ping(endpoint: &local_ipc::LocalIpcEndpoint) -> Result<(), String> {
+    ping_local_ipc_endpoint(endpoint)?;
+    println!(
+        "local_ipc=ok transport={} address={}",
+        endpoint.transport.as_str(),
+        endpoint.address
+    );
+    Ok(())
+}
+
+fn ping_local_ipc_endpoint(endpoint: &local_ipc::LocalIpcEndpoint) -> Result<(), String> {
     let nonce = u64::try_from(unix_timestamp_millis()).unwrap_or(u64::MAX);
     let mut client =
         local_ipc::LocalIpcClient::connect(endpoint).map_err(|error| error.to_string())?;
@@ -560,14 +864,7 @@ fn run_local_ipc_ping(endpoint: &local_ipc::LocalIpcEndpoint) -> Result<(), Stri
     {
         local_ipc::LocalIpcResponse::Pong {
             nonce: response_nonce,
-        } if response_nonce == nonce => {
-            println!(
-                "local_ipc=ok transport={} address={}",
-                endpoint.transport.as_str(),
-                endpoint.address
-            );
-            Ok(())
-        }
+        } if response_nonce == nonce => Ok(()),
         local_ipc::LocalIpcResponse::Error { code, message } => {
             Err(format!("local IPC error {code}: {message}"))
         }
@@ -587,10 +884,15 @@ fn handle_local_ipc_request_with_config_path(
         local_ipc::LocalIpcRequest::Ping { nonce } => local_ipc::LocalIpcResponse::Pong { nonce },
         local_ipc::LocalIpcRequest::Status => {
             let endpoint = local_ipc::default_local_ipc_endpoint();
+            let input_hot_path = if config_path.is_some() {
+                "daemon_data_plane"
+            } else {
+                "not_on_local_ipc"
+            };
             local_ipc::LocalIpcResponse::Status {
                 service: "kmsync".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                input_hot_path: "not_on_local_ipc".to_string(),
+                input_hot_path: input_hot_path.to_string(),
                 platform_transport: endpoint.transport.as_str().to_string(),
             }
         }
@@ -946,6 +1248,199 @@ fn desktop_capture_plan_from_state(state: &kmsync_core::DesktopState) -> Desktop
     DesktopCapturePlan { targets }
 }
 
+fn desktop_capture_idle_log_line() -> &'static str {
+    "desktop_capture=idle reason=no_online_layout_targets"
+}
+
+fn desktop_capture_plan_log_line(plan: &DesktopCapturePlan) -> String {
+    let targets = plan
+        .targets
+        .iter()
+        .map(|target| {
+            format!(
+                "target={} edge={} profile={}",
+                target.target_device_id,
+                target.edge.as_str(),
+                target.profile_name.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "desktop_capture=armed targets={} {}",
+        plan.targets.len(),
+        targets
+    )
+}
+
+fn desktop_capture_idle_runtime_status() -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Idle,
+        error: None,
+        targets: Vec::new(),
+        updated_at: None,
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+fn desktop_capture_plan_runtime_status(
+    plan: &DesktopCapturePlan,
+) -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+        error: None,
+        targets: desktop_capture_plan_target_ids(plan),
+        updated_at: None,
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+fn desktop_capture_failed_runtime_status(
+    plan: &DesktopCapturePlan,
+    error: &str,
+) -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Failed,
+        error: Some(error.to_string()),
+        targets: desktop_capture_plan_target_ids(plan),
+        updated_at: None,
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+fn desktop_capture_plan_target_ids(plan: &DesktopCapturePlan) -> Vec<String> {
+    plan.targets
+        .iter()
+        .map(|target| target.target_device_id.clone())
+        .collect()
+}
+
+fn desktop_input_listener_runtime_status() -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+        error: None,
+        targets: Vec::new(),
+        updated_at: None,
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+fn desktop_input_listener_progress_runtime_status(
+    received_events: u64,
+    last_received_at: u64,
+) -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+        error: None,
+        targets: Vec::new(),
+        updated_at: None,
+        received_events,
+        last_received_at: Some(last_received_at),
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+fn desktop_input_injection_progress_runtime_status(
+    injected_events: u64,
+    last_injected_at: u64,
+) -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+        error: None,
+        targets: Vec::new(),
+        updated_at: None,
+        injected_events,
+        last_injected_at: Some(last_injected_at),
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+fn desktop_input_listener_failed_runtime_status(
+    error: &str,
+) -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Failed,
+        error: Some(error.to_string()),
+        targets: Vec::new(),
+        updated_at: None,
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+fn desktop_capture_transmit_failed_runtime_status(
+    target_device_id: &str,
+    error: &str,
+) -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Failed,
+        error: Some(format!("发送到 {target_device_id} 失败：{error}")),
+        targets: vec![target_device_id.to_string()],
+        updated_at: None,
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+#[cfg(test)]
+fn desktop_capture_transmit_recovered_runtime_status<'a>(
+    target_device_ids: impl IntoIterator<Item = &'a str>,
+) -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+        error: None,
+        targets: target_device_ids.into_iter().map(str::to_string).collect(),
+        updated_at: None,
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+fn desktop_capture_transmit_progress_runtime_status<'a>(
+    target_device_ids: impl IntoIterator<Item = &'a str>,
+    sent_events: u64,
+    last_sent_at: u64,
+) -> kmsync_core::DesktopSyncRuntimeState {
+    kmsync_core::DesktopSyncRuntimeState {
+        state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+        error: None,
+        targets: target_device_ids.into_iter().map(str::to_string).collect(),
+        updated_at: None,
+        sent_events,
+        last_sent_at: Some(last_sent_at),
+        ..kmsync_core::DesktopSyncRuntimeState::default()
+    }
+}
+
+fn desktop_sync_runtime_status_path(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("desktop-runtime.json")
+}
+
+fn read_desktop_sync_runtime_status(
+    config_path: &Path,
+) -> Result<kmsync_core::DesktopSyncRuntimeState, String> {
+    let path = desktop_sync_runtime_status_path(config_path);
+    if !path.exists() {
+        return Ok(kmsync_core::DesktopSyncRuntimeState::default());
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+fn write_desktop_sync_runtime_status(
+    config_path: &Path,
+    runtime: &kmsync_core::DesktopSyncRuntimeState,
+) -> Result<(), String> {
+    let mut runtime = runtime.clone();
+    runtime.updated_at = Some(unix_timestamp_seconds());
+    let text = serde_json::to_string_pretty(&runtime)
+        .map(|mut text| {
+            text.push('\n');
+            text
+        })
+        .map_err(|error| format!("failed to encode desktop runtime status: {error}"))?;
+    local_config::write_text_atomic(&desktop_sync_runtime_status_path(config_path), &text)
+}
+
 fn desktop_layout_edge_targets(layout: &kmsync_core::DesktopLayout) -> Vec<(Edge, &str)> {
     [
         (Edge::Left, layout.left.as_deref()),
@@ -1047,11 +1542,15 @@ fn run_core_service(config_path: &Path) -> Result<(), String> {
 
     let bind = plan.bind;
     let data_plane_config = config.clone();
+    let data_plane_runtime_config_path = plan.config_path.clone();
     let data_plane_result_tx = result_tx.clone();
     thread::spawn(move || {
-        let _ = data_plane_result_tx.send(CoreServiceThreadResult::DataPlane(
-            run_listener_with_relay(bind, Some(data_plane_config)),
-        ));
+        let _ =
+            data_plane_result_tx.send(CoreServiceThreadResult::DataPlane(run_listener_with_relay(
+                bind,
+                Some(data_plane_config),
+                Some(data_plane_runtime_config_path),
+            )));
     });
 
     let heartbeat_result_tx = result_tx.clone();
@@ -1084,10 +1583,25 @@ fn run_core_service(config_path: &Path) -> Result<(), String> {
 }
 
 fn run_desktop_capture_supervisor(config_path: &Path) -> Result<(), String> {
+    let mut logged_idle = false;
     loop {
         let state = build_local_desktop_state(config_path)?;
+        if !desktop_capture_supervisor_should_manage_runtime(&state) {
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        }
         let plan = desktop_capture_plan_from_state(&state);
         if plan.targets.is_empty() {
+            if let Err(error) = write_desktop_sync_runtime_status(
+                config_path,
+                &desktop_capture_idle_runtime_status(),
+            ) {
+                eprintln!("desktop capture runtime status write failed: {error}");
+            }
+            if !logged_idle {
+                eprintln!("{}", desktop_capture_idle_log_line());
+                logged_idle = true;
+            }
             thread::sleep(Duration::from_secs(2));
             continue;
         }
@@ -1095,7 +1609,18 @@ fn run_desktop_capture_supervisor(config_path: &Path) -> Result<(), String> {
     }
 }
 
+fn desktop_capture_supervisor_should_manage_runtime(state: &kmsync_core::DesktopState) -> bool {
+    state.device.role == kmsync_core::DesktopRole::Master
+}
+
 fn run_desktop_capture_plan(config_path: &Path, plan: DesktopCapturePlan) -> Result<(), String> {
+    eprintln!("{}", desktop_capture_plan_log_line(&plan));
+    if let Err(error) =
+        write_desktop_sync_runtime_status(config_path, &desktop_capture_plan_runtime_status(&plan))
+    {
+        eprintln!("desktop capture runtime status write failed: {error}");
+    }
+    let runtime_plan = plan.clone();
     let mut platform = platform::current_platform();
     let display_layout = platform.display_layout();
     let mut router = DesktopCaptureRouter::with_display_layout(plan, display_layout);
@@ -1119,6 +1644,14 @@ fn run_desktop_capture_plan(config_path: &Path, plan: DesktopCapturePlan) -> Res
         route.route.decision
     });
     restore_local_pointer_if_hidden(&local_pointer_hidden, None);
+    if let Err(error) = &capture_result {
+        if let Err(write_error) = write_desktop_sync_runtime_status(
+            config_path,
+            &desktop_capture_failed_runtime_status(&runtime_plan, error),
+        ) {
+            eprintln!("desktop capture runtime status write failed: {write_error}");
+        }
+    }
     capture_result
 }
 
@@ -1298,14 +1831,25 @@ fn input_event_log_type(event: &InputEvent) -> &'static str {
 }
 
 fn run_listener(bind: SocketAddr) -> Result<(), String> {
-    run_listener_with_relay(bind, None)
+    run_listener_with_relay(bind, None, None)
 }
 
 fn run_listener_with_relay(
     bind: SocketAddr,
     relay_config: Option<client::ClientConfig>,
+    runtime_config_path: Option<PathBuf>,
 ) -> Result<(), String> {
-    let receiver = QuicEventReceiver::bind(bind)?;
+    let receiver = match QuicEventReceiver::bind(bind) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            write_input_listener_failed_runtime_status_if_configured(
+                runtime_config_path.as_deref(),
+                &error,
+            );
+            return Err(error);
+        }
+    };
+    write_input_listener_runtime_status_if_configured(runtime_config_path.as_deref());
     let (input_tx, input_rx) = sync_channel(1024);
     let (clipboard_tx, clipboard_rx) = sync_channel(16);
     let (control_tx, control_rx) = sync_channel(32);
@@ -1318,6 +1862,7 @@ fn run_listener_with_relay(
     let receive_control_tx = control_tx.clone();
     let receive_result_tx = result_tx.clone();
     let receive_latency_stats = latency_stats.clone();
+    let receive_runtime_config_path = runtime_config_path.clone();
     thread::spawn(move || {
         let mut receiver = receiver;
         let result = receive_remote_frames(
@@ -1326,6 +1871,7 @@ fn run_listener_with_relay(
             receive_clipboard_tx,
             receive_control_tx,
             receive_latency_stats,
+            receive_runtime_config_path,
         );
         let _ = receive_result_tx.send(ListenerThreadResult::Receive(result));
     });
@@ -1335,6 +1881,7 @@ fn run_listener_with_relay(
         let relay_clipboard_tx = clipboard_tx.clone();
         let relay_control_tx = control_tx.clone();
         let relay_latency_stats = latency_stats.clone();
+        let relay_runtime_config_path = runtime_config_path.clone();
         thread::spawn(move || {
             run_relay_receive_loop(
                 config,
@@ -1342,15 +1889,22 @@ fn run_listener_with_relay(
                 relay_clipboard_tx,
                 relay_control_tx,
                 relay_latency_stats,
+                relay_runtime_config_path,
             );
         });
     }
 
     let injection_result_tx = result_tx.clone();
     let injection_latency_stats = latency_stats.clone();
+    let injection_runtime_config_path = runtime_config_path.clone();
     thread::spawn(move || {
         let mut adapter = platform::current_platform();
-        let result = inject_received_frames(input_rx, &mut adapter, injection_latency_stats);
+        let result = inject_received_frames(
+            input_rx,
+            &mut adapter,
+            injection_latency_stats,
+            injection_runtime_config_path,
+        );
         let _ = injection_result_tx.send(ListenerThreadResult::Injection(result));
     });
 
@@ -1367,7 +1921,40 @@ fn run_listener_with_relay(
         let _ = control_result_tx.send(ListenerThreadResult::Control(result));
     });
 
-    wait_listener_results(result_rx)
+    let result = wait_listener_results(result_rx);
+    if let Err(error) = &result {
+        write_input_listener_failed_runtime_status_if_configured(
+            runtime_config_path.as_deref(),
+            error,
+        );
+    }
+    result
+}
+
+fn write_input_listener_runtime_status_if_configured(config_path: Option<&Path>) {
+    let Some(config_path) = config_path else {
+        return;
+    };
+    if let Err(error) =
+        write_desktop_sync_runtime_status(config_path, &desktop_input_listener_runtime_status())
+    {
+        eprintln!("desktop input listener runtime status write failed: {error}");
+    }
+}
+
+fn write_input_listener_failed_runtime_status_if_configured(
+    config_path: Option<&Path>,
+    error: &str,
+) {
+    let Some(config_path) = config_path else {
+        return;
+    };
+    if let Err(write_error) = write_desktop_sync_runtime_status(
+        config_path,
+        &desktop_input_listener_failed_runtime_status(error),
+    ) {
+        eprintln!("desktop input listener runtime status write failed: {write_error}");
+    }
 }
 
 enum ListenerThreadResult {
@@ -1463,6 +2050,7 @@ fn run_relay_receive_loop(
     clipboard_tx: SyncSender<ReceivedClipboardFrame>,
     control_tx: SyncSender<ReceivedControlFrame>,
     stats: ListenerLatencyStats,
+    runtime_config_path: Option<PathBuf>,
 ) {
     loop {
         let identity = match client::DeviceIdentity::load_or_generate(&config.identity_path) {
@@ -1489,6 +2077,7 @@ fn run_relay_receive_loop(
             clipboard_tx.clone(),
             control_tx.clone(),
             stats.clone(),
+            runtime_config_path.clone(),
         ) {
             eprintln!("relay receive disconnected; reconnecting: {error}");
             thread::sleep(Duration::from_secs(2));
@@ -1659,7 +2248,10 @@ fn receive_remote_frames(
     clipboard_tx: SyncSender<ReceivedClipboardFrame>,
     control_tx: SyncSender<ReceivedControlFrame>,
     stats: ListenerLatencyStats,
+    runtime_config_path: Option<PathBuf>,
 ) -> Result<(), String> {
+    let mut received_events = 0_u64;
+    let mut last_progress_write = None;
     loop {
         let frame = receiver.recv_frame()?;
         let received_at = Instant::now();
@@ -1671,7 +2263,25 @@ fn receive_remote_frames(
                 );
                 input_tx
                     .send(ReceivedInputFrame { frame, received_at })
-                    .map_err(|_| "input injection thread is disconnected".to_string())?
+                    .map_err(|_| "input injection thread is disconnected".to_string())?;
+                received_events = received_events.saturating_add(1);
+                if desktop_runtime_progress_write_due(last_progress_write, Instant::now()) {
+                    last_progress_write = Some(Instant::now());
+                    if let Some(config_path) = runtime_config_path.as_deref() {
+                        let timestamp = unix_timestamp_seconds();
+                        if let Err(write_error) = write_desktop_sync_runtime_status(
+                            config_path,
+                            &desktop_input_listener_progress_runtime_status(
+                                received_events,
+                                timestamp,
+                            ),
+                        ) {
+                            eprintln!(
+                                "desktop input listener runtime status write failed: {write_error}"
+                            );
+                        }
+                    }
+                }
             }
             ProtocolPayload::ClipboardText(clipboard) => {
                 let bytes = clipboard.text.len();
@@ -1718,59 +2328,77 @@ fn inject_received_frames(
     rx: Receiver<ReceivedInputFrame>,
     adapter: &mut impl InputInjector,
     stats: ListenerLatencyStats,
+    runtime_config_path: Option<PathBuf>,
 ) -> Result<(), String> {
     let mut remote_input = RemoteInputState::default();
     let mut current_target_device_id = None;
     let mut reliable_input = ReliableInputSequencer::new();
+    let mut injected_events = 0_u64;
+    let mut last_progress_write = None;
     for received in rx {
         if is_reliable_input_frame(&received) {
             match reliable_input.accept(received) {
                 ReliableInputDecision::Inject(ready) => {
-                    inject_received_input_frame(
+                    inject_received_input_frame_and_record(
                         ready,
                         adapter,
                         &mut remote_input,
                         &mut current_target_device_id,
                         &stats,
+                        runtime_config_path.as_deref(),
+                        &mut injected_events,
+                        &mut last_progress_write,
                     )?;
                     while let Some(ready) = reliable_input.pop_ready() {
-                        inject_received_input_frame(
+                        inject_received_input_frame_and_record(
                             ready,
                             adapter,
                             &mut remote_input,
                             &mut current_target_device_id,
                             &stats,
+                            runtime_config_path.as_deref(),
+                            &mut injected_events,
+                            &mut last_progress_write,
                         )?;
                     }
                 }
                 ReliableInputDecision::Recover(ready) => {
                     release_tracked_input(adapter, &mut remote_input)?;
-                    inject_received_input_frame(
+                    inject_received_input_frame_and_record(
                         ready,
                         adapter,
                         &mut remote_input,
                         &mut current_target_device_id,
                         &stats,
+                        runtime_config_path.as_deref(),
+                        &mut injected_events,
+                        &mut last_progress_write,
                     )?;
                     while let Some(ready) = reliable_input.pop_ready() {
-                        inject_received_input_frame(
+                        inject_received_input_frame_and_record(
                             ready,
                             adapter,
                             &mut remote_input,
                             &mut current_target_device_id,
                             &stats,
+                            runtime_config_path.as_deref(),
+                            &mut injected_events,
+                            &mut last_progress_write,
                         )?;
                     }
                 }
                 ReliableInputDecision::Buffer | ReliableInputDecision::Drop => {}
             }
         } else {
-            inject_received_input_frame(
+            inject_received_input_frame_and_record(
                 received,
                 adapter,
                 &mut remote_input,
                 &mut current_target_device_id,
                 &stats,
+                runtime_config_path.as_deref(),
+                &mut injected_events,
+                &mut last_progress_write,
             )?;
         }
     }
@@ -1779,6 +2407,39 @@ fn inject_received_frames(
 
 fn is_reliable_input_frame(received: &ReceivedInputFrame) -> bool {
     received.frame.payload.transport_lane() == TransportLane::InputReliable
+}
+
+fn inject_received_input_frame_and_record(
+    received: ReceivedInputFrame,
+    adapter: &mut impl InputInjector,
+    remote_input: &mut RemoteInputState,
+    current_target_device_id: &mut Option<DeviceId>,
+    stats: &ListenerLatencyStats,
+    runtime_config_path: Option<&Path>,
+    injected_events: &mut u64,
+    last_progress_write: &mut Option<Instant>,
+) -> Result<(), String> {
+    inject_received_input_frame(
+        received,
+        adapter,
+        remote_input,
+        current_target_device_id,
+        stats,
+    )?;
+    *injected_events = injected_events.saturating_add(1);
+    if desktop_runtime_progress_write_due(*last_progress_write, Instant::now()) {
+        *last_progress_write = Some(Instant::now());
+        if let Some(config_path) = runtime_config_path {
+            let timestamp = unix_timestamp_seconds();
+            if let Err(write_error) = write_desktop_sync_runtime_status(
+                config_path,
+                &desktop_input_injection_progress_runtime_status(*injected_events, timestamp),
+            ) {
+                eprintln!("desktop input injection runtime status write failed: {write_error}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn inject_received_input_frame(
@@ -2647,6 +3308,13 @@ fn unix_timestamp_millis() -> u128 {
         .as_millis()
 }
 
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn crash_report_from_panic_parts(
     timestamp_millis: u128,
     payload: &(dyn std::any::Any + Send),
@@ -2994,6 +3662,12 @@ enum DesktopTargetTransport {
     Relay(client::RelayFrameSender),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DesktopTargetTransportSelection<D, R> {
+    Direct(D),
+    Relay(R),
+}
+
 impl DesktopTargetTransport {
     fn send_event(
         &mut self,
@@ -3030,12 +3704,48 @@ fn transmit_desktop_capture_events(
     stats: CaptureQueueStats,
 ) {
     let mut senders = BTreeMap::new();
+    let mut transmit_failed = false;
+    let mut sent_events = 0_u64;
+    let mut last_progress_write = None;
     for queued in rx {
+        let target_device_id = queued.target_device_id.clone();
         stats.record_capture_to_send_latency(queued.captured_at.elapsed());
         if let Err(error) = transmit_desktop_capture_event(&config_path, &mut senders, queued) {
             eprintln!("desktop capture transmit failed: {error}");
+            transmit_failed = true;
+            if let Err(write_error) = write_desktop_sync_runtime_status(
+                &config_path,
+                &desktop_capture_transmit_failed_runtime_status(&target_device_id, &error),
+            ) {
+                eprintln!("desktop capture runtime status write failed: {write_error}");
+            }
+            continue;
+        }
+
+        sent_events = sent_events.saturating_add(1);
+        if transmit_failed
+            || desktop_runtime_progress_write_due(last_progress_write, Instant::now())
+        {
+            transmit_failed = false;
+            last_progress_write = Some(Instant::now());
+            let timestamp = unix_timestamp_seconds();
+            if let Err(write_error) = write_desktop_sync_runtime_status(
+                &config_path,
+                &desktop_capture_transmit_progress_runtime_status(
+                    senders.keys().map(String::as_str),
+                    sent_events,
+                    timestamp,
+                ),
+            ) {
+                eprintln!("desktop capture runtime status write failed: {write_error}");
+            }
         }
     }
+}
+
+fn desktop_runtime_progress_write_due(last_write: Option<Instant>, now: Instant) -> bool {
+    const INTERVAL: Duration = Duration::from_secs(2);
+    last_write.is_none_or(|last_write| now.duration_since(last_write) >= INTERVAL)
 }
 
 fn transmit_desktop_capture_event(
@@ -3099,20 +3809,68 @@ fn connect_desktop_target_transport(
     source_device_id: &str,
     target_device_id: &str,
 ) -> Result<DesktopTargetTransport, String> {
-    match client::resolve_target_direct_lan_connection(config.clone(), target_device_id) {
-        Ok(connection) => {
-            println!(
-                "desktop capture direct connection selected {:?} {} for {}",
-                connection.candidate.kind, connection.address, target_device_id
-            );
-            QuicEventSender::connect(connection.address).map(DesktopTargetTransport::Direct)
+    let server_url = config.server_url.clone();
+    match connect_desktop_target_transport_with(
+        &server_url,
+        source_device_id,
+        target_device_id,
+        |target_device_id| client::resolve_target_direct_lan_connection(config, target_device_id),
+        QuicEventSender::connect,
+        client::RelayFrameSender::connect,
+    )? {
+        DesktopTargetTransportSelection::Direct(sender) => {
+            Ok(DesktopTargetTransport::Direct(sender))
         }
+        DesktopTargetTransportSelection::Relay(sender) => Ok(DesktopTargetTransport::Relay(sender)),
+    }
+}
+
+fn connect_desktop_target_transport_with<D, R, ResolveDirect, ConnectDirect, ConnectRelay>(
+    server_url: &str,
+    source_device_id: &str,
+    target_device_id: &str,
+    resolve_direct: ResolveDirect,
+    connect_direct: ConnectDirect,
+    connect_relay: ConnectRelay,
+) -> Result<DesktopTargetTransportSelection<D, R>, String>
+where
+    ResolveDirect: FnOnce(&str) -> Result<client::DirectConnectionAttempt, String>,
+    ConnectDirect: FnOnce(SocketAddr) -> Result<D, String>,
+    ConnectRelay: FnOnce(&str, &str) -> Result<R, String>,
+{
+    match resolve_direct(target_device_id) {
+        Ok(connection) => match connect_direct(connection.address) {
+            Ok(sender) => {
+                println!(
+                    "desktop capture direct connection selected {:?} {} for {}",
+                    connection.candidate.kind, connection.address, target_device_id
+                );
+                Ok(DesktopTargetTransportSelection::Direct(sender))
+            }
+            Err(error) => {
+                let direct_error = format!(
+                    "direct LAN connection {:?} {} failed: {error}",
+                    connection.candidate.kind, connection.address
+                );
+                eprintln!(
+                    "desktop capture direct connection failed for {target_device_id}; using server relay: {direct_error}"
+                );
+                connect_relay(server_url, source_device_id)
+                    .map(DesktopTargetTransportSelection::Relay)
+                    .map_err(|relay_error| {
+                        format!("{direct_error}; relay connection failed: {relay_error}")
+                    })
+            }
+        },
         Err(direct_error) => {
             eprintln!(
                 "desktop capture direct connection unavailable for {target_device_id}; using server relay: {direct_error}"
             );
-            client::RelayFrameSender::connect(&config.server_url, source_device_id)
-                .map(DesktopTargetTransport::Relay)
+            connect_relay(server_url, source_device_id)
+                .map(DesktopTargetTransportSelection::Relay)
+                .map_err(|relay_error| {
+                    format!("{direct_error}; relay connection failed: {relay_error}")
+                })
         }
     }
 }
@@ -3396,6 +4154,13 @@ impl ProfileName {
         match self {
             Self::MacToWindows => Profile::mac_to_windows_default(),
             Self::WindowsToMac => Profile::windows_to_macos_default(),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MacToWindows => "mac_to_windows",
+            Self::WindowsToMac => "windows_to_mac",
         }
     }
 }
@@ -3851,23 +4616,27 @@ fn default_user_daemon_config_path(
 }
 
 fn is_macos_app_bundle_executable(exe_path: &Path) -> bool {
+    macos_app_bundle_path_from_executable(exe_path).is_some()
+}
+
+fn macos_app_bundle_path_from_executable(exe_path: &Path) -> Option<PathBuf> {
     let Some(exe_dir) = exe_path.parent() else {
-        return false;
+        return None;
     };
     if exe_dir.file_name().and_then(|name| name.to_str()) != Some("MacOS") {
-        return false;
+        return None;
     }
     let Some(contents_dir) = exe_dir.parent() else {
-        return false;
+        return None;
     };
     if contents_dir.file_name().and_then(|name| name.to_str()) != Some("Contents") {
-        return false;
+        return None;
     }
-    contents_dir
-        .parent()
-        .and_then(|bundle| bundle.extension())
-        .and_then(|extension| extension.to_str())
-        == Some("app")
+    let bundle = contents_dir.parent()?;
+    if bundle.extension().and_then(|extension| extension.to_str()) != Some("app") {
+        return None;
+    }
+    Some(bundle.to_path_buf())
 }
 
 fn is_windows_installed_package_executable(exe_path: &Path) -> bool {
@@ -4277,6 +5046,19 @@ impl Edge {
             _ => Err(format!(
                 "unknown capture edge '{value}', expected all, lock, left, right, top, bottom, top-left, top-right, bottom-left, or bottom-right"
             )),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::TopLeft => "top_left",
+            Self::TopRight => "top_right",
+            Self::BottomLeft => "bottom_left",
+            Self::BottomRight => "bottom_right",
         }
     }
 }
@@ -5189,6 +5971,180 @@ mod tests {
     }
 
     #[test]
+    fn desktop_autostart_keeps_existing_core_service_when_local_ipc_responds() {
+        let action = desktop_core_service_autostart_action(
+            Ok(CoreServiceHealth {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                input_hot_path: "daemon_data_plane".to_string(),
+            }),
+            Path::new("/Applications/KMSync.app/Contents/MacOS/kmsync"),
+            Path::new("/Users/alice/Library/Application Support/KMSync/daemon.example.json"),
+            "macos",
+        );
+
+        assert_eq!(action, CoreServiceAutostartAction::AlreadyRunning);
+    }
+
+    #[test]
+    fn desktop_autostart_uses_launch_services_for_macos_app_bundle() {
+        let action = desktop_core_service_autostart_action(
+            Err("local ipc unavailable".to_string()),
+            Path::new("/Applications/KMSync.app/Contents/MacOS/kmsync"),
+            Path::new("/Users/alice/Library/Application Support/KMSync/daemon.example.json"),
+            "macos",
+        );
+
+        assert_eq!(
+            action,
+            CoreServiceAutostartAction::Start(CoreServiceAutostartCommand {
+                program: PathBuf::from("/usr/bin/open"),
+                args: vec![
+                    "-n".to_string(),
+                    "-g".to_string(),
+                    "-a".to_string(),
+                    "/Applications/KMSync.app".to_string(),
+                    "--args".to_string(),
+                    "core-service".to_string(),
+                    "/Users/alice/Library/Application Support/KMSync/daemon.example.json"
+                        .to_string(),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn desktop_autostart_runs_core_service_from_current_binary_for_portable_launches() {
+        let action = desktop_core_service_autostart_action(
+            Err("local ipc unavailable".to_string()),
+            Path::new("/opt/kmsync/kmsync"),
+            Path::new("/home/alice/.config/kmsync/daemon.example.json"),
+            "linux",
+        );
+
+        assert_eq!(
+            action,
+            CoreServiceAutostartAction::Start(CoreServiceAutostartCommand {
+                program: PathBuf::from("/opt/kmsync/kmsync"),
+                args: vec![
+                    "core-service".to_string(),
+                    "/home/alice/.config/kmsync/daemon.example.json".to_string(),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn desktop_autostart_replaces_legacy_ipc_status_that_is_not_the_hot_path() {
+        let action = desktop_core_service_autostart_action(
+            Ok(CoreServiceHealth {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                input_hot_path: "not_on_local_ipc".to_string(),
+            }),
+            Path::new("/Applications/KMSync.app/Contents/MacOS/kmsync"),
+            Path::new("/Users/alice/Library/Application Support/KMSync/daemon.example.json"),
+            "macos",
+        );
+
+        assert!(matches!(action, CoreServiceAutostartAction::Restart { .. }));
+    }
+
+    #[test]
+    fn desktop_autostart_restarts_incompatible_macos_core_service_before_launch_services() {
+        let action = desktop_core_service_autostart_action(
+            Ok(CoreServiceHealth {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                input_hot_path: "not_on_local_ipc".to_string(),
+            }),
+            Path::new("/Applications/KMSync.app/Contents/MacOS/kmsync"),
+            Path::new("/Users/alice/Library/Application Support/KMSync/daemon.example.json"),
+            "macos",
+        );
+
+        assert_eq!(
+            action,
+            CoreServiceAutostartAction::Restart {
+                stop: CoreServiceAutostartCommand {
+                    program: PathBuf::from("/usr/bin/pkill"),
+                    args: vec![
+                        "-f".to_string(),
+                        "/Applications/KMSync\\.app/Contents/MacOS/kmsync .*core-service"
+                            .to_string(),
+                    ],
+                },
+                start: CoreServiceAutostartCommand {
+                    program: PathBuf::from("/usr/bin/open"),
+                    args: vec![
+                        "-n".to_string(),
+                        "-g".to_string(),
+                        "-a".to_string(),
+                        "/Applications/KMSync.app".to_string(),
+                        "--args".to_string(),
+                        "core-service".to_string(),
+                        "/Users/alice/Library/Application Support/KMSync/daemon.example.json"
+                            .to_string(),
+                    ],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn desktop_autostart_restarts_incompatible_windows_core_service_before_user_companion() {
+        let root = unique_test_dir("windows-autostart-restart");
+        let install_dir = root.join("Program Files").join("KMSync");
+        std::fs::create_dir_all(&install_dir).expect("create install dir");
+        let exe_path = install_dir.join("kmsync.exe");
+        std::fs::write(install_dir.join("Uninstall.exe"), "").expect("write uninstall marker");
+        let config_path = root
+            .join("AppData")
+            .join("Roaming")
+            .join("KMSync")
+            .join("daemon.example.json");
+
+        let action = desktop_core_service_autostart_action(
+            Ok(CoreServiceHealth {
+                version: "0.0.0".to_string(),
+                input_hot_path: "not_on_local_ipc".to_string(),
+            }),
+            &exe_path,
+            &config_path,
+            "windows",
+        );
+
+        let CoreServiceAutostartAction::Restart { stop, start } = action else {
+            panic!("expected incompatible Windows core-service to be restarted");
+        };
+        assert_eq!(stop.program, PathBuf::from("powershell.exe"));
+        assert!(stop.args.iter().any(|arg| arg.contains("core-service")));
+        assert!(stop.args.iter().any(|arg| arg.contains("kmsync.exe")));
+        assert_eq!(start.program, exe_path);
+        assert_eq!(
+            start.args,
+            vec![
+                "core-service".to_string(),
+                config_path.display().to_string(),
+            ]
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup temp package");
+    }
+
+    #[test]
+    fn desktop_autostart_replaces_local_ipc_with_mismatched_version() {
+        let action = desktop_core_service_autostart_action(
+            Ok(CoreServiceHealth {
+                version: "0.0.0".to_string(),
+                input_hot_path: "daemon_data_plane".to_string(),
+            }),
+            Path::new("/opt/kmsync/kmsync"),
+            Path::new("/home/alice/.config/kmsync/daemon.example.json"),
+            "linux",
+        );
+
+        assert!(matches!(action, CoreServiceAutostartAction::Start(_)));
+    }
+
+    #[test]
     fn args_parse_accepts_desktop_command_with_output_path() {
         let args = Args::parse(
             [
@@ -5496,6 +6452,257 @@ mod tests {
     }
 
     #[test]
+    fn desktop_capture_idle_log_line_is_privacy_safe() {
+        let line = desktop_capture_idle_log_line();
+
+        assert_eq!(line, "desktop_capture=idle reason=no_online_layout_targets");
+        assert!(!line.contains("key"));
+        assert!(!line.contains("mouse"));
+    }
+
+    #[test]
+    fn desktop_capture_plan_log_line_lists_targets_without_input_content() {
+        let plan = DesktopCapturePlan {
+            targets: vec![DesktopCaptureTarget {
+                edge: Edge::Right,
+                target_device_id: "right-device".to_string(),
+                profile_name: ProfileName::MacToWindows,
+            }],
+        };
+
+        let line = desktop_capture_plan_log_line(&plan);
+
+        assert_eq!(
+            line,
+            "desktop_capture=armed targets=1 target=right-device edge=right profile=mac_to_windows"
+        );
+        assert!(!line.contains("key="));
+        assert!(!line.contains("clipboard"));
+    }
+
+    #[test]
+    fn desktop_sync_runtime_status_round_trips_next_to_config() {
+        let root = unique_test_dir("desktop-sync-runtime");
+        std::fs::create_dir_all(&root).expect("create runtime dir");
+        let config_path = root.join(DEFAULT_DAEMON_CONFIG_FILE);
+        let runtime = kmsync_core::DesktopSyncRuntimeState {
+            state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+            error: None,
+            targets: vec!["right-device".to_string()],
+            updated_at: Some(123),
+            ..kmsync_core::DesktopSyncRuntimeState::default()
+        };
+
+        write_desktop_sync_runtime_status(&config_path, &runtime).expect("write runtime");
+
+        assert_eq!(
+            desktop_sync_runtime_status_path(&config_path),
+            root.join("desktop-runtime.json")
+        );
+        assert_eq!(
+            read_desktop_sync_runtime_status(&config_path)
+                .expect("read runtime")
+                .state,
+            runtime.state
+        );
+        let stored = read_desktop_sync_runtime_status(&config_path).expect("read stored runtime");
+        assert_eq!(stored.targets, runtime.targets);
+        assert_eq!(stored.error, runtime.error);
+        assert!(
+            stored.updated_at.is_some(),
+            "runtime status should record write time"
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn desktop_capture_plan_runtime_status_lists_targets() {
+        let plan = DesktopCapturePlan {
+            targets: vec![DesktopCaptureTarget {
+                edge: Edge::Right,
+                target_device_id: "right-device".to_string(),
+                profile_name: ProfileName::MacToWindows,
+            }],
+        };
+
+        let runtime = desktop_capture_plan_runtime_status(&plan);
+
+        assert_eq!(runtime.state, kmsync_core::DesktopSyncRuntimeKind::Armed);
+        assert_eq!(runtime.targets, vec!["right-device"]);
+        assert_eq!(runtime.error, None);
+    }
+
+    #[test]
+    fn desktop_capture_failed_runtime_status_preserves_targets_and_error() {
+        let plan = DesktopCapturePlan {
+            targets: vec![DesktopCaptureTarget {
+                edge: Edge::Right,
+                target_device_id: "right-device".to_string(),
+                profile_name: ProfileName::MacToWindows,
+            }],
+        };
+
+        let runtime = desktop_capture_failed_runtime_status(&plan, "missing permission");
+
+        assert_eq!(runtime.state, kmsync_core::DesktopSyncRuntimeKind::Failed);
+        assert_eq!(runtime.targets, vec!["right-device"]);
+        assert_eq!(runtime.error.as_deref(), Some("missing permission"));
+    }
+
+    #[test]
+    fn desktop_capture_transmit_failed_runtime_status_names_target_and_error() {
+        let runtime = desktop_capture_transmit_failed_runtime_status(
+            "right-device",
+            "direct connection refused",
+        );
+
+        assert_eq!(runtime.state, kmsync_core::DesktopSyncRuntimeKind::Failed);
+        assert_eq!(runtime.targets, vec!["right-device"]);
+        let error = runtime.error.as_deref().expect("runtime error");
+        assert!(error.contains("right-device"));
+        assert!(error.contains("direct connection refused"));
+    }
+
+    #[test]
+    fn desktop_capture_transmit_recovered_runtime_status_clears_error() {
+        let targets = ["right-device", "left-device"];
+
+        let runtime = desktop_capture_transmit_recovered_runtime_status(targets);
+
+        assert_eq!(runtime.state, kmsync_core::DesktopSyncRuntimeKind::Armed);
+        assert_eq!(runtime.targets, vec!["right-device", "left-device"]);
+        assert_eq!(runtime.error, None);
+    }
+
+    #[test]
+    fn desktop_capture_transmit_progress_runtime_status_records_sent_events() {
+        let targets = ["right-device"];
+
+        let runtime = desktop_capture_transmit_progress_runtime_status(targets, 3, 123);
+
+        assert_eq!(runtime.state, kmsync_core::DesktopSyncRuntimeKind::Armed);
+        assert_eq!(runtime.targets, vec!["right-device"]);
+        assert_eq!(runtime.error, None);
+        assert_eq!(runtime.sent_events, 3);
+        assert_eq!(runtime.last_sent_at, Some(123));
+    }
+
+    #[test]
+    fn desktop_capture_transmit_failure_updates_runtime_status() {
+        let root = unique_test_dir("desktop-capture-transmit-failed");
+        std::fs::create_dir_all(&root).expect("create runtime dir");
+        let config_path = root.join(DEFAULT_DAEMON_CONFIG_FILE);
+        let identity_path = root.join("identity.json");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"{{
+                    "server_url": "http://127.0.0.1:24888",
+                    "device_name": "Master Mac",
+                    "role": "master",
+                    "listen_port": 24800,
+                    "heartbeat_interval_seconds": 30,
+                    "identity_path": "{}"
+                }}"#,
+                identity_path.display()
+            ),
+        )
+        .expect("write config");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(TargetedQueuedInputEvent::new(
+            "not-a-uuid".to_string(),
+            ProfileName::MacToWindows,
+            InputEvent::Mouse(MouseEvent::Move { dx: 1.0, dy: 0.0 }),
+        ))
+        .expect("queue targeted event");
+        drop(tx);
+
+        transmit_desktop_capture_events(rx, config_path.clone(), CaptureQueueStats::default());
+
+        let runtime = read_desktop_sync_runtime_status(&config_path).expect("read runtime status");
+        assert_eq!(runtime.state, kmsync_core::DesktopSyncRuntimeKind::Failed);
+        assert!(
+            runtime
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not-a-uuid")),
+            "runtime error should name the failed target id, got {:?}",
+            runtime.error
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn desktop_input_listener_runtime_status_marks_receiver_ready() {
+        let runtime = desktop_input_listener_runtime_status();
+
+        assert_eq!(
+            runtime.state,
+            kmsync_core::DesktopSyncRuntimeKind::Listening
+        );
+        assert_eq!(runtime.error, None);
+        assert!(runtime.targets.is_empty());
+    }
+
+    #[test]
+    fn desktop_input_listener_failed_runtime_status_preserves_injection_error() {
+        let runtime = desktop_input_listener_failed_runtime_status("SendInput sent 0/1 events");
+
+        assert_eq!(runtime.state, kmsync_core::DesktopSyncRuntimeKind::Failed);
+        assert_eq!(runtime.error.as_deref(), Some("SendInput sent 0/1 events"));
+        assert!(runtime.targets.is_empty());
+    }
+
+    #[test]
+    fn desktop_input_listener_progress_runtime_status_records_received_events() {
+        let runtime = desktop_input_listener_progress_runtime_status(4, 456);
+
+        assert_eq!(
+            runtime.state,
+            kmsync_core::DesktopSyncRuntimeKind::Listening
+        );
+        assert_eq!(runtime.error, None);
+        assert_eq!(runtime.received_events, 4);
+        assert_eq!(runtime.last_received_at, Some(456));
+    }
+
+    #[test]
+    fn desktop_input_injection_progress_runtime_status_records_injected_events() {
+        let runtime = desktop_input_injection_progress_runtime_status(2, 789);
+
+        assert_eq!(
+            runtime.state,
+            kmsync_core::DesktopSyncRuntimeKind::Listening
+        );
+        assert_eq!(runtime.error, None);
+        assert_eq!(runtime.injected_events, 2);
+        assert_eq!(runtime.last_injected_at, Some(789));
+    }
+
+    #[test]
+    fn desktop_capture_supervisor_only_manages_master_runtime_state() {
+        let master = kmsync_core::DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: kmsync_core::DesktopRole::Master,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            ..kmsync_core::DesktopState::default()
+        };
+        let client = kmsync_core::DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: kmsync_core::DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            ..kmsync_core::DesktopState::default()
+        };
+
+        assert!(desktop_capture_supervisor_should_manage_runtime(&master));
+        assert!(!desktop_capture_supervisor_should_manage_runtime(&client));
+    }
+
+    #[test]
     fn desktop_capture_router_routes_each_configured_edge_to_its_target() {
         let plan = DesktopCapturePlan {
             targets: vec![
@@ -5573,6 +6780,46 @@ mod tests {
         };
         assert_eq!(input.source_device_id, expected_source_id);
         assert_eq!(input.target_device_id, expected_target_id);
+    }
+
+    #[test]
+    fn desktop_target_transport_falls_back_to_relay_when_direct_connect_fails() {
+        let target_address = "10.0.0.8:24800"
+            .parse::<SocketAddr>()
+            .expect("target address");
+        let direct_attempt = client::DirectConnectionAttempt {
+            candidate: client::ConnectionCandidate {
+                device_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                kind: client::ConnectionCandidateKind::BackendLan,
+                address: target_address.to_string(),
+                priority: client::ConnectionCandidateKind::BackendLan.priority(),
+            },
+            address: target_address,
+            failed_attempts: Vec::new(),
+        };
+        let mut relay_attempted = false;
+
+        let selected: DesktopTargetTransportSelection<&str, &str> =
+            connect_desktop_target_transport_with(
+                "http://relay.example",
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+                |_target_device_id| Ok(direct_attempt),
+                |_address| Err("udp blocked".to_string()),
+                |server_url, source_device_id| {
+                    relay_attempted = true;
+                    assert_eq!(server_url, "http://relay.example");
+                    assert_eq!(source_device_id, "11111111-1111-4111-8111-111111111111");
+                    Ok("relay-transport")
+                },
+            )
+            .expect("relay fallback");
+
+        assert_eq!(
+            selected,
+            DesktopTargetTransportSelection::Relay("relay-transport")
+        );
+        assert!(relay_attempted);
     }
 
     #[test]
@@ -5778,6 +7025,32 @@ mod tests {
     }
 
     #[test]
+    fn local_ipc_status_response_reports_daemon_hot_path_when_served_by_core_service() {
+        let response = handle_local_ipc_request_with_config_path(
+            local_ipc::LocalIpcRequest::Status,
+            Some(Path::new("configs/daemon.example.json")),
+        );
+
+        match response {
+            local_ipc::LocalIpcResponse::Status {
+                service,
+                version,
+                input_hot_path,
+                platform_transport,
+            } => {
+                assert_eq!(service, "kmsync");
+                assert_eq!(version, env!("CARGO_PKG_VERSION"));
+                assert_eq!(input_hot_path, "daemon_data_plane");
+                assert_eq!(
+                    platform_transport,
+                    local_ipc::default_local_ipc_endpoint().transport.as_str()
+                );
+            }
+            _ => panic!("expected local ipc status response"),
+        }
+    }
+
+    #[test]
     fn local_ipc_desktop_state_reads_config_and_layout_updates_write_back() {
         let root = unique_test_dir("desktop-ipc-config");
         let config_path = root.join("daemon.example.json");
@@ -5855,6 +7128,79 @@ mod tests {
         let text = std::fs::read_to_string(&config_path).expect("read updated config");
         assert!(text.contains("\"server_url\": \"http://203.0.113.10:24889\""));
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn local_ipc_desktop_state_includes_sync_runtime_failure() {
+        let root = unique_test_dir("desktop-sync-runtime-state");
+        let config_path = root.join("daemon.example.json");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "server_url": "http://127.0.0.1:9",
+                "device_name": "Master Mac",
+                "listen_port": 24800,
+                "heartbeat_interval_seconds": 15,
+                "role": "master"
+            }"#,
+        )
+        .expect("write config");
+        write_desktop_sync_runtime_status(
+            &config_path,
+            &kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Failed,
+                error: Some("macOS Input Monitoring permission is missing".to_string()),
+                targets: vec!["right-device".to_string()],
+                updated_at: None,
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+        )
+        .expect("write runtime");
+
+        let response = handle_local_ipc_request_with_config_path(
+            local_ipc::LocalIpcRequest::GetDesktopState,
+            Some(&config_path),
+        );
+
+        match response {
+            local_ipc::LocalIpcResponse::DesktopState { state } => {
+                assert_eq!(
+                    state.sync_runtime.state,
+                    kmsync_core::DesktopSyncRuntimeKind::Failed
+                );
+                assert_eq!(state.sync_runtime.targets, vec!["right-device"]);
+                assert!(
+                    state
+                        .master_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Input Monitoring")),
+                    "sync runtime failure should be visible to UI"
+                );
+            }
+            _ => panic!("expected desktop state"),
+        }
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn desktop_state_surfaces_incompatible_core_service_status() {
+        let mut state = kmsync_core::DesktopState::default();
+
+        attach_core_service_health_status(
+            &mut state,
+            Ok(CoreServiceHealth {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                input_hot_path: "not_on_local_ipc".to_string(),
+            }),
+        );
+
+        let error = state.master_error.as_deref().expect("core service error");
+        assert!(error.contains("旧后台服务"));
+        assert!(error.contains("同步热路径"));
+        assert!(error.contains("input_hot_path=not_on_local_ipc"));
+        assert!(error.contains("重新安装或重启"));
     }
 
     #[test]
@@ -6629,6 +7975,7 @@ mod tests {
             clipboard_tx,
             control_tx,
             ListenerLatencyStats::default(),
+            None,
         );
 
         assert_eq!(result, Err("recv failed".to_string()));
@@ -6671,6 +8018,7 @@ mod tests {
             clipboard_tx,
             control_tx,
             ListenerLatencyStats::default(),
+            None,
         );
 
         assert_eq!(result, Err("recv failed".to_string()));
@@ -6708,6 +8056,7 @@ mod tests {
             clipboard_tx,
             control_tx,
             stats.clone(),
+            None,
         );
 
         assert_eq!(result, Err("recv failed".to_string()));
@@ -6735,6 +8084,7 @@ mod tests {
             clipboard_tx,
             control_tx,
             ListenerLatencyStats::default(),
+            None,
         );
 
         assert_eq!(result, Err("recv failed".to_string()));
@@ -6764,7 +8114,7 @@ mod tests {
         drop(tx);
         let mut adapter = RecordingInjector::default();
 
-        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default())
+        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default(), None)
             .expect("inject frames");
 
         assert_eq!(
@@ -6780,6 +8130,46 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn injection_loop_writes_injection_progress_runtime_status() {
+        let root = unique_test_dir("desktop-input-injection-progress");
+        std::fs::create_dir_all(&root).expect("create runtime root");
+        let config_path = root.join(DEFAULT_DAEMON_CONFIG_FILE);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(ReceivedInputFrame {
+            frame: ProtocolFrame {
+                sequence: 1,
+                timestamp_micros: 2,
+                payload: input_payload(InputEvent::Scroll(kmsync_core::ScrollEvent {
+                    dx: 0.0,
+                    dy: 1.0,
+                })),
+            },
+            received_at: Instant::now(),
+        })
+        .expect("queue input");
+        drop(tx);
+        let mut adapter = RecordingInjector::default();
+
+        inject_received_frames(
+            rx,
+            &mut adapter,
+            ListenerLatencyStats::default(),
+            Some(config_path.clone()),
+        )
+        .expect("inject input");
+
+        let runtime = read_desktop_sync_runtime_status(&config_path).expect("read runtime");
+        assert_eq!(
+            runtime.state,
+            kmsync_core::DesktopSyncRuntimeKind::Listening
+        );
+        assert_eq!(runtime.injected_events, 1);
+        assert!(runtime.last_injected_at.is_some());
+
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -6823,7 +8213,7 @@ mod tests {
         drop(tx);
         let mut adapter = RecordingInjector::default();
 
-        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default())
+        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default(), None)
             .expect("release tracked input on connection close");
 
         assert_eq!(
@@ -6910,7 +8300,7 @@ mod tests {
         drop(tx);
         let mut adapter = RecordingInjector::default();
 
-        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default())
+        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default(), None)
             .expect("target switch releases tracked input");
 
         assert_eq!(
@@ -6982,7 +8372,7 @@ mod tests {
         drop(tx);
         let mut adapter = RecordingInjector::default();
 
-        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default())
+        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default(), None)
             .expect("inject reliable frames");
 
         assert_eq!(
@@ -7027,7 +8417,7 @@ mod tests {
         drop(tx);
         let mut adapter = RecordingInjector::default();
 
-        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default())
+        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default(), None)
             .expect("inject reliable frames");
 
         assert_eq!(
@@ -7079,7 +8469,7 @@ mod tests {
         drop(tx);
         let mut adapter = RecordingInjector::default();
 
-        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default())
+        inject_received_frames(rx, &mut adapter, ListenerLatencyStats::default(), None)
             .expect("inject reliable frames");
 
         assert_eq!(
@@ -7130,7 +8520,7 @@ mod tests {
         let mut adapter = RecordingInjector::default();
         let stats = ListenerLatencyStats::default();
 
-        inject_received_frames(rx, &mut adapter, stats.clone()).expect("inject input");
+        inject_received_frames(rx, &mut adapter, stats.clone(), None).expect("inject input");
 
         assert!(stats.snapshot().last_receive_to_inject_micros >= 700);
     }
@@ -7155,7 +8545,7 @@ mod tests {
         let mut adapter = RecordingInjector::default();
         let stats = ListenerLatencyStats::default();
 
-        inject_received_frames(rx, &mut adapter, stats.clone()).expect("inject input");
+        inject_received_frames(rx, &mut adapter, stats.clone(), None).expect("inject input");
 
         assert!(stats.snapshot().last_end_to_end_input_micros >= 900);
     }
@@ -7756,14 +9146,17 @@ mod tests {
 
         allocation_tracking::reset();
         let route = enqueue_routed_capture(&tx, &stats, &mut router, captured_move(60.0, 60.0));
+        let enqueue_allocations = allocation_tracking::count();
         drop(tx);
+        allocation_tracking::reset();
         transmit_captured_events(rx, &mut sender, compiled, stats).expect("transmit mouse move");
-        let allocations = allocation_tracking::count();
+        let transmit_allocations = allocation_tracking::count();
 
         assert!(route.send_remote);
         assert_eq!(route.decision, CaptureDecision::Suppress);
         assert_eq!(sender.sent, 1);
-        assert_eq!(allocations, 0);
+        assert_eq!(enqueue_allocations, 0);
+        assert_eq!(transmit_allocations, 0);
     }
 }
 
@@ -7794,12 +9187,16 @@ mod packaging_tests {
         assert!(macos.contains("USER_GUIDE.md"));
         assert!(macos.contains("uninstall-macos.sh"));
         assert!(macos.contains("launchctl bootout"));
+        assert!(macos.contains("cat > \"${SCRIPTS_DIR}/preinstall\""));
+        assert!(macos.contains("rm -rf \"/Applications/KMSync.app\""));
+        assert!(macos.contains("rm -f \"/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist\""));
         assert!(macos.contains("stat -f %Su /dev/console"));
         assert!(macos.contains("label=\"com.kmsync.mvp\""));
         assert!(macos.contains("launchctl bootstrap \"gui/$uid\""));
         assert!(macos.contains("launchctl kickstart -k \"gui/$uid/${label}\""));
 
         assert!(windows.contains("Software\\Microsoft\\Windows\\CurrentVersion\\Run"));
+        assert!(windows.contains("ExecShell \"open\" \"$INSTDIR\\${APP_EXE}\" \"core-service\""));
         assert!(windows.contains("DeleteRegValue HKLM"));
         assert!(windows.contains("$SMPROGRAMS\\KMSync"));
         assert!(windows.contains("USER_GUIDE.md"));

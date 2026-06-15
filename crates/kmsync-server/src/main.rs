@@ -21,6 +21,8 @@ const PRESENCE_TTL_SECONDS: u64 = 60;
 const RELAY_FRAME_MAGIC: &[u8; 4] = b"KMR1";
 const RELAY_TARGET_DEVICE_ID_LEN: usize = 36;
 const RELAY_CLIENT_FRAME_HEADER_LEN: usize = RELAY_FRAME_MAGIC.len() + RELAY_TARGET_DEVICE_ID_LEN;
+const RELAY_ROUTE_ACK_OK: &str = "relay_ok";
+const RELAY_ROUTE_ERROR_PREFIX: &str = "relay_error=";
 
 #[tokio::main]
 async fn main() {
@@ -1015,19 +1017,25 @@ async fn handle_relay_socket_message(
 ) -> bool {
     match incoming {
         Some(Ok(Message::Binary(payload))) => {
-            if let Err(error) =
-                route_relay_client_frame(state, user_id, source_device_id, payload.as_ref())
-            {
-                let _ = socket
-                    .send(Message::Text(format!("relay_error={error}").into()))
-                    .await;
-            }
-            true
+            let ack = relay_route_ack_message(route_relay_client_frame(
+                state,
+                user_id,
+                source_device_id,
+                payload.as_ref(),
+            ));
+            socket.send(Message::Text(ack.into())).await.is_ok()
         }
         Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await.is_ok(),
         Some(Ok(Message::Close(_))) | None => false,
         Some(Ok(Message::Text(_) | Message::Pong(_))) => true,
         Some(Err(_)) => false,
+    }
+}
+
+fn relay_route_ack_message(result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => RELAY_ROUTE_ACK_OK.to_string(),
+        Err(error) => format!("{RELAY_ROUTE_ERROR_PREFIX}{error}"),
     }
 }
 
@@ -1990,6 +1998,15 @@ mod tests {
 
         assert_eq!(parsed_target, target);
         assert_eq!(frame, b"encoded-protocol-frame");
+    }
+
+    #[test]
+    fn relay_route_ack_message_reports_delivery_result() {
+        assert_eq!(relay_route_ack_message(Ok(())), "relay_ok");
+        assert_eq!(
+            relay_route_ack_message(Err("relay route failed: target disconnected".to_string())),
+            "relay_error=relay route failed: target disconnected"
+        );
     }
 
     #[tokio::test]

@@ -318,8 +318,14 @@ struct NativeToneColors {
 }
 
 impl NativeDesktopApp {
+    fn load_state(config_path: &Path) -> Result<DesktopState, String> {
+        let mut state = crate::build_local_desktop_state(config_path)?;
+        crate::attach_current_core_service_health_status(&mut state);
+        Ok(state)
+    }
+
     fn load(config_path: PathBuf) -> Result<Self, String> {
-        let state = crate::build_local_desktop_state(&config_path)?;
+        let state = Self::load_state(&config_path)?;
         maybe_request_platform_permissions(&state);
         let view_model = NativeDesktopViewModel::from_state(&state);
         let status_message = status_message_for_state(&state, "就绪");
@@ -339,7 +345,7 @@ impl NativeDesktopApp {
     }
 
     fn reload_state(&mut self, success_message: &str) {
-        match crate::build_local_desktop_state(&self.config_path) {
+        match Self::load_state(&self.config_path) {
             Ok(state) => {
                 let status_message = status_message_for_state(&state, success_message);
                 maybe_request_platform_permissions(&state);
@@ -354,7 +360,7 @@ impl NativeDesktopApp {
     }
 
     fn reload_state_quietly(&mut self) {
-        if let Ok(state) = crate::build_local_desktop_state(&self.config_path) {
+        if let Ok(state) = Self::load_state(&self.config_path) {
             self.apply_state(state);
         }
     }
@@ -1514,10 +1520,54 @@ fn native_layout_section_status(state: &DesktopState) -> (String, NativeStatusTo
     if state.master_error.is_some() {
         return ("同步通道 需处理".to_string(), NativeStatusTone::Danger);
     }
+    if let Some((label, tone)) = sync_runtime_status_label(state) {
+        return (format!("同步通道 {label}"), tone);
+    }
     (
-        format!("同步通道 {}", connection_state_label(&state.master_state)),
-        connection_state_tone(&state.master_state),
+        format!("同步通道 {}", sync_channel_state_label(&state.master_state)),
+        sync_channel_state_tone(&state.master_state),
     )
+}
+
+fn sync_runtime_status_label(state: &DesktopState) -> Option<(String, NativeStatusTone)> {
+    match state.sync_runtime.state {
+        kmsync_core::DesktopSyncRuntimeKind::Unknown => None,
+        kmsync_core::DesktopSyncRuntimeKind::Idle => {
+            Some(("等待设备".to_string(), NativeStatusTone::Muted))
+        }
+        kmsync_core::DesktopSyncRuntimeKind::Listening
+            if state.device.role == DesktopRole::Client
+                && state.master_state != DesktopConnectionState::Disconnected =>
+        {
+            if state.sync_runtime.injected_events > 0 {
+                Some((
+                    format!("已注入 {}", state.sync_runtime.injected_events),
+                    NativeStatusTone::Warning,
+                ))
+            } else if state.sync_runtime.received_events > 0 {
+                Some((
+                    format!("已接收 {}", state.sync_runtime.received_events),
+                    NativeStatusTone::Warning,
+                ))
+            } else {
+                Some(("等待输入".to_string(), NativeStatusTone::Warning))
+            }
+        }
+        kmsync_core::DesktopSyncRuntimeKind::Listening => None,
+        kmsync_core::DesktopSyncRuntimeKind::Armed => {
+            if state.sync_runtime.sent_events > 0 {
+                Some((
+                    format!("已转发 {}", state.sync_runtime.sent_events),
+                    NativeStatusTone::Warning,
+                ))
+            } else {
+                Some(("捕获中".to_string(), NativeStatusTone::Warning))
+            }
+        }
+        kmsync_core::DesktopSyncRuntimeKind::Failed => {
+            Some(("需处理".to_string(), NativeStatusTone::Danger))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1581,14 +1631,14 @@ fn native_layout_slot_view(
     {
         Some(device) if device.online => NativeLayoutSlotView {
             device_name: device.name.clone(),
-            status_label: "已连接".to_string(),
-            route_hint: "已连接主电脑".to_string(),
-            tone: NativeStatusTone::Success,
+            status_label: "在线".to_string(),
+            route_hint: "已加入布局，等待同步通道".to_string(),
+            tone: NativeStatusTone::Info,
         },
         Some(device) => NativeLayoutSlotView {
             device_name: device.name.clone(),
-            status_label: "未连接".to_string(),
-            route_hint: "未连接主电脑".to_string(),
+            status_label: "离线".to_string(),
+            route_hint: "从电脑离线".to_string(),
             tone: NativeStatusTone::Muted,
         },
         None => NativeLayoutSlotView {
@@ -2134,10 +2184,30 @@ fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
     }
 }
 
+fn sync_channel_state_label(state: &DesktopConnectionState) -> &'static str {
+    match state {
+        DesktopConnectionState::Connected | DesktopConnectionState::Connecting => "连接中",
+        DesktopConnectionState::Disconnected => "未连接",
+        DesktopConnectionState::Retrying => "正在重试",
+        DesktopConnectionState::SelfDevice => "本机",
+    }
+}
+
 fn connection_state_tone(state: &DesktopConnectionState) -> NativeStatusTone {
     match state {
         DesktopConnectionState::Connected => NativeStatusTone::Success,
         DesktopConnectionState::Connecting => NativeStatusTone::Danger,
+        DesktopConnectionState::Retrying => NativeStatusTone::Warning,
+        DesktopConnectionState::SelfDevice => NativeStatusTone::Info,
+        DesktopConnectionState::Disconnected => NativeStatusTone::Muted,
+    }
+}
+
+fn sync_channel_state_tone(state: &DesktopConnectionState) -> NativeStatusTone {
+    match state {
+        DesktopConnectionState::Connected | DesktopConnectionState::Connecting => {
+            NativeStatusTone::Warning
+        }
         DesktopConnectionState::Retrying => NativeStatusTone::Warning,
         DesktopConnectionState::SelfDevice => NativeStatusTone::Info,
         DesktopConnectionState::Disconnected => NativeStatusTone::Muted,
@@ -2429,7 +2499,7 @@ mod tests {
 
         assert_eq!(
             native_layout_section_status(&state),
-            ("同步通道 已连接".to_string(), NativeStatusTone::Success)
+            ("同步通道 连接中".to_string(), NativeStatusTone::Warning)
         );
     }
 
@@ -2444,6 +2514,141 @@ mod tests {
         assert_eq!(
             native_layout_section_status(&state),
             ("同步通道 需处理".to_string(), NativeStatusTone::Danger)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_reports_runtime_capture_state() {
+        let state = DesktopState {
+            master_state: DesktopConnectionState::SelfDevice,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                error: None,
+                targets: vec!["right-device".to_string()],
+                updated_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 捕获中".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_reports_transmit_progress() {
+        let state = DesktopState {
+            master_state: DesktopConnectionState::SelfDevice,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                sent_events: 3,
+                last_sent_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 已转发 3".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_reports_client_listener_without_claiming_connected() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::Connecting,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+                error: None,
+                targets: Vec::new(),
+                updated_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 等待输入".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_reports_receive_progress() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::Connecting,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+                received_events: 4,
+                last_received_at: Some(456),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 已接收 4".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_reports_injection_progress() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::Connecting,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+                received_events: 4,
+                last_received_at: Some(456),
+                injected_events: 2,
+                last_injected_at: Some(789),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 已注入 2".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_keeps_client_disconnected_when_master_is_offline() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::Disconnected,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+                error: None,
+                targets: Vec::new(),
+                updated_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 未连接".to_string(), NativeStatusTone::Muted)
         );
     }
 
@@ -2563,7 +2768,7 @@ mod tests {
 
         assert_eq!(
             native_layout_slot_status_text(&state, Some("right-device")),
-            "已连接"
+            "在线"
         );
         assert_eq!(native_layout_slot_status_text(&state, None), "未配置");
     }
@@ -2609,17 +2814,17 @@ mod tests {
             native_layout_slot_view(&state, Some("right-device")),
             NativeLayoutSlotView {
                 device_name: "Right PC".to_string(),
-                status_label: "已连接".to_string(),
-                route_hint: "已连接主电脑".to_string(),
-                tone: NativeStatusTone::Success,
+                status_label: "在线".to_string(),
+                route_hint: "已加入布局，等待同步通道".to_string(),
+                tone: NativeStatusTone::Info,
             }
         );
         assert_eq!(
             native_layout_slot_view(&state, Some("bottom-device")),
             NativeLayoutSlotView {
                 device_name: "Bottom PC".to_string(),
-                status_label: "未连接".to_string(),
-                route_hint: "未连接主电脑".to_string(),
+                status_label: "离线".to_string(),
+                route_hint: "从电脑离线".to_string(),
                 tone: NativeStatusTone::Muted,
             }
         );

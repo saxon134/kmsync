@@ -109,6 +109,7 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
                 },
             })
             .collect(),
+        sync_runtime: Default::default(),
     }
 }
 
@@ -131,6 +132,7 @@ fn desktop_sync_permission_error(
             permissions,
             &["input_monitoring", "input monitoring", "capture"],
         )
+        .or_else(|| missing_permission_for(permissions, &["accessibility"]))
         .map(|permission| (permission, "捕获本机鼠标键盘"))?,
         DesktopRole::Client => missing_permission_for(
             permissions,
@@ -207,7 +209,7 @@ fn effective_desktop_role(
 fn master_connection_state(
     current_device_id: Option<&str>,
     master_device_id: Option<&str>,
-    layout: &DesktopLayout,
+    _layout: &DesktopLayout,
     devices: &[DeviceWithPresence],
     now: u64,
 ) -> DesktopConnectionState {
@@ -219,23 +221,16 @@ fn master_connection_state(
         return DesktopConnectionState::SelfDevice;
     }
 
-    devices
+    let master_online = devices
         .iter()
         .find(|item| item.device.id == master_device_id)
         .and_then(|item| item.presence.as_ref())
-        .filter(|presence| presence_is_online_at(presence, now))
-        .map_or(DesktopConnectionState::Disconnected, |_| {
-            if current_device_id.is_some_and(|device_id| {
-                layout
-                    .target_device_ids()
-                    .into_iter()
-                    .any(|target_device_id| target_device_id == device_id)
-            }) {
-                DesktopConnectionState::Connected
-            } else {
-                DesktopConnectionState::Connecting
-            }
-        })
+        .is_some_and(|presence| presence_is_online_at(presence, now));
+    if !master_online {
+        return DesktopConnectionState::Disconnected;
+    }
+
+    DesktopConnectionState::Connecting
 }
 
 fn peer_states(
@@ -412,7 +407,8 @@ mod tests {
     }
 
     #[test]
-    fn desktop_state_marks_client_master_connection_connected_when_current_device_is_in_layout() {
+    fn desktop_state_keeps_client_master_connection_connecting_when_current_device_is_only_in_layout(
+    ) {
         let config = DesktopConfig {
             role: DesktopRole::Client,
             master_device_id: Some("master-device".to_string()),
@@ -445,7 +441,7 @@ mod tests {
         });
 
         assert_eq!(state.master_device_id.as_deref(), Some("master-device"));
-        assert_eq!(state.master_state, DesktopConnectionState::Connected);
+        assert_eq!(state.master_state, DesktopConnectionState::Connecting);
     }
 
     #[test]
@@ -595,6 +591,59 @@ mod tests {
             .as_deref()
             .expect("missing capture permission should be surfaced");
         assert!(error.contains("macOS Input Monitoring"));
+        assert!(error.contains("无法捕获"));
+    }
+
+    #[test]
+    fn desktop_state_reports_missing_master_accessibility_permission() {
+        let config = DesktopConfig {
+            role: DesktopRole::Master,
+            master_device_id: Some("current-device".to_string()),
+            layout: DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..DesktopLayout::default()
+            },
+            profile_path: None,
+        };
+        let input_monitoring = PlatformPermissionCheck {
+            id: "macos.input_monitoring",
+            label: "macOS Input Monitoring",
+            status: PermissionStatus::Granted,
+            guidance: "Grant Input Monitoring permission.",
+        };
+        let accessibility = PlatformPermissionCheck {
+            id: "macos.accessibility",
+            label: "macOS Accessibility",
+            status: PermissionStatus::Missing,
+            guidance: "Grant Accessibility permission.",
+        };
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "Master Mac",
+            server_url: "http://kmsync.example.com:24888",
+            listen_port: 24_800,
+            current_device_id: Some("current-device"),
+            local_lan_ips: vec!["10.0.0.4".to_string()],
+            desktop_config: &config,
+            devices: &[device_with_presence(
+                "right-device",
+                "Right PC",
+                true,
+                &["10.0.0.5"],
+                "203.0.113.45",
+            )],
+            permissions: &[input_monitoring, accessibility],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        let error = state
+            .master_error
+            .as_deref()
+            .expect("missing Accessibility should be surfaced for master capture");
+        assert!(error.contains("macOS Accessibility"));
         assert!(error.contains("无法捕获"));
     }
 }

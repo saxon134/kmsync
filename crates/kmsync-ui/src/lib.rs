@@ -192,14 +192,35 @@ fn render_status_response(
             version,
             input_hot_path,
             platform_transport,
-        } => Ok(format!(
-            "KMSync\ncore_service={service}\nversion={version}\ninput_hot_path={input_hot_path}\nlocal_ipc_transport={platform_transport}\nlocal_ipc_address={}\n",
-            endpoint.address
-        )),
+        } => {
+            let hot_path_status = core_service_hot_path_status(input_hot_path);
+            let diagnostic = core_service_status_diagnostic(input_hot_path);
+            Ok(format!(
+                "KMSync\ncore_service={service}\nversion={version}\ninput_hot_path={input_hot_path}\nsync_hot_path={hot_path_status}\n{diagnostic}local_ipc_transport={platform_transport}\nlocal_ipc_address={}\n",
+                endpoint.address
+            ))
+        }
         LocalIpcResponse::Error { code, message } => {
             Err(format!("core service returned {code}: {message}"))
         }
         response => Err(format!("unexpected core service response: {response:?}")),
+    }
+}
+
+fn core_service_hot_path_status(input_hot_path: &str) -> &'static str {
+    if input_hot_path == "daemon_data_plane" {
+        "available"
+    } else {
+        "unavailable"
+    }
+}
+
+fn core_service_status_diagnostic(input_hot_path: &str) -> String {
+    if input_hot_path == "daemon_data_plane" {
+        String::new()
+    } else {
+        "diagnostic=old_or_incompatible_core_service\naction=reinstall_or_restart_kmsync\n"
+            .to_string()
     }
 }
 
@@ -259,6 +280,9 @@ mod tests {
         assert!(output.contains("KMSync"));
         assert!(output.contains("core_service=kmsync"));
         assert!(output.contains("input_hot_path=not_on_local_ipc"));
+        assert!(output.contains("sync_hot_path=unavailable"));
+        assert!(output.contains("diagnostic=old_or_incompatible_core_service"));
+        assert!(output.contains("action=reinstall_or_restart_kmsync"));
         assert!(output.contains("local_ipc_transport=unix_domain_socket"));
         assert!(!output.contains("InputEvent"));
     }

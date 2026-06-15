@@ -15,7 +15,7 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use tungstenite::{connect, Error as WebSocketError, Message, WebSocket};
 
 use crate::transport::QuicEventSender;
 
@@ -24,6 +24,9 @@ const MDNS_MULTICAST_ENDPOINT: &str = "224.0.0.251:5353";
 const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(350);
 const RELAY_FRAME_MAGIC: &[u8; 4] = b"KMR1";
 const RELAY_TARGET_DEVICE_ID_LEN: usize = 36;
+const RELAY_SEND_ACK_OK: &str = "relay_ok";
+const RELAY_SEND_ERROR_PREFIX: &str = "relay_error=";
+const RELAY_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_PTR: u16 = 12;
 const DNS_TYPE_TXT: u16 = 16;
@@ -890,7 +893,54 @@ impl RelayFrameSender {
         let payload = encode_relay_client_frame(target_device_id, frame)?;
         self.socket
             .send(Message::Binary(payload.into()))
-            .map_err(|error| format!("failed to send relay frame: {error}"))
+            .map_err(|error| format!("failed to send relay frame: {error}"))?;
+        self.read_send_ack()
+    }
+
+    fn read_send_ack(&mut self) -> Result<(), String> {
+        set_relay_socket_read_timeout(&mut self.socket, Some(RELAY_SEND_ACK_TIMEOUT))?;
+        let ack_result = loop {
+            match self.socket.read() {
+                Ok(Message::Text(text)) => break relay_send_ack_result(text.as_str()),
+                Ok(Message::Ping(payload)) => {
+                    if let Err(error) = self.socket.send(Message::Pong(payload)) {
+                        break Err(format!("failed to respond relay ping: {error}"));
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    break Err("relay websocket closed while waiting for send ack".to_string());
+                }
+                Ok(Message::Binary(_) | Message::Pong(_) | Message::Frame(_)) => {}
+                Err(WebSocketError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break Err("timed out waiting for relay send ack".to_string());
+                }
+                Err(error) => break Err(format!("failed to read relay send ack: {error}")),
+            }
+        };
+        match (
+            ack_result,
+            set_relay_socket_read_timeout(&mut self.socket, None),
+        ) {
+            (Ok(()), Err(error)) => Err(error),
+            (result, _) => result,
+        }
+    }
+}
+
+fn set_relay_socket_read_timeout(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    timeout: Option<Duration>,
+) -> Result<(), String> {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream
+            .set_read_timeout(timeout)
+            .map_err(|error| format!("failed to configure relay ack timeout: {error}")),
+        _ => Err("relay ack timeout is unsupported for this websocket stream".to_string()),
     }
 }
 
@@ -985,6 +1035,16 @@ fn encode_relay_client_frame(
     payload.extend_from_slice(target_device_id.as_bytes());
     payload.extend_from_slice(&frame_bytes);
     Ok(payload)
+}
+
+fn relay_send_ack_result(message: &str) -> Result<(), String> {
+    if message == RELAY_SEND_ACK_OK {
+        return Ok(());
+    }
+    if let Some(error) = message.strip_prefix(RELAY_SEND_ERROR_PREFIX) {
+        return Err(error.to_string());
+    }
+    Err(format!("unexpected relay send ack: {message}"))
 }
 
 #[allow(dead_code)]
@@ -3628,6 +3688,62 @@ mod tests {
             target_device_id
         );
         assert_eq!(ProtocolFrame::decode(&payload[40..]), Ok(frame));
+    }
+
+    #[test]
+    fn relay_send_ack_reports_server_route_errors() {
+        assert_eq!(relay_send_ack_result("relay_ok"), Ok(()));
+        assert_eq!(
+            relay_send_ack_result("relay_error=relay route failed: target device is not connected"),
+            Err("relay route failed: target device is not connected".to_string())
+        );
+        assert_eq!(
+            relay_send_ack_result("unexpected relay response"),
+            Err("unexpected relay send ack: unexpected relay response".to_string())
+        );
+    }
+
+    #[test]
+    fn relay_frame_sender_surfaces_server_route_error_ack() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind local websocket test server");
+        let server_addr = listener.local_addr().expect("local websocket server addr");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept websocket client");
+            let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+            match socket.read().expect("read relay payload") {
+                Message::Binary(payload) => assert!(payload.starts_with(RELAY_FRAME_MAGIC)),
+                other => panic!("expected relay binary frame, got {other:?}"),
+            }
+            socket
+                .send(Message::Text(
+                    "relay_error=relay route failed: target device is not connected".into(),
+                ))
+                .expect("send relay error ack");
+        });
+        let source_device_id = "11111111-1111-4111-8111-111111111111";
+        let target_device_id = "22222222-2222-4222-8222-222222222222";
+        let server_url = format!("http://{server_addr}");
+        let mut sender =
+            RelayFrameSender::connect(&server_url, source_device_id).expect("connect relay sender");
+        let frame = ProtocolFrame {
+            sequence: 1,
+            timestamp_micros: 123,
+            payload: ProtocolPayload::Input(InputEventEnvelope::legacy(InputEvent::Key(
+                KeyEvent {
+                    key: Key::A,
+                    state: KeyState::Pressed,
+                    modifiers: Modifiers::CONTROL,
+                },
+            ))),
+        };
+
+        let error = sender
+            .send_frame(target_device_id, &frame)
+            .expect_err("relay route error should fail send");
+
+        assert!(error.contains("target device is not connected"));
+        server.join().expect("websocket server should finish");
     }
 
     #[test]

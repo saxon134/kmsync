@@ -8,7 +8,8 @@ pub mod protocol;
 
 pub use desktop::{
     DesktopConnectionState, DesktopDeviceState, DesktopLayout, DesktopNetworkState,
-    DesktopPeerState, DesktopPermissionState, DesktopRole, DesktopState,
+    DesktopPeerState, DesktopPermissionState, DesktopRole, DesktopState, DesktopSyncRuntimeKind,
+    DesktopSyncRuntimeState,
 };
 pub use event::{
     DeviceId, InputEvent, Key, KeyEvent, KeyState, ModifierSemantic, ModifierSide, Modifiers,
