@@ -7,6 +7,8 @@ This package contains the `kmsync-server` Linux executable plus sample deploymen
 - `bin/kmsync-server`: backend control-plane server.
 - `config/kmsync-server.example.json`: configuration sample.
 - `systemd/kmsync-server.service`: sample systemd unit.
+- `deploy-server.sh`: SSH helper that uploads the release package, installs the
+  server, restarts systemd, and verifies `/health` reports `relay_rx_status`.
 
 ## Configuration
 
@@ -19,6 +21,21 @@ argument; when omitted, `/etc/kmsync/kmsync-server.json` is used.
   this file.
 
 ## Example
+
+For a server reachable over SSH, use the deploy helper from the repository root:
+
+```bash
+packaging/linux/deploy-server.sh root@47.114.107.118 \
+  dist/linux/kmsync-server-0.1.0-linux-x86_64-musl.tar.gz \
+  http://47.114.107.118:24888/health
+```
+
+The helper keeps an existing `/etc/kmsync/kmsync-server.json`, backs up the old
+binary as `/opt/kmsync/bin/kmsync-server.backup.<timestamp>`, restarts
+`kmsync-server`, and fails if the running server does not expose
+`"relay_rx_status":true`.
+
+Manual installation:
 
 ```bash
 sudo useradd --system --home /var/lib/kmsync --shell /usr/sbin/nologin kmsync

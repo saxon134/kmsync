@@ -22,6 +22,7 @@ use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime};
 const QUIC_STREAM_FRAME_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const QUIC_DATAGRAM_FRAME_BYTES: usize = 1200;
 const QUIC_CHANNEL_CAPACITY: usize = 1024;
+const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
 const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const QUIC_SOCKET_BUFFER_BYTES: usize = 1 << 20;
 const DATA_PLANE_MAGIC: &[u8; 4] = b"SYE1";
@@ -42,6 +43,10 @@ pub struct QuicEventSender {
 
 impl QuicEventSender {
     pub fn connect(target: SocketAddr) -> Result<Self, String> {
+        Self::connect_with_timeout(target, QUIC_CONNECT_TIMEOUT)
+    }
+
+    pub fn connect_with_timeout(target: SocketAddr, timeout: Duration) -> Result<Self, String> {
         let runtime = quic_runtime("kmsync-quic-tx", 1)?;
         let mut endpoint = {
             let _guard = runtime.enter();
@@ -50,10 +55,17 @@ impl QuicEventSender {
         endpoint.set_default_client_config(quic_client_config()?);
         let connection = runtime
             .block_on(async {
-                endpoint
+                let connecting = endpoint
                     .connect(target, "kmsync-peer")
-                    .map_err(format_quic_error)?
+                    .map_err(format_quic_error)?;
+                tokio::time::timeout(timeout, connecting)
                     .await
+                    .map_err(|_| {
+                        format!(
+                            "timed out after {}ms while connecting QUIC peer {target}",
+                            timeout.as_millis()
+                        )
+                    })?
                     .map_err(format_quic_error)
             })
             .map_err(|error| format!("failed to connect QUIC peer {target}: {error}"))?;
@@ -1057,6 +1069,25 @@ mod tests {
                 .expect("receive second"),
             second
         );
+    }
+
+    #[test]
+    fn quic_connect_to_unreachable_peer_returns_after_timeout() {
+        let target = "203.0.113.1:24800".parse().expect("test address");
+        let started_at = std::time::Instant::now();
+
+        let error = match QuicEventSender::connect_with_timeout(target, Duration::from_millis(100))
+        {
+            Ok(_) => panic!("unreachable peer should not connect"),
+            Err(error) => error,
+        };
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "connect should return quickly, got {:?}",
+            started_at.elapsed()
+        );
+        assert!(error.contains("QUIC peer"));
     }
 
     #[test]

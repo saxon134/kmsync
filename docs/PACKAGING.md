@@ -112,12 +112,12 @@ The script signs `kmsync-daemon.exe` and the generated NSIS installer when signi
 configured. If signing parameters are absent, it emits a clear skip message and
 leaves artifacts unsigned.
 
-The NSIS installer registers a Windows Service named `KMSyncCoreService` with
-`kmsync-daemon.exe windows-service "$INSTDIR\configs\daemon.example.json"` and
-writes a machine-wide Run entry that starts the user-mode companion via
-`kmsync-daemon.exe core-service "$INSTDIR\configs\daemon.example.json"` after
-login. Input capture/injection stays in the companion for the MVP; secure
-desktop and login-screen control still need additional hardening.
+The NSIS installer writes a machine-wide Run entry that starts the user-mode
+companion via `kmsync-daemon.exe core-service` after login. It also stops and
+deletes the legacy `KMSyncCoreService` if an older package left it installed,
+so the system service cannot take the data-plane port away from the interactive
+desktop companion. Input capture/injection stays in the companion for the MVP;
+secure desktop and login-screen control still need additional hardening.
 
 输出：
 

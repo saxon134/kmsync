@@ -93,13 +93,11 @@ events.
 The current Windows installer is unsigned. Windows SmartScreen may warn during
 local MVP testing.
 
-The installer registers a Windows Service named `KMSyncCoreService` and adds a
-machine-wide Run entry for the user-mode companion. The service launches
-`kmsync-daemon.exe windows-service`; the companion launches
-`kmsync-daemon.exe core-service`, keeping input capture/injection in the
-interactive desktop session. The installer also adds Start Menu shortcuts for
-daemon diagnostics, status, and the permission guide, and removes those
-entries during uninstall.
+The installer adds a machine-wide Run entry for the user-mode companion. The
+companion launches `kmsync-daemon.exe core-service`, keeping input
+capture/injection in the interactive desktop session. The installer also adds
+Start Menu shortcuts for daemon diagnostics, status, and the permission guide,
+and removes those entries during uninstall.
 
 ### Linux
 
@@ -141,9 +139,10 @@ Monitoring, including `granted` or `missing` status and the next action.
 ### Windows Permissions
 
 Run the user-mode companion in the active interactive user session. The Windows
-Service is installed as a system anchor, while normal desktop hooks and
-`SendInput` stay in the companion. This MVP still does not control the secure
-desktop, UAC consent screen, login screen, or locked workstation.
+installer starts only that companion, because normal desktop hooks and
+`SendInput` must run in the logged-in user's desktop. This MVP still does not
+control the secure desktop, UAC consent screen, login screen, or locked
+workstation.
 
 If injection fails, run:
 
@@ -187,6 +186,16 @@ presence, is stored in the local file named by `data_path`:
 Check that each client can reach it through the configured server URL in
 `configs/daemon.example.json`.
 
+After deploying a server build, verify that the health response exposes the
+relay receiver status capability. Older servers can keep device heartbeats
+online but cannot tell the desktop whether the sync receiver is connected:
+
+```bash
+curl http://<server-ip>:24888/health
+```
+
+The response should include `"capabilities":{"relay_rx_status":true}`.
+
 ### Device Presence
 
 Refresh presence and LAN IP information:
@@ -197,7 +206,21 @@ kmsync-daemon devices configs/daemon.example.json
 ```
 
 The device list should show the target device as online with a reachable LAN
-address and port.
+address and port. Newer servers also show `relay_rx_online`; if that value is
+missing, update the server before trusting the sync-channel status.
+
+Probe the configured target from the master before testing edge capture:
+
+```bash
+kmsync-daemon target-probe configs/daemon.example.json <target_device_id>
+kmsync-daemon target-input-test configs/daemon.example.json <target_device_id>
+```
+
+`target-probe` sends a control frame. `target-input-test` sends a zero-distance
+mouse move through the same desktop transport path as real sync; it should not
+move the pointer, but it verifies that input frames can reach the target
+receiver. If it fails with `TargetOffline`, the target's Core Service receiver
+or the server relay is not connected.
 
 Run the resident Core Service when you want one process to keep the network data
 plane, heartbeat, and local IPC control endpoint alive:
@@ -435,10 +458,9 @@ manually in System Settings.
 
 ### Why does Windows stop working on the lock screen or UAC screen?
 
-The MVP installs a Windows Service plus a user-mode companion, but input capture
-and injection intentionally remain in the companion. Secure desktop, login
-screen, and locked workstation control still require additional service
-hardening and privilege-bound handoff logic.
+The MVP runs input capture and injection only in the user-mode companion.
+Secure desktop, login screen, and locked workstation control still require
+additional service hardening and privilege-bound handoff logic.
 
 ### Why does Linux report unavailable input capture or injection?
 

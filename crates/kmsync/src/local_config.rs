@@ -1,6 +1,9 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
@@ -34,7 +37,12 @@ fn temp_path_for(path: &Path) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("config");
-    path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()))
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        counter
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -131,5 +139,16 @@ mod tests {
             .to_string_lossy()
             .contains(".tmp")));
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn atomic_temp_paths_are_unique_for_repeated_writes_to_same_file() {
+        let root = unique_test_dir("atomic-temp-unique");
+        let path = root.join("profile.json");
+
+        let first = temp_path_for(&path);
+        let second = temp_path_for(&path);
+
+        assert_ne!(first, second);
     }
 }

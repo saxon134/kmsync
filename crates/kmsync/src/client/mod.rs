@@ -17,6 +17,7 @@ use serde_json::Value;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Error as WebSocketError, Message, WebSocket};
 
+use crate::local_config;
 use crate::transport::QuicEventSender;
 
 const MDNS_SERVICE_TYPE: &str = "_kmsync._udp.local";
@@ -97,22 +98,24 @@ impl DeviceIdentity {
         if path.exists() {
             let text = fs::read_to_string(path)
                 .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-            let stored: DeviceIdentityFile = serde_json::from_str(&text)
-                .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-            if let Some(private_key) = stored.private_key {
-                let device_id = stored.device_id.unwrap_or_else(generate_device_id);
-                let identity = DeviceIdentity {
-                    device_id,
-                    public_key: stored.public_key,
-                    private_key,
-                };
-                write_device_identity_local_file(
-                    path,
-                    &identity.device_id,
-                    &identity.public_key,
-                    &identity.private_key,
-                )?;
-                return Ok(identity);
+            if !text.trim().is_empty() {
+                let stored: DeviceIdentityFile = serde_json::from_str(&text)
+                    .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+                if let Some(private_key) = stored.private_key {
+                    let device_id = stored.device_id.unwrap_or_else(generate_device_id);
+                    let identity = DeviceIdentity {
+                        device_id,
+                        public_key: stored.public_key,
+                        private_key,
+                    };
+                    write_device_identity_local_file(
+                        path,
+                        &identity.device_id,
+                        &identity.public_key,
+                        &identity.private_key,
+                    )?;
+                    return Ok(identity);
+                }
             }
         }
 
@@ -300,16 +303,7 @@ fn write_device_identity_metadata(path: &Path, stored: &DeviceIdentityFile) -> R
 }
 
 fn write_device_identity_text(path: &Path, text: &str) -> Result<(), String> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    }
-    fs::write(path, text)
-        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
-    Ok(())
+    local_config::write_text_atomic(path, text)
 }
 
 trait DeviceIdentitySecretStore {
@@ -616,6 +610,14 @@ pub struct DesktopDeviceInventory {
 pub struct DeviceWithPresence {
     pub device: Device,
     pub presence: Option<Presence>,
+    #[serde(default)]
+    pub relay: Option<DeviceRelayStatus>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DeviceRelayStatus {
+    #[serde(default)]
+    pub rx_online: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -639,6 +641,8 @@ pub struct Presence {
     pub listen_port: u16,
     pub nat_type: String,
     pub last_seen_at: u64,
+    #[serde(default)]
+    pub expires_at: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1786,6 +1790,10 @@ pub fn print_devices(config: ClientConfig) -> Result<(), String> {
         } else {
             println!("  offline");
         }
+        match item.relay.as_ref() {
+            Some(relay) => println!("  relay_rx_online={}", relay.rx_online),
+            None => println!("  relay_rx_online=unknown"),
+        }
         if let Some(discovered) = discovered_lan_devices
             .iter()
             .find(|discovered| discovered.device.id == item.device.id)
@@ -1808,20 +1816,47 @@ pub fn print_connection_diagnostics(
     let client = ControlClient::new(config.server_url.clone());
     let devices = client.list_devices()?;
     let mdns_endpoints = discover_mdns_lan_endpoints(MDNS_DISCOVERY_TIMEOUT).unwrap_or_default();
+    let local_lan_ips = discover_local_lan_ips();
     println!(
         "{}",
-        render_connection_diagnostic_report(target_device_id, &mdns_endpoints, &devices, &[], &[])
+        render_connection_diagnostic_report_with_local_lan_ips(
+            target_device_id,
+            &mdns_endpoints,
+            &devices,
+            &[],
+            &[],
+            &local_lan_ips,
+        )
     );
     Ok(())
 }
 
 #[must_use]
-pub fn render_connection_diagnostic_report(
+#[cfg(test)]
+fn render_connection_diagnostic_report(
     target_device_id: &str,
     mdns_endpoints: &[LanDiscoveryEndpoint],
     devices: &[DeviceWithPresence],
     nat_candidates: &[NatTraversalCandidate],
     relay_candidates: &[RelayCandidate],
+) -> String {
+    render_connection_diagnostic_report_with_local_lan_ips(
+        target_device_id,
+        mdns_endpoints,
+        devices,
+        nat_candidates,
+        relay_candidates,
+        &[],
+    )
+}
+
+fn render_connection_diagnostic_report_with_local_lan_ips(
+    target_device_id: &str,
+    mdns_endpoints: &[LanDiscoveryEndpoint],
+    devices: &[DeviceWithPresence],
+    nat_candidates: &[NatTraversalCandidate],
+    relay_candidates: &[RelayCandidate],
+    local_lan_ips: &[IpAddr],
 ) -> String {
     let target = devices
         .iter()
@@ -1841,6 +1876,19 @@ pub fn render_connection_diagnostic_report(
 
     let mut report = String::from("connection diagnostic report\n");
     let _ = writeln!(report, "target_device_id={target_device_id}");
+    if !local_lan_ips.is_empty() {
+        let _ = writeln!(
+            report,
+            "local_lan_ips={}",
+            local_lan_ips
+                .iter()
+                .map(IpAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    let mut target_relay_receiver_offline = false;
+    let mut server_relay_status_unavailable = false;
     match target {
         Some(item) => {
             let _ = writeln!(
@@ -1865,6 +1913,20 @@ pub fn render_connection_diagnostic_report(
             } else {
                 report.push_str("presence offline\n");
             }
+            match item.relay.as_ref() {
+                Some(relay) => {
+                    let _ = writeln!(report, "relay_rx_online={}", relay.rx_online);
+                    target_relay_receiver_offline = !relay.rx_online;
+                    if target_relay_receiver_offline {
+                        report.push_str("warning=target_relay_receiver_offline\n");
+                    }
+                }
+                None => {
+                    report.push_str("relay_rx_online=unknown\n");
+                    server_relay_status_unavailable = true;
+                    report.push_str("warning=server_relay_status_unavailable\n");
+                }
+            }
         }
         None => {
             report.push_str("device=not_found\n");
@@ -1875,6 +1937,9 @@ pub fn render_connection_diagnostic_report(
     if candidates.is_empty() {
         report.push_str("recommendation=refresh_presence_or_check_network\n");
     } else {
+        if direct_candidates_not_on_local_subnet(&candidates, local_lan_ips) {
+            report.push_str("warning=direct_candidates_not_on_local_subnet\n");
+        }
         report.push_str("candidates:\n");
         for candidate in candidates {
             let _ = writeln!(
@@ -1885,10 +1950,38 @@ pub fn render_connection_diagnostic_report(
                 sanitize_connection_endpoint(&candidate.address)
             );
         }
-        report.push_str("recommendation=try_candidates_in_priority_order\n");
+        if target_relay_receiver_offline {
+            report.push_str("recommendation=restart_or_update_target_core_service\n");
+        } else if server_relay_status_unavailable {
+            report.push_str("recommendation=upgrade_server_for_relay_status\n");
+        } else {
+            report.push_str("recommendation=try_candidates_in_priority_order\n");
+        }
     }
     report.push_str("privacy=connection_metadata_only\n");
     report
+}
+
+fn direct_candidates_not_on_local_subnet(
+    candidates: &[ConnectionCandidate],
+    local_lan_ips: &[IpAddr],
+) -> bool {
+    if local_lan_ips.is_empty() {
+        return false;
+    }
+    let direct_candidates = candidates
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.kind,
+                ConnectionCandidateKind::MdnsLan | ConnectionCandidateKind::BackendLan
+            )
+        })
+        .collect::<Vec<_>>();
+    !direct_candidates.is_empty()
+        && direct_candidates
+            .iter()
+            .all(|candidate| !candidate_matches_local_subnet(candidate, local_lan_ips))
 }
 
 fn sanitize_connection_endpoint(address: &str) -> String {
@@ -2430,6 +2523,21 @@ mod tests {
                         "disabled": false
                     },
                     "presence": null
+                },
+                {
+                    "device": {
+                        "id": "33333333-3333-4333-8333-333333333333",
+                        "name": "Relay PC",
+                        "os_type": "windows",
+                        "os_version": "unknown",
+                        "app_version": "0.1.0",
+                        "public_key": "ed25519:relay",
+                        "disabled": false
+                    },
+                    "presence": null,
+                    "relay": {
+                        "rx_online": true
+                    }
                 }
             ]"#,
         ]);
@@ -2455,8 +2563,14 @@ mod tests {
         .expect("load inventory");
 
         assert_eq!(inventory.current_device_id, current_device_id);
-        assert_eq!(inventory.devices.len(), 2);
+        assert_eq!(inventory.devices.len(), 3);
         assert_eq!(inventory.devices[1].device.name, "Windows PC");
+        assert!(inventory.devices[1].relay.is_none());
+        assert_eq!(inventory.devices[2].device.name, "Relay PC");
+        assert!(inventory.devices[2]
+            .relay
+            .as_ref()
+            .is_some_and(|relay| relay.rx_online));
 
         let requests = server.finish();
         let register_body: serde_json::Value =
@@ -2470,6 +2584,29 @@ mod tests {
             serde_json::from_str(http_body(&requests[1])).expect("heartbeat json");
         assert_eq!(heartbeat_body["lan_ips"][0], "192.168.1.10");
         assert!(requests[2].starts_with("GET /v1/devices "));
+    }
+
+    #[test]
+    fn desktop_device_inventory_treats_missing_relay_status_as_unknown() {
+        let devices: Vec<DeviceWithPresence> = serde_json::from_str(
+            r#"[
+                {
+                    "device": {
+                        "id": "22222222-2222-4222-8222-222222222222",
+                        "name": "Windows PC",
+                        "os_type": "windows",
+                        "os_version": "unknown",
+                        "app_version": "0.1.0",
+                        "public_key": "ed25519:peer",
+                        "disabled": false
+                    },
+                    "presence": null
+                }
+            ]"#,
+        )
+        .expect("parse legacy device list");
+
+        assert!(devices[0].relay.is_none());
     }
 
     #[test]
@@ -2785,7 +2922,9 @@ mod tests {
                     listen_port: 24_800,
                     nat_type: "unknown".to_string(),
                     last_seen_at: 10,
+                    expires_at: 0,
                 }),
+                relay: None,
             },
             DeviceWithPresence {
                 device: Device {
@@ -2798,6 +2937,7 @@ mod tests {
                     disabled: false,
                 },
                 presence: None,
+                relay: None,
             },
         ];
         let mdns = vec![
@@ -3144,7 +3284,9 @@ mod tests {
                 listen_port: 24800,
                 nat_type: "cone".to_string(),
                 last_seen_at: 10,
+                expires_at: 0,
             }),
+            relay: Some(DeviceRelayStatus { rx_online: false }),
         }];
         let mdns = vec![LanDiscoveryEndpoint {
             device_id: "windows".to_string(),
@@ -3202,7 +3344,9 @@ mod tests {
                     listen_port: 24800,
                     nat_type: "unknown".to_string(),
                     last_seen_at: 10,
+                    expires_at: 0,
                 }),
+                relay: None,
             },
             DeviceWithPresence {
                 device: Device {
@@ -3221,7 +3365,9 @@ mod tests {
                     listen_port: 24800,
                     nat_type: "unknown".to_string(),
                     last_seen_at: 10,
+                    expires_at: 0,
                 }),
+                relay: None,
             },
         ];
 
@@ -3257,7 +3403,9 @@ mod tests {
                 listen_port: 24800,
                 nat_type: "unknown".to_string(),
                 last_seen_at: 10,
+                expires_at: 0,
             }),
+            relay: Some(DeviceRelayStatus { rx_online: false }),
         }];
 
         let error = verified_target_connection_candidates("windows", &[], &devices, &[], &[])
@@ -3287,7 +3435,9 @@ mod tests {
                 listen_port: 24800,
                 nat_type: "unknown".to_string(),
                 last_seen_at: 10,
+                expires_at: 0,
             }),
+            relay: None,
         }];
 
         let verified = verified_target_connection_candidates("windows", &[], &devices, &[], &[])
@@ -3318,7 +3468,9 @@ mod tests {
                 listen_port: 24800,
                 nat_type: "cone".to_string(),
                 last_seen_at: 10,
+                expires_at: 0,
             }),
+            relay: Some(DeviceRelayStatus { rx_online: false }),
         }];
         let mdns = vec![LanDiscoveryEndpoint {
             device_id: "windows".to_string(),
@@ -3333,13 +3485,89 @@ mod tests {
 
         assert!(report.contains("connection diagnostic report"));
         assert!(report.contains("target_device_id=windows"));
+        assert!(report.contains("relay_rx_online=false"));
+        assert!(report.contains("warning=target_relay_receiver_offline"));
         assert!(report.contains("candidate_count=2"));
         assert!(report.contains("MdnsLan priority=400 address=192.168.1.20:24800"));
         assert!(report.contains("Relay priority=100 address=relay://relay.kmsync.local:443"));
+        assert!(report.contains("recommendation=restart_or_update_target_core_service"));
         assert!(report.contains("privacy=connection_metadata_only"));
         assert!(!report.contains("secret-token"));
         assert!(!report.contains("secret clipboard"));
         assert!(!report.contains("Key::C"));
+    }
+
+    #[test]
+    fn connection_diagnostic_report_marks_legacy_server_relay_status_unknown() {
+        let devices = vec![DeviceWithPresence {
+            device: Device {
+                id: "windows".to_string(),
+                name: "Windows".to_string(),
+                os_type: "windows".to_string(),
+                os_version: "11".to_string(),
+                app_version: "0.1.0".to_string(),
+                public_key: valid_test_public_key(),
+                disabled: false,
+            },
+            presence: Some(Presence {
+                online: true,
+                lan_ips: vec!["192.168.1.20".to_string()],
+                public_ip: "203.0.113.20".to_string(),
+                listen_port: 24800,
+                nat_type: "cone".to_string(),
+                last_seen_at: 10,
+                expires_at: 0,
+            }),
+            relay: None,
+        }];
+
+        let report = render_connection_diagnostic_report("windows", &[], &devices, &[], &[]);
+
+        assert!(report.contains("relay_rx_online=unknown"));
+        assert!(report.contains("warning=server_relay_status_unavailable"));
+        assert!(!report.contains("warning=target_relay_receiver_offline"));
+        assert!(report.contains("recommendation=upgrade_server_for_relay_status"));
+    }
+
+    #[test]
+    fn connection_diagnostic_report_warns_when_direct_candidates_are_not_on_local_subnet() {
+        let devices = vec![DeviceWithPresence {
+            device: Device {
+                id: "windows".to_string(),
+                name: "Windows".to_string(),
+                os_type: "windows".to_string(),
+                os_version: "11".to_string(),
+                app_version: "0.1.0".to_string(),
+                public_key: valid_test_public_key(),
+                disabled: false,
+            },
+            presence: Some(Presence {
+                online: true,
+                lan_ips: vec!["192.168.30.99".to_string(), "100.64.160.109".to_string()],
+                public_ip: "203.0.113.20".to_string(),
+                listen_port: 24800,
+                nat_type: "unknown".to_string(),
+                last_seen_at: 10,
+                expires_at: 0,
+            }),
+            relay: None,
+        }];
+        let local_lan_ips = vec![
+            "192.168.50.226".parse().expect("local lan ip"),
+            "100.64.162.92".parse().expect("tailscale ip"),
+        ];
+
+        let report = render_connection_diagnostic_report_with_local_lan_ips(
+            "windows",
+            &[],
+            &devices,
+            &[],
+            &[],
+            &local_lan_ips,
+        );
+
+        assert!(report.contains("local_lan_ips=192.168.50.226,100.64.162.92"));
+        assert!(report.contains("warning=direct_candidates_not_on_local_subnet"));
     }
 
     fn connection_candidate(
@@ -3367,6 +3595,7 @@ mod tests {
                 disabled,
             },
             presence: None,
+            relay: None,
         }
     }
 
@@ -3450,6 +3679,61 @@ mod tests {
         .expect("load local identity");
         assert_eq!(second, first);
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_file_identity_recovers_from_empty_file() {
+        let path = temp_identity_path();
+        fs::write(&path, "").expect("write empty identity file");
+
+        let identity = DeviceIdentity::load_or_generate_for_storage_mode(
+            &path,
+            DeviceIdentityStorageMode::LocalFile,
+        )
+        .expect("recover empty local identity");
+        let text = fs::read_to_string(&path).expect("read recovered identity");
+
+        assert!(!identity.device_id.is_empty());
+        assert!(identity.public_key.starts_with("ed25519:"));
+        assert!(identity.private_key.starts_with("ed25519:"));
+        assert!(text.contains("\"device_id\""));
+        assert!(text.contains("\"private_key\""));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_file_identity_write_ignores_stale_legacy_atomic_temp_file() {
+        let path = temp_identity_path();
+        write_device_identity_local_file(
+            &path,
+            "device-1",
+            "ed25519:public-1",
+            "ed25519:private-1",
+        )
+        .expect("write original identity");
+        let temp_path = path.with_file_name(format!(
+            ".{}.tmp.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        fs::write(&temp_path, "pending").expect("create colliding temp file");
+
+        let result = write_device_identity_local_file(
+            &path,
+            "device-2",
+            "ed25519:public-2",
+            "ed25519:private-2",
+        );
+
+        result.expect("write identity despite stale temp file");
+        let updated = fs::read_to_string(&path).expect("read updated identity");
+        assert!(updated.contains("device-2"));
+        assert!(updated.contains("ed25519:public-2"));
+        assert!(updated.contains("ed25519:private-2"));
+
+        let _ = fs::remove_file(temp_path);
         let _ = fs::remove_file(path);
     }
 

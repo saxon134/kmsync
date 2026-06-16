@@ -118,6 +118,10 @@ pub struct DesktopPeerState {
     pub os: String,
     pub online: bool,
     #[serde(default)]
+    pub sync_relay_status_known: bool,
+    #[serde(default)]
+    pub sync_relay_online: bool,
+    #[serde(default)]
     pub lan_ips: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<String>,
@@ -162,6 +166,12 @@ pub struct DesktopSyncRuntimeState {
     pub targets: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<u64>,
+    #[serde(default)]
+    pub relay_connected: bool,
+    #[serde(default)]
+    pub captured_events: u64,
+    #[serde(default)]
+    pub routed_events: u64,
     #[serde(default)]
     pub sent_events: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,6 +296,7 @@ mod tests {
             last_received_at: Some(121),
             injected_events: 4,
             last_injected_at: Some(122),
+            ..DesktopSyncRuntimeState::default()
         };
 
         let json = serde_json::to_string(&runtime).expect("serialize runtime");
@@ -298,6 +309,26 @@ mod tests {
         assert_eq!(decoded.last_received_at, Some(121));
         assert_eq!(decoded.injected_events, 4);
         assert_eq!(decoded.last_injected_at, Some(122));
+    }
+
+    #[test]
+    fn desktop_sync_runtime_serializes_capture_observation_progress() {
+        let runtime = DesktopSyncRuntimeState {
+            state: DesktopSyncRuntimeKind::Armed,
+            error: None,
+            targets: vec!["right-device".to_string()],
+            updated_at: Some(123),
+            captured_events: 12,
+            routed_events: 3,
+            ..DesktopSyncRuntimeState::default()
+        };
+
+        let json = serde_json::to_string(&runtime).expect("serialize runtime");
+        let decoded: DesktopSyncRuntimeState =
+            serde_json::from_str(&json).expect("deserialize runtime");
+
+        assert_eq!(decoded.captured_events, 12);
+        assert_eq!(decoded.routed_events, 3);
     }
 
     #[test]

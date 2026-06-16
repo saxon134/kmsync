@@ -192,6 +192,7 @@ fn render_status_response(
             version,
             input_hot_path,
             platform_transport,
+            ..
         } => {
             let hot_path_status = core_service_hot_path_status(input_hot_path);
             let diagnostic = core_service_status_diagnostic(input_hot_path);
@@ -273,6 +274,8 @@ mod tests {
             version: "0.1.0".to_string(),
             input_hot_path: "not_on_local_ipc".to_string(),
             platform_transport: "unix_domain_socket".to_string(),
+            config_path: None,
+            device_id: None,
         };
 
         let output = render_status_response(&endpoint, &response).expect("render status");

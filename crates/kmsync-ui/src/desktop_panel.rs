@@ -364,12 +364,24 @@ fn render_device_rows(state: &DesktopState) -> String {
                 "<tr><td>{}<br><small>{}</small></td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape_html(&device.name),
                 escape_html(&device.os),
-                if device.online { "在线" } else { "离线" },
+                desktop_peer_sync_status_label(device),
                 escape_html(&empty_dash(&device.lan_ips.join(", "))),
                 escape_html(device.public_ip.as_deref().unwrap_or("-"))
             )
         })
         .collect()
+}
+
+fn desktop_peer_sync_status_label(device: &kmsync_core::DesktopPeerState) -> &'static str {
+    if !device.online {
+        "离线"
+    } else if !device.sync_relay_status_known {
+        "同步接收待验证"
+    } else if device.sync_relay_online {
+        "同步接收在线"
+    } else {
+        "同步接收未连接"
+    }
 }
 
 fn device_label<'a>(state: &'a DesktopState, device_id: &str) -> Option<&'a str> {
@@ -401,12 +413,22 @@ fn connection_state_label(state: &DesktopConnectionState) -> &'static str {
 }
 
 fn master_connection_state_key(state: &DesktopState) -> &'static str {
+    if state.master_error.is_some() {
+        return "disconnected";
+    }
     match state.sync_runtime.state {
         kmsync_core::DesktopSyncRuntimeKind::Armed => return "retrying",
         kmsync_core::DesktopSyncRuntimeKind::Idle => return "disconnected",
         kmsync_core::DesktopSyncRuntimeKind::Listening
             if state.device.role == DesktopRole::Client
                 && state.master_state != DesktopConnectionState::Disconnected =>
+        {
+            return "retrying";
+        }
+        kmsync_core::DesktopSyncRuntimeKind::Listening
+            if state.device.role == DesktopRole::Client
+                && state.master_state == DesktopConnectionState::Disconnected
+                && state.sync_runtime.relay_connected =>
         {
             return "retrying";
         }
@@ -423,15 +445,31 @@ fn master_connection_state_key(state: &DesktopState) -> &'static str {
 }
 
 fn master_connection_state_label(state: &DesktopState) -> String {
+    if state.master_error.is_some() {
+        return "需处理".to_string();
+    }
     match state.sync_runtime.state {
         kmsync_core::DesktopSyncRuntimeKind::Armed => {
             return if state.sync_runtime.sent_events > 0 {
                 format!("已转发 {}", state.sync_runtime.sent_events)
+            } else if master_layout_has_non_relay_target_outside_local_subnet(state) {
+                "网络不可直连".to_string()
+            } else if master_layout_has_unknown_sync_receiver(state) {
+                "服务器待更新".to_string()
+            } else if master_layout_waiting_for_sync_receiver(state) {
+                "等待从电脑接收端".to_string()
             } else {
                 "捕获中".to_string()
             };
         }
         kmsync_core::DesktopSyncRuntimeKind::Idle => return "等待设备".to_string(),
+        kmsync_core::DesktopSyncRuntimeKind::Listening
+            if state.device.role == DesktopRole::Client
+                && state.master_state == DesktopConnectionState::Disconnected
+                && state.sync_runtime.relay_connected =>
+        {
+            return "等待主电脑".to_string();
+        }
         kmsync_core::DesktopSyncRuntimeKind::Listening
             if state.device.role == DesktopRole::Client
                 && state.master_state != DesktopConnectionState::Disconnected =>
@@ -440,6 +478,8 @@ fn master_connection_state_label(state: &DesktopState) -> String {
                 format!("已注入 {}", state.sync_runtime.injected_events)
             } else if state.sync_runtime.received_events > 0 {
                 format!("已接收 {}", state.sync_runtime.received_events)
+            } else if !state.sync_runtime.relay_connected {
+                "中继连接中".to_string()
             } else {
                 "等待输入".to_string()
             };
@@ -455,6 +495,89 @@ fn master_connection_state_label(state: &DesktopState) -> String {
         DesktopConnectionState::Disconnected => "未连接".to_string(),
         DesktopConnectionState::Retrying => "正在重试".to_string(),
         DesktopConnectionState::SelfDevice => "本机".to_string(),
+    }
+}
+
+fn master_layout_waiting_for_sync_receiver(state: &DesktopState) -> bool {
+    if state.device.role != DesktopRole::Master {
+        return false;
+    }
+    state
+        .layout
+        .target_device_ids()
+        .into_iter()
+        .any(|target_id| {
+            state
+                .devices
+                .iter()
+                .find(|device| device.id == target_id)
+                .is_some_and(|device| {
+                    device.online && device.sync_relay_status_known && !device.sync_relay_online
+                })
+        })
+}
+
+fn master_layout_has_unknown_sync_receiver(state: &DesktopState) -> bool {
+    if state.device.role != DesktopRole::Master {
+        return false;
+    }
+    state
+        .layout
+        .target_device_ids()
+        .into_iter()
+        .any(|target_id| {
+            state
+                .devices
+                .iter()
+                .find(|device| device.id == target_id)
+                .is_some_and(|device| device.online && !device.sync_relay_status_known)
+        })
+}
+
+fn master_layout_has_non_relay_target_outside_local_subnet(state: &DesktopState) -> bool {
+    if state.device.role != DesktopRole::Master || state.network.lan_ips.is_empty() {
+        return false;
+    }
+    state
+        .layout
+        .target_device_ids()
+        .into_iter()
+        .filter_map(|target_id| state.devices.iter().find(|device| device.id == target_id))
+        .filter(|device| {
+            device.online
+                && !device.lan_ips.is_empty()
+                && (!device.sync_relay_status_known || !device.sync_relay_online)
+        })
+        .any(|device| {
+            device.lan_ips.iter().all(|target_ip| {
+                state
+                    .network
+                    .lan_ips
+                    .iter()
+                    .all(|local_ip| !same_lan_subnet(local_ip, target_ip))
+            })
+        })
+}
+
+fn same_lan_subnet(left: &str, right: &str) -> bool {
+    let Ok(left) = left.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(right) = right.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match (left, right) {
+        (std::net::IpAddr::V4(left), std::net::IpAddr::V4(right)) => {
+            let left = left.octets();
+            let right = right.octets();
+            left[..3] == right[..3]
+        }
+        (std::net::IpAddr::V6(left), std::net::IpAddr::V6(right)) => {
+            let left = left.segments();
+            let right = right.segments();
+            left[..4] == right[..4]
+        }
+        _ => false,
     }
 }
 
@@ -535,6 +658,8 @@ mod tests {
                 name: "Right PC".to_string(),
                 os: "macos".to_string(),
                 online: true,
+                sync_relay_status_known: true,
+                sync_relay_online: true,
                 lan_ips: vec!["192.168.1.21".to_string()],
                 public_ip: Some("203.0.113.11".to_string()),
                 listen_port: Some(24_800),
@@ -599,6 +724,8 @@ mod tests {
                     name: "This PC".to_string(),
                     os: "windows".to_string(),
                     online: true,
+                    sync_relay_status_known: true,
+                    sync_relay_online: true,
                     lan_ips: vec![],
                     public_ip: None,
                     listen_port: None,
@@ -609,6 +736,8 @@ mod tests {
                     name: "Right PC".to_string(),
                     os: "macos".to_string(),
                     online: true,
+                    sync_relay_status_known: true,
+                    sync_relay_online: true,
                     lan_ips: vec![],
                     public_ip: None,
                     listen_port: None,
@@ -660,6 +789,138 @@ mod tests {
     }
 
     #[test]
+    fn desktop_panel_waits_for_target_sync_receiver() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                id: Some("master-device".to_string()),
+                role: DesktopRole::Master,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            server_state: DesktopConnectionState::Connected,
+            master_state: DesktopConnectionState::SelfDevice,
+            layout: kmsync_core::DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..kmsync_core::DesktopLayout::default()
+            },
+            devices: vec![kmsync_core::DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                online: true,
+                sync_relay_status_known: true,
+                sync_relay_online: false,
+                ..kmsync_core::DesktopPeerState::default()
+            }],
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                error: None,
+                targets: vec!["right-device".to_string()],
+                updated_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        let html = render_desktop_panel(&state).expect("render desktop panel");
+
+        assert!(html.contains("主电脑：等待从电脑接收端"));
+        assert!(!html.contains("主电脑：捕获中"));
+    }
+
+    #[test]
+    fn desktop_panel_marks_unknown_target_sync_receiver() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                id: Some("master-device".to_string()),
+                role: DesktopRole::Master,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            server_state: DesktopConnectionState::Connected,
+            master_state: DesktopConnectionState::SelfDevice,
+            layout: kmsync_core::DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..kmsync_core::DesktopLayout::default()
+            },
+            devices: vec![kmsync_core::DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                online: true,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
+                ..kmsync_core::DesktopPeerState::default()
+            }],
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                error: None,
+                targets: vec!["right-device".to_string()],
+                updated_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        let html = render_desktop_panel(&state).expect("render desktop panel");
+
+        assert!(html.contains("主电脑：服务器待更新"));
+        assert!(!html.contains("主电脑：捕获中"));
+    }
+
+    #[test]
+    fn desktop_panel_marks_target_lan_mismatch_before_capture_state() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                id: Some("master-device".to_string()),
+                role: DesktopRole::Master,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            network: kmsync_core::DesktopNetworkState {
+                lan_ips: vec!["192.168.50.226".to_string()],
+                ..kmsync_core::DesktopNetworkState::default()
+            },
+            server_state: DesktopConnectionState::Connected,
+            master_state: DesktopConnectionState::SelfDevice,
+            layout: kmsync_core::DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..kmsync_core::DesktopLayout::default()
+            },
+            devices: vec![kmsync_core::DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                online: true,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
+                lan_ips: vec!["192.168.30.99".to_string()],
+                ..kmsync_core::DesktopPeerState::default()
+            }],
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                error: None,
+                targets: vec!["right-device".to_string()],
+                updated_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        let html = render_desktop_panel(&state).expect("render desktop panel");
+
+        assert!(html.contains("主电脑：网络不可直连"));
+        assert!(!html.contains("主电脑：捕获中"));
+        assert!(!html.contains("主电脑：接收端待验证"));
+    }
+
+    #[test]
+    fn desktop_peer_sync_status_label_marks_unknown_relay_status() {
+        let device = kmsync_core::DesktopPeerState {
+            online: true,
+            sync_relay_status_known: false,
+            sync_relay_online: false,
+            ..kmsync_core::DesktopPeerState::default()
+        };
+
+        assert_eq!(desktop_peer_sync_status_label(&device), "同步接收待验证");
+    }
+
+    #[test]
     fn desktop_panel_reports_runtime_transmit_progress() {
         let state = DesktopState {
             server_state: DesktopConnectionState::Connected,
@@ -692,6 +953,7 @@ mod tests {
                 error: None,
                 targets: Vec::new(),
                 updated_at: Some(123),
+                relay_connected: true,
                 ..kmsync_core::DesktopSyncRuntimeState::default()
             },
             ..DesktopState::default()
@@ -700,6 +962,33 @@ mod tests {
         let html = render_desktop_panel(&state).expect("render desktop panel");
 
         assert!(html.contains("主电脑：等待输入"));
+        assert!(!html.contains("主电脑：已连接"));
+    }
+
+    #[test]
+    fn desktop_panel_reports_client_relay_connecting() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            server_state: DesktopConnectionState::Connected,
+            master_state: DesktopConnectionState::Connecting,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+                error: None,
+                targets: Vec::new(),
+                updated_at: Some(123),
+                relay_connected: false,
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        let html = render_desktop_panel(&state).expect("render desktop panel");
+
+        assert!(html.contains("主电脑：中继连接中"));
+        assert!(!html.contains("主电脑：等待输入"));
         assert!(!html.contains("主电脑：已连接"));
     }
 
@@ -716,6 +1005,7 @@ mod tests {
                 state: kmsync_core::DesktopSyncRuntimeKind::Listening,
                 received_events: 4,
                 last_received_at: Some(456),
+                relay_connected: true,
                 ..kmsync_core::DesktopSyncRuntimeState::default()
             },
             ..DesktopState::default()
@@ -742,6 +1032,7 @@ mod tests {
                 last_received_at: Some(456),
                 injected_events: 2,
                 last_injected_at: Some(789),
+                relay_connected: true,
                 ..kmsync_core::DesktopSyncRuntimeState::default()
             },
             ..DesktopState::default()
@@ -767,6 +1058,7 @@ mod tests {
                 error: None,
                 targets: Vec::new(),
                 updated_at: Some(123),
+                relay_connected: false,
                 ..kmsync_core::DesktopSyncRuntimeState::default()
             },
             ..DesktopState::default()
@@ -775,6 +1067,33 @@ mod tests {
         let html = render_desktop_panel(&state).expect("render desktop panel");
 
         assert!(html.contains("主电脑：未连接"));
+        assert!(!html.contains("主电脑：已连接"));
+    }
+
+    #[test]
+    fn desktop_panel_waits_for_master_when_client_relay_is_connected() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            server_state: DesktopConnectionState::Connected,
+            master_state: DesktopConnectionState::Disconnected,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+                error: None,
+                targets: Vec::new(),
+                updated_at: Some(123),
+                relay_connected: true,
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        let html = render_desktop_panel(&state).expect("render desktop panel");
+
+        assert!(html.contains("主电脑：等待主电脑"));
+        assert!(!html.contains("主电脑：等待输入"));
         assert!(!html.contains("主电脑：已连接"));
     }
 }

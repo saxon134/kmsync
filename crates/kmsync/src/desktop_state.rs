@@ -243,11 +243,15 @@ fn peer_states(
         .filter(|item| Some(item.device.id.as_str()) != current_device_id)
         .map(|item| {
             let presence = item.presence.as_ref();
+            let sync_relay_status_known = item.relay.is_some();
+            let sync_relay_online = item.relay.as_ref().is_some_and(|relay| relay.rx_online);
             DesktopPeerState {
                 id: item.device.id.clone(),
                 name: item.device.name.clone(),
                 os: item.device.os_type.clone(),
                 online: presence.is_some_and(|presence| presence_is_online_at(presence, now)),
+                sync_relay_status_known,
+                sync_relay_online,
                 lan_ips: presence
                     .map(|presence| presence.lan_ips.clone())
                     .unwrap_or_default(),
@@ -260,7 +264,12 @@ fn peer_states(
 }
 
 fn presence_is_online_at(presence: &crate::client::Presence, now: u64) -> bool {
-    presence.online && now <= presence.last_seen_at.saturating_add(PRESENCE_TTL_SECONDS)
+    let expires_at = if presence.expires_at == 0 {
+        presence.last_seen_at.saturating_add(PRESENCE_TTL_SECONDS)
+    } else {
+        presence.expires_at
+    };
+    presence.online && now <= expires_at
 }
 
 fn now_seconds() -> u64 {
@@ -302,7 +311,9 @@ mod tests {
                 listen_port: 24_800,
                 nat_type: "unknown".to_string(),
                 last_seen_at: now_seconds(),
+                expires_at: 0,
             }),
+            relay: None,
         }
     }
 
@@ -407,6 +418,85 @@ mod tests {
     }
 
     #[test]
+    fn desktop_state_preserves_peer_relay_receiver_status() {
+        let config = DesktopConfig {
+            role: DesktopRole::Master,
+            master_device_id: Some("current-device".to_string()),
+            layout: DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..DesktopLayout::default()
+            },
+            profile_path: None,
+        };
+        let mut right = device_with_presence(
+            "right-device",
+            "Right PC",
+            true,
+            &["10.0.0.5"],
+            "203.0.113.45",
+        );
+        right.relay = Some(crate::client::DeviceRelayStatus { rx_online: true });
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "Master Mac",
+            server_url: "http://kmsync.example.com:24888",
+            listen_port: 24_800,
+            current_device_id: Some("current-device"),
+            local_lan_ips: vec!["10.0.0.4".to_string()],
+            desktop_config: &config,
+            devices: &[right],
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert_eq!(state.devices[0].id, "right-device");
+        assert!(state.devices[0].sync_relay_status_known);
+        assert!(state.devices[0].sync_relay_online);
+    }
+
+    #[test]
+    fn desktop_state_preserves_unknown_peer_relay_receiver_status() {
+        let config = DesktopConfig {
+            role: DesktopRole::Master,
+            master_device_id: Some("current-device".to_string()),
+            layout: DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..DesktopLayout::default()
+            },
+            profile_path: None,
+        };
+        let right = device_with_presence(
+            "right-device",
+            "Right PC",
+            true,
+            &["10.0.0.5"],
+            "203.0.113.45",
+        );
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "Master Mac",
+            server_url: "http://kmsync.example.com:24888",
+            listen_port: 24_800,
+            current_device_id: Some("current-device"),
+            local_lan_ips: vec!["10.0.0.4".to_string()],
+            desktop_config: &config,
+            devices: &[right],
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert_eq!(state.devices[0].id, "right-device");
+        assert!(!state.devices[0].sync_relay_status_known);
+        assert!(!state.devices[0].sync_relay_online);
+    }
+
+    #[test]
     fn desktop_state_keeps_client_master_connection_connecting_when_current_device_is_only_in_layout(
     ) {
         let config = DesktopConfig {
@@ -486,6 +576,47 @@ mod tests {
 
         assert_eq!(state.master_state, DesktopConnectionState::Disconnected);
         assert_eq!(state.devices[0].id, "master-device");
+        assert!(!state.devices[0].online);
+    }
+
+    #[test]
+    fn desktop_state_treats_expired_server_presence_as_disconnected() {
+        let config = DesktopConfig {
+            role: DesktopRole::Client,
+            master_device_id: Some("master-device".to_string()),
+            layout: DesktopLayout::default(),
+            profile_path: None,
+        };
+        let mut expired_master = device_with_presence(
+            "master-device",
+            "Master PC",
+            true,
+            &["10.0.0.4"],
+            "203.0.113.44",
+        );
+        expired_master
+            .presence
+            .as_mut()
+            .expect("presence")
+            .expires_at = 1;
+        let devices = [expired_master];
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "Client PC",
+            server_url: "http://kmsync.example.com:24888",
+            listen_port: 24_800,
+            current_device_id: Some("client-device"),
+            local_lan_ips: vec!["10.0.0.5".to_string()],
+            desktop_config: &config,
+            devices: &devices,
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert_eq!(state.master_state, DesktopConnectionState::Disconnected);
         assert!(!state.devices[0].online);
     }
 

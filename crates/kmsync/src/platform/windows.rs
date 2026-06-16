@@ -87,7 +87,7 @@ impl PlatformAdapter for WindowsPlatform {
     fn permission_hints(&self) -> &'static [&'static str] {
         &[
             "Run as the interactive desktop user for normal SendInput injection.",
-            "Use the Windows Service as the system anchor and the user-mode companion for interactive desktop input.",
+            "Keep the user-mode companion running in the active Windows desktop session.",
         ]
     }
 
@@ -1154,6 +1154,16 @@ mod tests {
         assert_eq!(checks[0].status, PermissionStatus::Granted);
         assert!(checks[0].guidance.contains("interactive user session"));
         assert!(checks[0].guidance.contains("user-mode companion"));
+    }
+
+    #[test]
+    fn windows_permission_hints_do_not_recommend_service_for_interactive_input() {
+        let platform = WindowsPlatform::new();
+        let hints = platform.permission_hints().join("\n");
+
+        assert!(hints.contains("interactive desktop user"));
+        assert!(hints.contains("user-mode companion"));
+        assert!(!hints.contains("Windows Service"));
     }
 
     #[test]

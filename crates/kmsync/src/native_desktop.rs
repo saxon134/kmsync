@@ -1537,6 +1537,13 @@ fn sync_runtime_status_label(state: &DesktopState) -> Option<(String, NativeStat
         }
         kmsync_core::DesktopSyncRuntimeKind::Listening
             if state.device.role == DesktopRole::Client
+                && state.master_state == DesktopConnectionState::Disconnected
+                && state.sync_runtime.relay_connected =>
+        {
+            Some(("等待主电脑".to_string(), NativeStatusTone::Warning))
+        }
+        kmsync_core::DesktopSyncRuntimeKind::Listening
+            if state.device.role == DesktopRole::Client
                 && state.master_state != DesktopConnectionState::Disconnected =>
         {
             if state.sync_runtime.injected_events > 0 {
@@ -1549,6 +1556,8 @@ fn sync_runtime_status_label(state: &DesktopState) -> Option<(String, NativeStat
                     format!("已接收 {}", state.sync_runtime.received_events),
                     NativeStatusTone::Warning,
                 ))
+            } else if !state.sync_runtime.relay_connected {
+                Some(("中继连接中".to_string(), NativeStatusTone::Warning))
             } else {
                 Some(("等待输入".to_string(), NativeStatusTone::Warning))
             }
@@ -1560,6 +1569,12 @@ fn sync_runtime_status_label(state: &DesktopState) -> Option<(String, NativeStat
                     format!("已转发 {}", state.sync_runtime.sent_events),
                     NativeStatusTone::Warning,
                 ))
+            } else if master_layout_has_non_relay_target_outside_local_subnet(state) {
+                Some(("网络不可直连".to_string(), NativeStatusTone::Warning))
+            } else if master_layout_has_unknown_sync_receiver(state) {
+                Some(("服务器待更新".to_string(), NativeStatusTone::Warning))
+            } else if master_layout_waiting_for_sync_receiver(state) {
+                Some(("等待从电脑接收端".to_string(), NativeStatusTone::Warning))
             } else {
                 Some(("捕获中".to_string(), NativeStatusTone::Warning))
             }
@@ -1629,11 +1644,23 @@ fn native_layout_slot_view(
         .iter()
         .find(|device| device.id == selected_device_id)
     {
+        Some(device) if device.online && !device.sync_relay_status_known => NativeLayoutSlotView {
+            device_name: device.name.clone(),
+            status_label: "同步接收待验证".to_string(),
+            route_hint: "服务器需更新后才能确认接收端".to_string(),
+            tone: NativeStatusTone::Warning,
+        },
+        Some(device) if device.online && device.sync_relay_online => NativeLayoutSlotView {
+            device_name: device.name.clone(),
+            status_label: "同步接收在线".to_string(),
+            route_hint: "可接收主电脑输入".to_string(),
+            tone: NativeStatusTone::Success,
+        },
         Some(device) if device.online => NativeLayoutSlotView {
             device_name: device.name.clone(),
-            status_label: "在线".to_string(),
-            route_hint: "已加入布局，等待同步通道".to_string(),
-            tone: NativeStatusTone::Info,
+            status_label: "同步接收未连接".to_string(),
+            route_hint: "设备在线，等待同步接收端".to_string(),
+            tone: NativeStatusTone::Warning,
         },
         Some(device) => NativeLayoutSlotView {
             device_name: device.name.clone(),
@@ -1667,9 +1694,12 @@ fn native_device_list_rows(
         id: Some(device.id.clone()),
         name: device.name.clone(),
         detail: native_device_row_detail(&state.layout, device),
-        status: if device.online { "在线" } else { "离线" }.to_string(),
-        status_tone: if device.online {
+        status: native_device_sync_status_label(device).to_string(),
+        status_tone: if device.online && device.sync_relay_status_known && device.sync_relay_online
+        {
             NativeStatusTone::Success
+        } else if device.online {
+            NativeStatusTone::Warning
         } else {
             NativeStatusTone::Muted
         },
@@ -1677,6 +1707,18 @@ fn native_device_list_rows(
         can_delete: true,
     }));
     rows
+}
+
+fn native_device_sync_status_label(device: &kmsync_core::DesktopPeerState) -> &'static str {
+    if !device.online {
+        "离线"
+    } else if !device.sync_relay_status_known {
+        "同步接收待验证"
+    } else if device.sync_relay_online {
+        "同步接收在线"
+    } else {
+        "同步接收未连接"
+    }
 }
 
 fn native_device_row_detail(
@@ -2295,6 +2337,89 @@ fn empty_dash(value: &str) -> String {
     }
 }
 
+fn master_layout_waiting_for_sync_receiver(state: &DesktopState) -> bool {
+    if state.device.role != DesktopRole::Master {
+        return false;
+    }
+    state
+        .layout
+        .target_device_ids()
+        .into_iter()
+        .any(|target_id| {
+            state
+                .devices
+                .iter()
+                .find(|device| device.id == target_id)
+                .is_some_and(|device| {
+                    device.online && device.sync_relay_status_known && !device.sync_relay_online
+                })
+        })
+}
+
+fn master_layout_has_unknown_sync_receiver(state: &DesktopState) -> bool {
+    if state.device.role != DesktopRole::Master {
+        return false;
+    }
+    state
+        .layout
+        .target_device_ids()
+        .into_iter()
+        .any(|target_id| {
+            state
+                .devices
+                .iter()
+                .find(|device| device.id == target_id)
+                .is_some_and(|device| device.online && !device.sync_relay_status_known)
+        })
+}
+
+fn master_layout_has_non_relay_target_outside_local_subnet(state: &DesktopState) -> bool {
+    if state.device.role != DesktopRole::Master || state.network.lan_ips.is_empty() {
+        return false;
+    }
+    state
+        .layout
+        .target_device_ids()
+        .into_iter()
+        .filter_map(|target_id| state.devices.iter().find(|device| device.id == target_id))
+        .filter(|device| {
+            device.online
+                && !device.lan_ips.is_empty()
+                && (!device.sync_relay_status_known || !device.sync_relay_online)
+        })
+        .any(|device| {
+            device.lan_ips.iter().all(|target_ip| {
+                state
+                    .network
+                    .lan_ips
+                    .iter()
+                    .all(|local_ip| !same_lan_subnet(local_ip, target_ip))
+            })
+        })
+}
+
+fn same_lan_subnet(left: &str, right: &str) -> bool {
+    let Ok(left) = left.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(right) = right.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match (left, right) {
+        (std::net::IpAddr::V4(left), std::net::IpAddr::V4(right)) => {
+            let left = left.octets();
+            let right = right.octets();
+            left[..3] == right[..3]
+        }
+        (std::net::IpAddr::V6(left), std::net::IpAddr::V6(right)) => {
+            let left = left.segments();
+            let right = right.segments();
+            left[..4] == right[..4]
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2332,6 +2457,8 @@ mod tests {
                 name: "Right PC".to_string(),
                 os: "macos".to_string(),
                 online: true,
+                sync_relay_status_known: true,
+                sync_relay_online: true,
                 lan_ips: vec!["192.168.1.21".to_string()],
                 public_ip: Some("203.0.113.21".to_string()),
                 listen_port: Some(24_800),
@@ -2538,6 +2665,131 @@ mod tests {
     }
 
     #[test]
+    fn native_layout_section_status_waits_for_target_sync_receiver() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                id: Some("master-device".to_string()),
+                role: DesktopRole::Master,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::SelfDevice,
+            layout: kmsync_core::DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..kmsync_core::DesktopLayout::default()
+            },
+            devices: vec![kmsync_core::DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                online: true,
+                sync_relay_status_known: true,
+                sync_relay_online: false,
+                ..kmsync_core::DesktopPeerState::default()
+            }],
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                error: None,
+                targets: vec!["right-device".to_string()],
+                updated_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            (
+                "同步通道 等待从电脑接收端".to_string(),
+                NativeStatusTone::Warning
+            )
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_marks_unknown_target_sync_receiver() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                id: Some("master-device".to_string()),
+                role: DesktopRole::Master,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::SelfDevice,
+            layout: kmsync_core::DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..kmsync_core::DesktopLayout::default()
+            },
+            devices: vec![kmsync_core::DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                online: true,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
+                ..kmsync_core::DesktopPeerState::default()
+            }],
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                error: None,
+                targets: vec!["right-device".to_string()],
+                updated_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            (
+                "同步通道 服务器待更新".to_string(),
+                NativeStatusTone::Warning
+            )
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_marks_target_lan_mismatch_before_capture_state() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                id: Some("master-device".to_string()),
+                role: DesktopRole::Master,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            network: DesktopNetworkState {
+                lan_ips: vec!["192.168.50.226".to_string()],
+                ..DesktopNetworkState::default()
+            },
+            master_state: DesktopConnectionState::SelfDevice,
+            layout: kmsync_core::DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..kmsync_core::DesktopLayout::default()
+            },
+            devices: vec![kmsync_core::DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                online: true,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
+                lan_ips: vec!["192.168.30.99".to_string()],
+                ..kmsync_core::DesktopPeerState::default()
+            }],
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                error: None,
+                targets: vec!["right-device".to_string()],
+                updated_at: Some(123),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            (
+                "同步通道 网络不可直连".to_string(),
+                NativeStatusTone::Warning
+            )
+        );
+    }
+
+    #[test]
     fn native_layout_section_status_reports_transmit_progress() {
         let state = DesktopState {
             master_state: DesktopConnectionState::SelfDevice,
@@ -2569,6 +2821,7 @@ mod tests {
                 error: None,
                 targets: Vec::new(),
                 updated_at: Some(123),
+                relay_connected: true,
                 ..kmsync_core::DesktopSyncRuntimeState::default()
             },
             ..DesktopState::default()
@@ -2577,6 +2830,56 @@ mod tests {
         assert_eq!(
             native_layout_section_status(&state),
             ("同步通道 等待输入".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_waits_for_master_when_client_relay_is_connected() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::Disconnected,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+                error: None,
+                targets: Vec::new(),
+                updated_at: Some(123),
+                relay_connected: true,
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 等待主电脑".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_reports_client_relay_connecting() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::Connecting,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+                error: None,
+                targets: Vec::new(),
+                updated_at: Some(123),
+                relay_connected: false,
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 中继连接中".to_string(), NativeStatusTone::Warning)
         );
     }
 
@@ -2592,6 +2895,7 @@ mod tests {
                 state: kmsync_core::DesktopSyncRuntimeKind::Listening,
                 received_events: 4,
                 last_received_at: Some(456),
+                relay_connected: true,
                 ..kmsync_core::DesktopSyncRuntimeState::default()
             },
             ..DesktopState::default()
@@ -2617,6 +2921,7 @@ mod tests {
                 last_received_at: Some(456),
                 injected_events: 2,
                 last_injected_at: Some(789),
+                relay_connected: true,
                 ..kmsync_core::DesktopSyncRuntimeState::default()
             },
             ..DesktopState::default()
@@ -2641,6 +2946,7 @@ mod tests {
                 error: None,
                 targets: Vec::new(),
                 updated_at: Some(123),
+                relay_connected: false,
                 ..kmsync_core::DesktopSyncRuntimeState::default()
             },
             ..DesktopState::default()
@@ -2736,6 +3042,8 @@ mod tests {
                 name: "Master PC".to_string(),
                 os: "macos".to_string(),
                 online: false,
+                sync_relay_status_known: true,
+                sync_relay_online: false,
                 lan_ips: vec![],
                 public_ip: None,
                 listen_port: None,
@@ -2758,6 +3066,8 @@ mod tests {
                 name: "Right PC".to_string(),
                 os: "windows".to_string(),
                 online: true,
+                sync_relay_status_known: true,
+                sync_relay_online: false,
                 lan_ips: vec![],
                 public_ip: None,
                 listen_port: None,
@@ -2768,9 +3078,33 @@ mod tests {
 
         assert_eq!(
             native_layout_slot_status_text(&state, Some("right-device")),
-            "在线"
+            "同步接收未连接"
         );
         assert_eq!(native_layout_slot_status_text(&state, None), "未配置");
+    }
+
+    #[test]
+    fn native_layout_slot_status_marks_unknown_relay_status() {
+        let state = DesktopState {
+            devices: vec![DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                os: "windows".to_string(),
+                online: true,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
+                lan_ips: vec![],
+                public_ip: None,
+                listen_port: None,
+                last_seen_at: None,
+            }],
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_slot_status_text(&state, Some("right-device")),
+            "同步接收待验证"
+        );
     }
 
     #[test]
@@ -2782,6 +3116,8 @@ mod tests {
                     name: "Right PC".to_string(),
                     os: "windows".to_string(),
                     online: true,
+                    sync_relay_status_known: true,
+                    sync_relay_online: true,
                     lan_ips: vec!["192.168.1.21".to_string()],
                     public_ip: None,
                     listen_port: Some(24_800),
@@ -2792,6 +3128,8 @@ mod tests {
                     name: "Bottom PC".to_string(),
                     os: "linux".to_string(),
                     online: false,
+                    sync_relay_status_known: true,
+                    sync_relay_online: false,
                     lan_ips: vec!["192.168.1.30".to_string()],
                     public_ip: None,
                     listen_port: Some(24_800),
@@ -2814,9 +3152,9 @@ mod tests {
             native_layout_slot_view(&state, Some("right-device")),
             NativeLayoutSlotView {
                 device_name: "Right PC".to_string(),
-                status_label: "在线".to_string(),
-                route_hint: "已加入布局，等待同步通道".to_string(),
-                tone: NativeStatusTone::Info,
+                status_label: "同步接收在线".to_string(),
+                route_hint: "可接收主电脑输入".to_string(),
+                tone: NativeStatusTone::Success,
             }
         );
         assert_eq!(
@@ -2861,6 +3199,8 @@ mod tests {
                 name: "Master PC".to_string(),
                 os: "macos".to_string(),
                 online: true,
+                sync_relay_status_known: true,
+                sync_relay_online: true,
                 lan_ips: vec!["192.168.1.10".to_string()],
                 public_ip: None,
                 listen_port: Some(24_800),
@@ -2899,6 +3239,8 @@ mod tests {
                     name: "This PC".to_string(),
                     os: "windows".to_string(),
                     online: true,
+                    sync_relay_status_known: true,
+                    sync_relay_online: true,
                     lan_ips: vec![],
                     public_ip: None,
                     listen_port: None,
@@ -2909,6 +3251,8 @@ mod tests {
                     name: "Right PC".to_string(),
                     os: "macos".to_string(),
                     online: true,
+                    sync_relay_status_known: true,
+                    sync_relay_online: true,
                     lan_ips: vec![],
                     public_ip: None,
                     listen_port: None,
@@ -3029,6 +3373,8 @@ mod tests {
                 name: "Right PC".to_string(),
                 os: "macos".to_string(),
                 online: true,
+                sync_relay_status_known: true,
+                sync_relay_online: false,
                 lan_ips: vec!["192.168.1.21".to_string()],
                 public_ip: None,
                 listen_port: Some(24_800),
@@ -3055,8 +3401,8 @@ mod tests {
                     id: Some("right-device".to_string()),
                     name: "Right PC".to_string(),
                     detail: "macos".to_string(),
-                    status: "在线".to_string(),
-                    status_tone: NativeStatusTone::Success,
+                    status: "同步接收未连接".to_string(),
+                    status_tone: NativeStatusTone::Warning,
                     lan_ips: vec!["192.168.1.21".to_string()],
                     can_delete: true,
                 }

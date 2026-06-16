@@ -33,6 +33,15 @@ Start a local control-plane server:
 kmsync-server /etc/kmsync/kmsync-server.json
 ```
 
+Verify a deployed server has the desktop sync relay status capability:
+
+```bash
+curl http://<server-ip>:24888/health
+```
+
+The response should include `"version"` and
+`"capabilities":{"relay_rx_status":true}`.
+
 Example server configuration:
 
 ```json
@@ -107,6 +116,13 @@ kmsync-daemon ping
 kmsync-daemon status
 ```
 
+Probe a configured desktop target without moving the remote pointer:
+
+```bash
+kmsync-daemon target-probe configs/daemon.example.json <target_device_id>
+kmsync-daemon target-input-test configs/daemon.example.json <target_device_id>
+```
+
 Generate a local graphical device layout editor:
 
 ```bash
@@ -136,8 +152,8 @@ macOS:
 
 Windows:
 
-- The installer registers `KMSyncCoreService` and a user-mode companion Run entry.
-- Run the companion on the interactive desktop for hooks and `SendInput`.
+- The installer starts only the user-mode companion through the Run entry.
+- Keep the companion running on the interactive desktop for hooks and `SendInput`.
 - Elevated/UAC secure desktop control is not included in this MVP.
 - The generated installer is currently unsigned.
 

@@ -161,6 +161,13 @@ impl RelayHub {
         tx.send(frame)
             .map_err(|_| RelayRouteError::TargetReceiverClosed)
     }
+
+    fn rx_online(&self, device_id: Uuid) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&device_id)
+    }
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -370,10 +377,23 @@ struct ErrorBody {
 #[derive(Debug, Serialize)]
 struct HealthBody {
     ok: bool,
+    version: &'static str,
+    capabilities: HealthCapabilities,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthCapabilities {
+    relay_rx_status: bool,
 }
 
 async fn health() -> Json<HealthBody> {
-    Json(HealthBody { ok: true })
+    Json(HealthBody {
+        ok: true,
+        version: env!("CARGO_PKG_VERSION"),
+        capabilities: HealthCapabilities {
+            relay_rx_status: true,
+        },
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1175,6 +1195,12 @@ async fn register_device(
 struct DeviceWithPresence {
     device: Device,
     presence: Option<Presence>,
+    relay: RelayStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct RelayStatus {
+    rx_online: bool,
 }
 
 async fn list_devices(
@@ -1191,6 +1217,9 @@ async fn list_devices(
         .map(|device| DeviceWithPresence {
             device: device.clone(),
             presence: presence_for_device_list(store.presence.get(&device.id), now),
+            relay: RelayStatus {
+                rx_online: state.relay.rx_online(device.id),
+            },
         })
         .collect();
     Ok(Json(devices))
@@ -2010,6 +2039,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_version_and_relay_status_capability() {
+        let (status, body) = json_request(
+            test_app(),
+            Method::GET,
+            "/health".to_string(),
+            None,
+            Value::Null,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["capabilities"]["relay_rx_status"], true);
+    }
+
+    #[tokio::test]
     async fn relay_hub_routes_payload_to_registered_target_and_unregisters_stale_connection() {
         let hub = RelayHub::default();
         let target = Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("uuid");
@@ -2493,6 +2539,33 @@ mod tests {
         assert_eq!(body[0]["device"]["name"], "desktop");
         assert_eq!(body[0]["presence"]["lan_ips"][0], "192.168.1.10");
         assert_eq!(body[0]["presence"]["public_ip"], "127.0.0.1");
+        assert_eq!(body[0]["relay"]["rx_online"], false);
+    }
+
+    #[tokio::test]
+    async fn device_list_reports_relay_receiver_online_status() {
+        let state = AppState::load(None).expect("in-memory state");
+        let app = build_app(state.clone());
+        let token = login(app.clone()).await;
+        let device_id = register_device(app.clone(), &token, "desktop").await;
+        let device_uuid = Uuid::parse_str(&device_id).expect("device uuid");
+
+        let (_rx_tx, receiver) = (
+            Uuid::new_v4(),
+            state.relay.register(device_uuid, Uuid::new_v4()),
+        );
+        let (list_status, devices) = json_request(
+            app,
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(devices[0]["relay"]["rx_online"], true);
+        drop(receiver);
     }
 
     #[tokio::test]
