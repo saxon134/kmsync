@@ -42,13 +42,9 @@ impl DesktopLayout {
     }
 
     pub fn validate(&self, current_device_id: Option<&str>) -> Result<(), DesktopLayoutError> {
+        let _ = current_device_id;
         let mut seen = BTreeSet::new();
         for device_id in self.target_device_ids() {
-            if current_device_id == Some(device_id) {
-                return Err(DesktopLayoutError::TargetsCurrentDevice(
-                    device_id.to_string(),
-                ));
-            }
             if !seen.insert(device_id.to_string()) {
                 return Err(DesktopLayoutError::DuplicateTarget(device_id.to_string()));
             }
@@ -84,6 +80,12 @@ impl Default for DesktopConnectionState {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DesktopDisplayState {
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DesktopNetworkState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
@@ -99,6 +101,8 @@ pub struct DesktopNetworkState {
     pub listen_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DesktopDisplayState>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,6 +113,10 @@ pub struct DesktopDeviceState {
     pub os: String,
     pub app_version: String,
     pub role: DesktopRole,
+    #[serde(default)]
+    pub sync_relay_status_known: bool,
+    #[serde(default)]
+    pub sync_relay_online: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -129,6 +137,8 @@ pub struct DesktopPeerState {
     pub listen_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DesktopDisplayState>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -172,6 +182,16 @@ pub struct DesktopSyncRuntimeState {
     pub captured_events: u64,
     #[serde(default)]
     pub routed_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_capture_pointer_x: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_capture_pointer_y: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_capture_edge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_capture_target: Option<String>,
+    #[serde(default)]
+    pub last_capture_routed: bool,
     #[serde(default)]
     pub sent_events: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,6 +340,11 @@ mod tests {
             updated_at: Some(123),
             captured_events: 12,
             routed_events: 3,
+            last_capture_pointer_x: Some(1432),
+            last_capture_pointer_y: Some(812),
+            last_capture_edge: Some("right".to_string()),
+            last_capture_target: Some("right-device".to_string()),
+            last_capture_routed: true,
             ..DesktopSyncRuntimeState::default()
         };
 
@@ -329,10 +354,15 @@ mod tests {
 
         assert_eq!(decoded.captured_events, 12);
         assert_eq!(decoded.routed_events, 3);
+        assert_eq!(decoded.last_capture_pointer_x, Some(1432));
+        assert_eq!(decoded.last_capture_pointer_y, Some(812));
+        assert_eq!(decoded.last_capture_edge.as_deref(), Some("right"));
+        assert_eq!(decoded.last_capture_target.as_deref(), Some("right-device"));
+        assert!(decoded.last_capture_routed);
     }
 
     #[test]
-    fn layout_validation_rejects_current_device_as_target() {
+    fn layout_validation_allows_current_device_as_local_edge_target() {
         let layout = DesktopLayout {
             left: Some("current-device".to_string()),
             right: None,
@@ -340,12 +370,7 @@ mod tests {
             bottom: None,
         };
 
-        assert_eq!(
-            layout.validate(Some("current-device")),
-            Err(DesktopLayoutError::TargetsCurrentDevice(
-                "current-device".to_string()
-            ))
-        );
+        assert_eq!(layout.validate(Some("current-device")), Ok(()));
     }
 
     #[test]

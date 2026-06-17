@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use kmsync_core::{DesktopDisplayState, ProtocolFrame, TransportLane};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
@@ -182,10 +183,32 @@ struct Store {
     devices: HashMap<Uuid, Device>,
     presence: HashMap<Uuid, Presence>,
     #[serde(default)]
+    deleted_device_keys: HashSet<DeletedDeviceKey>,
+    #[serde(default)]
+    deleted_presented_devices: HashSet<DeletedPresentedDeviceKey>,
+    #[serde(default)]
     topologies: HashMap<Uuid, Topology>,
     profiles: HashMap<String, DeviceProfile>,
     profile_history: HashMap<String, Vec<DeviceProfile>>,
     profile_revision: u64,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+struct DeletedDeviceKey {
+    user_id: Uuid,
+    #[serde(default)]
+    device_id: Option<Uuid>,
+    public_key: String,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+struct DeletedPresentedDeviceKey {
+    user_id: Uuid,
+    name: String,
+    os_type: String,
+    lan_ip: Option<String>,
+    public_ip: Option<String>,
+    listen_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +272,8 @@ struct Presence {
     expires_at: u64,
     #[serde(default = "default_version")]
     presence_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display: Option<DesktopDisplayState>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1037,13 +1062,15 @@ async fn handle_relay_socket_message(
 ) -> bool {
     match incoming {
         Some(Ok(Message::Binary(payload))) => {
-            let ack = relay_route_ack_message(route_relay_client_frame(
-                state,
-                user_id,
-                source_device_id,
-                payload.as_ref(),
-            ));
-            socket.send(Message::Text(ack.into())).await.is_ok()
+            let requires_ack = relay_client_frame_requires_ack(payload.as_ref()).unwrap_or(true);
+            let route_result =
+                route_relay_client_frame(state, user_id, source_device_id, payload.as_ref());
+            if requires_ack {
+                let ack = relay_route_ack_message(route_result);
+                socket.send(Message::Text(ack.into())).await.is_ok()
+            } else {
+                true
+            }
         }
         Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await.is_ok(),
         Some(Ok(Message::Close(_))) | None => false,
@@ -1090,6 +1117,13 @@ fn parse_relay_client_frame(payload: &[u8]) -> Result<(Uuid, &[u8]), String> {
     Ok((target_device_id, &payload[target_id_end..]))
 }
 
+fn relay_client_frame_requires_ack(payload: &[u8]) -> Result<bool, String> {
+    let (_, frame) = parse_relay_client_frame(payload)?;
+    let frame = ProtocolFrame::decode(frame)
+        .map_err(|error| format!("relay protocol frame is invalid: {error:?}"))?;
+    Ok(frame.payload.transport_lane() != TransportLane::InputUnreliable)
+}
+
 fn assert_relay_device_enabled(
     state: &AppState,
     user_id: Uuid,
@@ -1124,6 +1158,13 @@ struct RegisterDeviceResponse {
     device_id: Uuid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletedDeviceKeyDecision {
+    NotDeleted,
+    ReactivateSameIdentity,
+    BlockDuplicateIdentity,
+}
+
 async fn register_device(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1137,6 +1178,16 @@ async fn register_device(
     let mut store = state.lock()?;
     let now = now_seconds();
     let requested_device_id = request.device_id.unwrap_or_else(Uuid::new_v4);
+    let deleted_key_decision =
+        deleted_device_key_decision(&store, user_id, requested_device_id, &request.public_key);
+    if !store.devices.contains_key(&requested_device_id)
+        && deleted_key_decision == DeletedDeviceKeyDecision::BlockDuplicateIdentity
+    {
+        return Err(ApiError::forbidden("device was deleted"));
+    }
+    let normalized_name = normalize_presented_device_field(&request.name);
+    let normalized_os_type = normalize_presented_device_field(&request.os_type);
+    let public_key = request.public_key.clone();
     let device_id = if store.devices.contains_key(&requested_device_id) {
         requested_device_id
     } else {
@@ -1187,8 +1238,43 @@ async fn register_device(
         };
         store.devices.insert(device_id, device);
     }
+    store.deleted_device_keys.retain(|key| {
+        !(key.user_id == user_id
+            && key.public_key == public_key
+            && (key.device_id.is_none() || key.device_id == Some(device_id)))
+    });
+    if deleted_key_decision == DeletedDeviceKeyDecision::ReactivateSameIdentity {
+        store.deleted_presented_devices.retain(|key| {
+            !(key.user_id == user_id
+                && key.name == normalized_name
+                && key.os_type == normalized_os_type)
+        });
+    }
     state.save_locked(&store)?;
     Ok(Json(RegisterDeviceResponse { device_id }))
+}
+
+fn deleted_device_key_decision(
+    store: &Store,
+    user_id: Uuid,
+    requested_device_id: Uuid,
+    public_key: &str,
+) -> DeletedDeviceKeyDecision {
+    let mut decision = DeletedDeviceKeyDecision::NotDeleted;
+    for key in &store.deleted_device_keys {
+        if key.user_id != user_id || key.public_key != public_key {
+            continue;
+        }
+        match key.device_id {
+            Some(deleted_device_id) if deleted_device_id != requested_device_id => {
+                return DeletedDeviceKeyDecision::BlockDuplicateIdentity;
+            }
+            Some(_) | None => {
+                decision = DeletedDeviceKeyDecision::ReactivateSameIdentity;
+            }
+        }
+    }
+    decision
 }
 
 #[derive(Debug, Serialize)]
@@ -1347,6 +1433,12 @@ struct DeleteDeviceResponse {
     deleted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceDeletionScope {
+    SingleRecord,
+    PresentedDevice,
+}
+
 async fn delete_device(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1355,42 +1447,269 @@ async fn delete_device(
     let user_id = authorize_or_default(&state, &headers)?;
     let mut store = state.lock()?;
     assert_device_owner(&store, user_id, device_id)?;
-    let presence_version = store
-        .presence
-        .get(&device_id)
-        .map_or(1, |presence| presence.presence_version.saturating_add(1));
-    store.devices.remove(&device_id);
-    store.presence.remove(&device_id);
+    let now = now_seconds();
+    let deletion_scope = device_deletion_scope(&store, user_id, device_id, now);
+    let deleted_device_ids = match deletion_scope {
+        DeviceDeletionScope::SingleRecord => vec![device_id],
+        DeviceDeletionScope::PresentedDevice => {
+            device_deletion_group_ids(&store, user_id, device_id)
+        }
+    };
+    let deleted_devices = deleted_device_ids
+        .iter()
+        .filter_map(|device_id| store.devices.get(device_id).cloned())
+        .collect::<Vec<_>>();
+    let deleted_device_ids = deleted_devices
+        .iter()
+        .map(|device| device.id)
+        .collect::<HashSet<_>>();
+    let presence_versions = deleted_device_ids
+        .iter()
+        .map(|device_id| {
+            let presence_version = store
+                .presence
+                .get(device_id)
+                .map_or(1, |presence| presence.presence_version.saturating_add(1));
+            (*device_id, presence_version)
+        })
+        .collect::<Vec<_>>();
+    for device in &deleted_devices {
+        store.deleted_device_keys.insert(DeletedDeviceKey {
+            user_id,
+            device_id: Some(device.id),
+            public_key: device.public_key.clone(),
+        });
+        if deletion_scope == DeviceDeletionScope::PresentedDevice {
+            if let Some(presence) = store.presence.get(&device.id) {
+                for key in deleted_presented_device_keys_for_presence(user_id, device, presence) {
+                    store.deleted_presented_devices.insert(key);
+                }
+            }
+        }
+    }
+    for device_id in &deleted_device_ids {
+        store.devices.remove(device_id);
+        store.presence.remove(device_id);
+    }
     store.topologies.values_mut().for_each(|topology| {
-        if topology.master_device_id == Some(device_id) {
+        let mut changed = false;
+        if topology
+            .master_device_id
+            .is_some_and(|master_device_id| deleted_device_ids.contains(&master_device_id))
+        {
             topology.master_device_id = None;
+            changed = true;
+        }
+        changed |= clear_deleted_layout_slot(&mut topology.layout.left, &deleted_device_ids);
+        changed |= clear_deleted_layout_slot(&mut topology.layout.right, &deleted_device_ids);
+        changed |= clear_deleted_layout_slot(&mut topology.layout.top, &deleted_device_ids);
+        changed |= clear_deleted_layout_slot(&mut topology.layout.bottom, &deleted_device_ids);
+        if changed {
             topology.topology_version = topology.topology_version.saturating_add(1);
-            topology.updated_at = now_seconds();
-        }
-        if topology.layout.left == Some(device_id) {
-            topology.layout.left = None;
-        }
-        if topology.layout.right == Some(device_id) {
-            topology.layout.right = None;
-        }
-        if topology.layout.top == Some(device_id) {
-            topology.layout.top = None;
-        }
-        if topology.layout.bottom == Some(device_id) {
-            topology.layout.bottom = None;
+            topology.updated_at = now;
         }
     });
     store.profiles.retain(|_, profile| {
-        profile.source_device_id != device_id && profile.target_device_id != device_id
+        !deleted_device_ids.contains(&profile.source_device_id)
+            && !deleted_device_ids.contains(&profile.target_device_id)
     });
     state.save_locked(&store)?;
-    state.publish_event(ServerEvent::DevicePresenceChanged {
-        user_id,
-        device_id,
-        online: false,
-        presence_version,
-    });
+    for (device_id, presence_version) in presence_versions {
+        state.publish_event(ServerEvent::DevicePresenceChanged {
+            user_id,
+            device_id,
+            online: false,
+            presence_version,
+        });
+    }
     Ok(Json(DeleteDeviceResponse { deleted: true }))
+}
+
+fn device_deletion_scope(
+    store: &Store,
+    user_id: Uuid,
+    device_id: Uuid,
+    now: u64,
+) -> DeviceDeletionScope {
+    let Some(target) = store.devices.get(&device_id) else {
+        return DeviceDeletionScope::SingleRecord;
+    };
+    let target_presence = store.presence.get(&device_id);
+    let target_online =
+        target_presence.is_some_and(|presence| presence_is_online_at(presence, now));
+    if target_online {
+        return DeviceDeletionScope::PresentedDevice;
+    }
+    let has_online_presented_sibling = store
+        .devices
+        .values()
+        .filter(|candidate| candidate.user_id == user_id && candidate.id != target.id)
+        .any(|candidate| {
+            let candidate_presence = store.presence.get(&candidate.id);
+            candidate_presence.is_some_and(|presence| presence_is_online_at(presence, now))
+                && devices_share_presented_identity(
+                    target,
+                    target_presence,
+                    candidate,
+                    candidate_presence,
+                )
+        });
+    if has_online_presented_sibling {
+        DeviceDeletionScope::SingleRecord
+    } else {
+        DeviceDeletionScope::PresentedDevice
+    }
+}
+
+fn clear_deleted_layout_slot(slot: &mut Option<Uuid>, deleted_device_ids: &HashSet<Uuid>) -> bool {
+    if slot.is_some_and(|device_id| deleted_device_ids.contains(&device_id)) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn device_deletion_group_ids(store: &Store, user_id: Uuid, device_id: Uuid) -> Vec<Uuid> {
+    let Some(target) = store.devices.get(&device_id) else {
+        return Vec::new();
+    };
+    let target_presence = store.presence.get(&device_id);
+    store
+        .devices
+        .values()
+        .filter(|candidate| candidate.user_id == user_id)
+        .filter(|candidate| {
+            devices_share_presented_identity(
+                target,
+                target_presence,
+                candidate,
+                store.presence.get(&candidate.id),
+            )
+        })
+        .map(|device| device.id)
+        .collect()
+}
+
+fn devices_share_presented_identity(
+    target: &Device,
+    target_presence: Option<&Presence>,
+    candidate: &Device,
+    candidate_presence: Option<&Presence>,
+) -> bool {
+    if target.id == candidate.id {
+        return true;
+    }
+    let target_public_key = target.public_key.trim();
+    let candidate_public_key = candidate.public_key.trim();
+    if !target_public_key.is_empty() && target_public_key == candidate_public_key {
+        return true;
+    }
+    if target.name.trim().to_ascii_lowercase() != candidate.name.trim().to_ascii_lowercase()
+        || target.os_type.trim().to_ascii_lowercase()
+            != candidate.os_type.trim().to_ascii_lowercase()
+    {
+        return false;
+    }
+    let (Some(target_presence), Some(candidate_presence)) = (target_presence, candidate_presence)
+    else {
+        return false;
+    };
+    if lan_ips_overlap(&target_presence.lan_ips, &candidate_presence.lan_ips) {
+        return true;
+    }
+    let target_has_lan = target_presence
+        .lan_ips
+        .iter()
+        .any(|ip| !ip.trim().is_empty());
+    let candidate_has_lan = candidate_presence
+        .lan_ips
+        .iter()
+        .any(|ip| !ip.trim().is_empty());
+    !target_has_lan
+        && !candidate_has_lan
+        && !target_presence.public_ip.trim().is_empty()
+        && target_presence.public_ip.trim() == candidate_presence.public_ip.trim()
+        && target_presence.listen_port == candidate_presence.listen_port
+}
+
+fn lan_ips_overlap(left: &[String], right: &[String]) -> bool {
+    left.iter().any(|left_ip| {
+        let left_ip = left_ip.trim();
+        !left_ip.is_empty() && right.iter().any(|right_ip| left_ip == right_ip.trim())
+    })
+}
+
+fn deleted_presented_device_keys_for_presence(
+    user_id: Uuid,
+    device: &Device,
+    presence: &Presence,
+) -> Vec<DeletedPresentedDeviceKey> {
+    deleted_presented_device_keys(
+        user_id,
+        device,
+        &presence.lan_ips,
+        &presence.public_ip,
+        presence.listen_port,
+    )
+}
+
+fn deleted_presented_device_keys_for_heartbeat(
+    user_id: Uuid,
+    device: &Device,
+    request: &HeartbeatRequest,
+    public_ip: &str,
+) -> Vec<DeletedPresentedDeviceKey> {
+    deleted_presented_device_keys(
+        user_id,
+        device,
+        &request.lan_ips,
+        public_ip,
+        request.listen_port,
+    )
+}
+
+fn deleted_presented_device_keys(
+    user_id: Uuid,
+    device: &Device,
+    lan_ips: &[String],
+    public_ip: &str,
+    listen_port: u16,
+) -> Vec<DeletedPresentedDeviceKey> {
+    let name = normalize_presented_device_field(&device.name);
+    let os_type = normalize_presented_device_field(&device.os_type);
+    let mut keys = lan_ips
+        .iter()
+        .filter_map(|lan_ip| {
+            let lan_ip = normalize_presented_device_field(lan_ip);
+            (!lan_ip.is_empty()).then(|| DeletedPresentedDeviceKey {
+                user_id,
+                name: name.clone(),
+                os_type: os_type.clone(),
+                lan_ip: Some(lan_ip),
+                public_ip: None,
+                listen_port: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        let public_ip = public_ip.trim();
+        if !public_ip.is_empty() {
+            keys.push(DeletedPresentedDeviceKey {
+                user_id,
+                name,
+                os_type,
+                lan_ip: None,
+                public_ip: Some(public_ip.to_string()),
+                listen_port: Some(listen_port),
+            });
+        }
+    }
+    keys
+}
+
+fn normalize_presented_device_field(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1398,6 +1717,8 @@ struct HeartbeatRequest {
     lan_ips: Vec<String>,
     listen_port: u16,
     nat_type: Option<String>,
+    #[serde(default)]
+    display: Option<DesktopDisplayState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1425,6 +1746,21 @@ async fn heartbeat(
     if device.disabled {
         return Err(ApiError::forbidden("device is disabled"));
     }
+    let device = device.clone();
+    if deleted_presented_device_keys_for_heartbeat(
+        user_id,
+        &device,
+        &request,
+        &addr.ip().to_string(),
+    )
+    .into_iter()
+    .any(|key| store.deleted_presented_devices.contains(&key))
+    {
+        store.devices.remove(&device_id);
+        store.presence.remove(&device_id);
+        state.save_locked(&store)?;
+        return Err(ApiError::forbidden("device was deleted"));
+    }
 
     let last_seen_at = now_seconds();
     let nat_type = request.nat_type.unwrap_or_else(|| "unknown".to_string());
@@ -1436,6 +1772,7 @@ async fn heartbeat(
             && presence.lan_ips == request.lan_ips
             && presence.listen_port == request.listen_port
             && presence.nat_type == nat_type
+            && presence.display == request.display
         {
             presence.presence_version
         } else {
@@ -1447,6 +1784,7 @@ async fn heartbeat(
             || presence.lan_ips != request.lan_ips
             || presence.listen_port != request.listen_port
             || presence.nat_type != nat_type
+            || presence.display != request.display
     });
     let presence = Presence {
         device_id,
@@ -1459,6 +1797,7 @@ async fn heartbeat(
         last_seen_at,
         expires_at: last_seen_at.saturating_add(PRESENCE_TTL_SECONDS),
         presence_version,
+        display: request.display,
     };
     store.presence.insert(device_id, presence);
     state.save_locked(&store)?;
@@ -2006,6 +2345,10 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::extract::ConnectInfo;
     use axum::http::{Method, Request};
+    use kmsync_core::{
+        InputEvent, InputEventEnvelope, Key, KeyEvent, KeyState, Modifiers, MouseEvent,
+        ProtocolFrame, ProtocolPayload,
+    };
     use serde_json::json;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tower::util::ServiceExt;
@@ -2035,6 +2378,52 @@ mod tests {
         assert_eq!(
             relay_route_ack_message(Err("relay route failed: target disconnected".to_string())),
             "relay_error=relay route failed: target disconnected"
+        );
+    }
+
+    #[test]
+    fn relay_client_frame_ack_is_skipped_for_unreliable_mouse_moves() {
+        let target = Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("uuid");
+        let move_frame = ProtocolFrame {
+            sequence: 7,
+            timestamp_micros: 123,
+            payload: ProtocolPayload::Input(InputEventEnvelope::legacy(InputEvent::Mouse(
+                MouseEvent::Move { dx: 12.0, dy: -6.0 },
+            ))),
+        };
+        let position_frame = ProtocolFrame {
+            sequence: 8,
+            timestamp_micros: 124,
+            payload: ProtocolPayload::Input(InputEventEnvelope::legacy(InputEvent::Mouse(
+                MouseEvent::Position {
+                    x_ratio: 0.98,
+                    y_ratio: 0.5,
+                },
+            ))),
+        };
+        let key_frame = ProtocolFrame {
+            sequence: 9,
+            timestamp_micros: 125,
+            payload: ProtocolPayload::Input(InputEventEnvelope::legacy(InputEvent::Key(
+                KeyEvent {
+                    key: Key::A,
+                    state: KeyState::Pressed,
+                    modifiers: Modifiers::CONTROL,
+                },
+            ))),
+        };
+
+        assert_eq!(
+            relay_client_frame_requires_ack(&relay_client_payload(target, &move_frame)),
+            Ok(false)
+        );
+        assert_eq!(
+            relay_client_frame_requires_ack(&relay_client_payload(target, &position_frame)),
+            Ok(true)
+        );
+        assert_eq!(
+            relay_client_frame_requires_ack(&relay_client_payload(target, &key_frame)),
+            Ok(true)
         );
     }
 
@@ -2112,6 +2501,17 @@ mod tests {
         body["access_token"].as_str().expect("token").to_string()
     }
 
+    fn relay_client_payload(target_device_id: Uuid, frame: &ProtocolFrame) -> Vec<u8> {
+        let frame_bytes = frame.encode_vec();
+        let mut payload = Vec::with_capacity(
+            RELAY_FRAME_MAGIC.len() + RELAY_TARGET_DEVICE_ID_LEN + frame_bytes.len(),
+        );
+        payload.extend_from_slice(RELAY_FRAME_MAGIC);
+        payload.extend_from_slice(target_device_id.to_string().as_bytes());
+        payload.extend_from_slice(&frame_bytes);
+        payload
+    }
+
     async fn login_with_body(app: Router) -> Value {
         login_with_email(app, "tester@example.com").await
     }
@@ -2168,19 +2568,43 @@ mod tests {
         nat_type: &str,
         remote_addr: &str,
     ) -> (StatusCode, Value) {
+        send_heartbeat_with_display(
+            app,
+            token,
+            device_id,
+            lan_ips,
+            listen_port,
+            nat_type,
+            remote_addr,
+            None,
+        )
+        .await
+    }
+
+    async fn send_heartbeat_with_display(
+        app: Router,
+        token: &str,
+        device_id: &str,
+        lan_ips: Vec<&str>,
+        listen_port: u16,
+        nat_type: &str,
+        remote_addr: &str,
+        display: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut body = json!({
+            "lan_ips": lan_ips,
+            "listen_port": listen_port,
+            "nat_type": nat_type
+        });
+        if let Some(display) = display {
+            body["display"] = display;
+        }
         let mut heartbeat = Request::builder()
             .method(Method::POST)
             .uri(format!("/v1/devices/{device_id}/heartbeat"))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
-            .body(Body::from(
-                json!({
-                    "lan_ips": lan_ips,
-                    "listen_port": listen_port,
-                    "nat_type": nat_type
-                })
-                .to_string(),
-            ))
+            .body(Body::from(body.to_string()))
             .expect("heartbeat request");
         heartbeat.extensions_mut().insert(ConnectInfo(
             remote_addr.parse::<SocketAddr>().expect("remote addr"),
@@ -2357,6 +2781,427 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleted_device_public_key_cannot_re_register_as_duplicate() {
+        let app = test_app();
+        let token = login(app.clone()).await;
+        let deleted_device_id = "55555555-5555-4555-8555-555555555555";
+        let regenerated_device_id = "66666666-6666-4666-8666-666666666666";
+
+        let (register_status, _) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": deleted_device_id,
+                "name": "Duplicate PC",
+                "role": "client",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:deleted-duplicate-key"
+            }),
+        )
+        .await;
+        assert_eq!(register_status, StatusCode::OK);
+
+        let (delete_status, deleted) = json_request(
+            app.clone(),
+            Method::DELETE,
+            format!("/v1/devices/{deleted_device_id}"),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(delete_status, StatusCode::OK);
+        assert_eq!(deleted["deleted"], true);
+
+        let (register_again_status, register_again) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": regenerated_device_id,
+                "name": "Duplicate PC",
+                "role": "client",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:deleted-duplicate-key"
+            }),
+        )
+        .await;
+        assert_eq!(register_again_status, StatusCode::FORBIDDEN);
+        assert_eq!(register_again["error"], "device was deleted");
+
+        let (list_status, devices) = json_request(
+            app,
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert!(devices.as_array().expect("devices").is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_device_removes_same_presented_lan_duplicate() {
+        let app = test_app();
+        let token = login(app.clone()).await;
+        let first_device_id = "55555555-5555-4555-8555-555555555555";
+        let duplicate_device_id = "66666666-6666-4666-8666-666666666666";
+        let regenerated_device_id = "77777777-7777-4777-8777-777777777777";
+
+        for (device_id, public_key) in [
+            (first_device_id, "ed25519:first-duplicate-key"),
+            (duplicate_device_id, "ed25519:second-duplicate-key"),
+        ] {
+            let (register_status, _) = json_request(
+                app.clone(),
+                Method::POST,
+                "/v1/devices/register".to_string(),
+                Some(&token),
+                json!({
+                    "device_id": device_id,
+                    "name": "Office Windows",
+                    "role": "client",
+                    "os_type": "windows",
+                    "os_version": "11",
+                    "app_version": "0.1.0",
+                    "public_key": public_key
+                }),
+            )
+            .await;
+            assert_eq!(register_status, StatusCode::OK);
+        }
+
+        for device_id in [first_device_id, duplicate_device_id] {
+            let (heartbeat_status, _) = send_heartbeat(
+                app.clone(),
+                &token,
+                device_id,
+                vec!["192.168.1.32"],
+                24800,
+                "lan",
+                "203.0.113.20:51000",
+            )
+            .await;
+            assert_eq!(heartbeat_status, StatusCode::OK);
+        }
+
+        let (before_delete_status, devices_before_delete) = json_request(
+            app.clone(),
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(before_delete_status, StatusCode::OK);
+        assert_eq!(devices_before_delete.as_array().expect("devices").len(), 2);
+
+        let (delete_status, deleted) = json_request(
+            app.clone(),
+            Method::DELETE,
+            format!("/v1/devices/{first_device_id}"),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(delete_status, StatusCode::OK);
+        assert_eq!(deleted["deleted"], true);
+
+        let (list_status, devices) = json_request(
+            app.clone(),
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert!(devices.as_array().expect("devices").is_empty());
+
+        let (register_again_status, register_again) = json_request(
+            app,
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": regenerated_device_id,
+                "name": "Office Windows",
+                "role": "client",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:second-duplicate-key"
+            }),
+        )
+        .await;
+        assert_eq!(register_again_status, StatusCode::FORBIDDEN);
+        assert_eq!(register_again["error"], "device was deleted");
+    }
+
+    #[tokio::test]
+    async fn deleting_offline_duplicate_preserves_online_presented_device() {
+        let app = test_app();
+        let token = login(app.clone()).await;
+        let stale_device_id = "55555555-5555-4555-8555-555555555555";
+        let online_device_id = "66666666-6666-4666-8666-666666666666";
+
+        for (device_id, public_key) in [
+            (stale_device_id, "ed25519:stale-duplicate-key"),
+            (online_device_id, "ed25519:online-duplicate-key"),
+        ] {
+            let (register_status, _) = json_request(
+                app.clone(),
+                Method::POST,
+                "/v1/devices/register".to_string(),
+                Some(&token),
+                json!({
+                    "device_id": device_id,
+                    "name": "Office Windows",
+                    "role": "client",
+                    "os_type": "windows",
+                    "os_version": "11",
+                    "app_version": "0.1.0",
+                    "public_key": public_key
+                }),
+            )
+            .await;
+            assert_eq!(register_status, StatusCode::OK);
+
+            let (heartbeat_status, _) = send_heartbeat(
+                app.clone(),
+                &token,
+                device_id,
+                vec!["192.168.1.32"],
+                24800,
+                "lan",
+                "203.0.113.20:51000",
+            )
+            .await;
+            assert_eq!(heartbeat_status, StatusCode::OK);
+        }
+
+        let (offline_status, _) = json_request(
+            app.clone(),
+            Method::POST,
+            format!("/v1/devices/{stale_device_id}/offline"),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(offline_status, StatusCode::OK);
+
+        let (delete_status, deleted) = json_request(
+            app.clone(),
+            Method::DELETE,
+            format!("/v1/devices/{stale_device_id}"),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(delete_status, StatusCode::OK);
+        assert_eq!(deleted["deleted"], true);
+
+        let (list_status, devices) = json_request(
+            app.clone(),
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        let devices = devices.as_array().expect("devices");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0]["device"]["id"], online_device_id);
+
+        let (heartbeat_status, _) = send_heartbeat(
+            app,
+            &token,
+            online_device_id,
+            vec!["192.168.1.32"],
+            24800,
+            "lan",
+            "203.0.113.20:51000",
+        )
+        .await;
+        assert_eq!(heartbeat_status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn deleted_presented_lan_device_cannot_re_register_with_new_public_key() {
+        let app = test_app();
+        let token = login(app.clone()).await;
+        let deleted_device_id = "55555555-5555-4555-8555-555555555555";
+        let regenerated_device_id = "77777777-7777-4777-8777-777777777777";
+
+        let (register_status, _) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": deleted_device_id,
+                "name": "Office Windows",
+                "role": "client",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:old-key"
+            }),
+        )
+        .await;
+        assert_eq!(register_status, StatusCode::OK);
+        let (heartbeat_status, _) = send_heartbeat(
+            app.clone(),
+            &token,
+            deleted_device_id,
+            vec!["192.168.1.32"],
+            24800,
+            "lan",
+            "203.0.113.20:51000",
+        )
+        .await;
+        assert_eq!(heartbeat_status, StatusCode::OK);
+
+        let (delete_status, deleted) = json_request(
+            app.clone(),
+            Method::DELETE,
+            format!("/v1/devices/{deleted_device_id}"),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(delete_status, StatusCode::OK);
+        assert_eq!(deleted["deleted"], true);
+
+        let (register_again_status, _) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": regenerated_device_id,
+                "name": "Office Windows",
+                "role": "client",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:new-key"
+            }),
+        )
+        .await;
+        assert_eq!(register_again_status, StatusCode::OK);
+
+        let (heartbeat_again_status, heartbeat_again) = send_heartbeat(
+            app.clone(),
+            &token,
+            regenerated_device_id,
+            vec!["192.168.1.32"],
+            24800,
+            "lan",
+            "203.0.113.20:51000",
+        )
+        .await;
+        assert_eq!(heartbeat_again_status, StatusCode::FORBIDDEN);
+        assert_eq!(heartbeat_again["error"], "device was deleted");
+
+        let (list_status, devices) = json_request(
+            app,
+            Method::GET,
+            "/v1/devices".to_string(),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert!(devices.as_array().expect("devices").is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_device_can_reactivate_same_identity_and_clear_presented_tombstone() {
+        let app = test_app();
+        let token = login(app.clone()).await;
+        let device_id = "55555555-5555-4555-8555-555555555555";
+
+        let (register_status, _) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": device_id,
+                "name": "Office Windows",
+                "role": "client",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:reactivated-key"
+            }),
+        )
+        .await;
+        assert_eq!(register_status, StatusCode::OK);
+        let (heartbeat_status, _) = send_heartbeat(
+            app.clone(),
+            &token,
+            device_id,
+            vec!["192.168.1.32"],
+            24800,
+            "lan",
+            "203.0.113.20:51000",
+        )
+        .await;
+        assert_eq!(heartbeat_status, StatusCode::OK);
+
+        let (delete_status, deleted) = json_request(
+            app.clone(),
+            Method::DELETE,
+            format!("/v1/devices/{device_id}"),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(delete_status, StatusCode::OK);
+        assert_eq!(deleted["deleted"], true);
+
+        let (register_again_status, _) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/devices/register".to_string(),
+            Some(&token),
+            json!({
+                "device_id": device_id,
+                "name": "Office Windows",
+                "role": "client",
+                "os_type": "windows",
+                "os_version": "11",
+                "app_version": "0.1.0",
+                "public_key": "ed25519:reactivated-key"
+            }),
+        )
+        .await;
+        assert_eq!(register_again_status, StatusCode::OK);
+
+        let (heartbeat_again_status, _) = send_heartbeat(
+            app,
+            &token,
+            device_id,
+            vec!["192.168.1.32"],
+            24800,
+            "lan",
+            "203.0.113.20:51000",
+        )
+        .await;
+        assert_eq!(heartbeat_again_status, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn heartbeat_versions_only_change_when_candidates_change() {
         let app = test_app();
         let token = login(app.clone()).await;
@@ -2389,7 +3234,7 @@ mod tests {
         assert_eq!(second["presence_version"], 1);
 
         let (third_status, third) = send_heartbeat(
-            app,
+            app.clone(),
             &token,
             &device_id,
             vec!["10.0.0.8", "192.168.50.20"],
@@ -2400,6 +3245,23 @@ mod tests {
         .await;
         assert_eq!(third_status, StatusCode::OK);
         assert_eq!(third["presence_version"], 2);
+
+        let (fourth_status, fourth) = send_heartbeat_with_display(
+            app,
+            &token,
+            &device_id,
+            vec!["10.0.0.8", "192.168.50.20"],
+            24_999,
+            "symmetric",
+            "203.0.113.44:41001",
+            Some(json!({
+                "width_px": 1600,
+                "height_px": 900
+            })),
+        )
+        .await;
+        assert_eq!(fourth_status, StatusCode::OK);
+        assert_eq!(fourth["presence_version"], 3);
     }
 
     #[tokio::test]
@@ -2510,7 +3372,11 @@ mod tests {
                 json!({
                     "lan_ips": ["192.168.1.10"],
                     "listen_port": 24800,
-                    "nat_type": "open"
+                    "nat_type": "open",
+                    "display": {
+                        "width_px": 1600,
+                        "height_px": 900
+                    }
                 })
                 .to_string(),
             ))
@@ -2539,6 +3405,8 @@ mod tests {
         assert_eq!(body[0]["device"]["name"], "desktop");
         assert_eq!(body[0]["presence"]["lan_ips"][0], "192.168.1.10");
         assert_eq!(body[0]["presence"]["public_ip"], "127.0.0.1");
+        assert_eq!(body[0]["presence"]["display"]["width_px"], 1600);
+        assert_eq!(body[0]["presence"]["display"]["height_px"], 900);
         assert_eq!(body[0]["relay"]["rx_online"], false);
     }
 

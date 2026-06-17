@@ -49,11 +49,11 @@ submits it with `xcrun notarytool`, and staples the ticket. If these variables
 are not set, local MVP builds remain unsigned and notarization is skipped with
 an explicit message.
 
-The generated LaunchAgent starts `kmsync-daemon core-service
-/usr/local/share/kmsync/configs/daemon.example.json` at login. That resident
+Open `/Applications/KMSync.app` to start the desktop Core Service with the
+app's macOS Accessibility and Input Monitoring permissions. That resident
 process owns the data-plane listener, heartbeat loop, and local IPC control
-endpoint; input forwarding stays inside the daemon hot path rather than a UI
-process.
+endpoint while the desktop app is in use; input forwarding stays inside the
+daemon hot path rather than the UI render path.
 
 输出：
 

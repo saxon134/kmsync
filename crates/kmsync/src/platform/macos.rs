@@ -4,6 +4,7 @@ use std::ffi::c_char;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::mach_port::{CFMachPort, CFMachPortInvalidate, CFMachPortRef};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_foundation::string::{CFString, CFStringRef};
-use core_graphics::display::CGDisplay;
+use core_graphics::display::{CGDirectDisplayID, CGDisplay};
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType, CGMouseButton, CGScrollEventUnit, CallbackResult, EventField,
@@ -40,6 +41,9 @@ pub struct MacOsPlatform {
     remote_pointer: RemotePointerState,
 }
 
+static MACOS_ACCESSIBILITY_REQUESTED: AtomicBool = AtomicBool::new(false);
+static MACOS_INPUT_MONITORING_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 impl MacOsPlatform {
     #[must_use]
     pub fn new() -> Self {
@@ -64,19 +68,83 @@ impl MacOsPlatform {
 }
 
 pub fn hide_local_pointer() {
-    let _ = CGDisplay::main().hide_cursor();
+    let mut ops = SystemMacosLocalPointerOps;
+    hide_local_pointer_with(&mut ops);
 }
 
 pub fn restore_local_pointer(position: Option<PointerPosition>) {
-    if let Some(position) = position {
-        let _ = CGDisplay::warp_mouse_cursor_position(pointer_to_point(position));
-    }
-    let _ = CGDisplay::main().show_cursor();
+    let mut ops = SystemMacosLocalPointerOps;
+    restore_local_pointer_with(&mut ops, position);
 }
 
 pub fn request_platform_permissions() {
     let _ = request_macos_accessibility_permission();
     let _ = request_macos_input_monitoring_permission();
+}
+
+trait MacosLocalPointerOps {
+    fn active_display_ids(&mut self) -> Vec<CGDirectDisplayID>;
+    fn set_mouse_cursor_associated(&mut self, associated: bool);
+    fn hide_cursor(&mut self, display_id: CGDirectDisplayID);
+    fn show_cursor(&mut self, display_id: CGDirectDisplayID);
+    fn warp_mouse_cursor_position(&mut self, position: PointerPosition);
+}
+
+struct SystemMacosLocalPointerOps;
+
+impl MacosLocalPointerOps for SystemMacosLocalPointerOps {
+    fn active_display_ids(&mut self) -> Vec<CGDirectDisplayID> {
+        CGDisplay::active_displays()
+            .ok()
+            .filter(|display_ids| !display_ids.is_empty())
+            .unwrap_or_else(|| vec![CGDisplay::main().id])
+    }
+
+    fn set_mouse_cursor_associated(&mut self, associated: bool) {
+        associate_mouse_and_cursor_position(associated);
+    }
+
+    fn hide_cursor(&mut self, display_id: CGDirectDisplayID) {
+        let _ = CGDisplay::new(display_id).hide_cursor();
+    }
+
+    fn show_cursor(&mut self, display_id: CGDirectDisplayID) {
+        let _ = CGDisplay::new(display_id).show_cursor();
+    }
+
+    fn warp_mouse_cursor_position(&mut self, position: PointerPosition) {
+        let _ = CGDisplay::warp_mouse_cursor_position(pointer_to_point(position));
+    }
+}
+
+fn hide_local_pointer_with(ops: &mut impl MacosLocalPointerOps) {
+    let display_ids = ops.active_display_ids();
+    ops.set_mouse_cursor_associated(false);
+    for display_id in display_ids {
+        ops.hide_cursor(display_id);
+    }
+}
+
+fn restore_local_pointer_with(
+    ops: &mut impl MacosLocalPointerOps,
+    position: Option<PointerPosition>,
+) {
+    let display_ids = ops.active_display_ids();
+    if let Some(position) = position {
+        ops.warp_mouse_cursor_position(position);
+    }
+    for display_id in display_ids {
+        ops.show_cursor(display_id);
+    }
+    ops.set_mouse_cursor_associated(true);
+}
+
+#[allow(unsafe_code)]
+fn associate_mouse_and_cursor_position(associated: bool) {
+    let connected = if associated { 1 } else { 0 };
+    unsafe {
+        let _ = CGAssociateMouseAndMouseCursorPosition(connected);
+    }
 }
 
 impl PlatformAdapter for MacOsPlatform {
@@ -221,12 +289,8 @@ impl InputCaptureBackend for MacOsPlatform {
     where
         F: FnMut(CapturedInput) -> CaptureDecision + Send + 'static,
     {
-        if !macos_input_monitoring_granted() {
-            return Err(macos_input_monitoring_required_error());
-        }
-        if !macos_accessibility_trusted() {
-            return Err(macos_event_tap_required_error());
-        }
+        ensure_macos_input_monitoring_granted_for_capture()?;
+        ensure_macos_accessibility_trusted_for_capture()?;
 
         let callback = RefCell::new(callback);
         with_enabled_macos_capture_tap(
@@ -248,18 +312,71 @@ impl InputCaptureBackend for MacOsPlatform {
     }
 }
 
+fn ensure_macos_input_monitoring_granted_for_capture() -> Result<(), String> {
+    if macos_input_monitoring_granted() {
+        return Ok(());
+    }
+    if !MACOS_INPUT_MONITORING_REQUESTED.swap(true, Ordering::Relaxed) {
+        let _ = request_macos_input_monitoring_permission();
+    }
+    if macos_input_monitoring_granted() {
+        Ok(())
+    } else {
+        Err(macos_input_monitoring_required_error())
+    }
+}
+
+fn ensure_macos_accessibility_trusted_for_capture() -> Result<(), String> {
+    if macos_accessibility_trusted() {
+        return Ok(());
+    }
+    if !MACOS_ACCESSIBILITY_REQUESTED.swap(true, Ordering::Relaxed) {
+        let _ = request_macos_accessibility_permission();
+    }
+    if macos_accessibility_trusted() {
+        Ok(())
+    } else {
+        Err(macos_event_tap_required_error())
+    }
+}
+
 fn macos_input_monitoring_required_error() -> String {
-    "macOS Input Monitoring permission is missing for KMSync.app; open KMSync, click 申请权限, grant Input Monitoring, then restart KMSync".to_string()
+    format!(
+        "macOS Input Monitoring permission is missing for KMSync.app ({})；open KMSync.app, click 申请权限, grant Input Monitoring to KMSync.app, then restart KMSync",
+        macos_capture_permission_status_context()
+    )
 }
 
 fn macos_event_tap_required_error() -> String {
-    "failed to install macOS event tap; grant Accessibility and Input Monitoring to KMSync.app, make sure the core service is launched from /Applications/KMSync.app, then restart KMSync".to_string()
+    format!(
+        "failed to install macOS event tap ({})；grant Accessibility and Input Monitoring to KMSync.app, then restart KMSync",
+        macos_capture_permission_status_context()
+    )
+}
+
+fn macos_capture_permission_status_context() -> String {
+    format!(
+        "accessibility={} input_monitoring={}",
+        permission_bool_label(macos_accessibility_trusted()),
+        permission_bool_label(macos_input_monitoring_granted())
+    )
+}
+
+const fn permission_bool_label(granted: bool) -> &'static str {
+    if granted {
+        "granted"
+    } else {
+        "missing"
+    }
 }
 
 const MACOS_CAPTURE_EVENT_MASK: CGEventMask = event_mask_bit(CGEventType::KeyDown)
     | event_mask_bit(CGEventType::KeyUp)
     | event_mask_bit(CGEventType::FlagsChanged)
     | event_mask_bit(CGEventType::MouseMoved)
+    | event_mask_bit(CGEventType::LeftMouseDragged)
+    | event_mask_bit(CGEventType::RightMouseDragged)
+    | event_mask_bit(CGEventType::OtherMouseDragged)
     | event_mask_bit(CGEventType::LeftMouseDown)
     | event_mask_bit(CGEventType::LeftMouseUp)
     | event_mask_bit(CGEventType::RightMouseDown)
@@ -693,7 +810,10 @@ fn mac_capture_event(event_type: CGEventType, event: &CGEvent) -> Option<Capture
                 modifiers: modifiers_from_macos(event.get_flags()),
             })
         }
-        CGEventType::MouseMoved => InputEvent::Mouse(MouseEvent::Move {
+        CGEventType::MouseMoved
+        | CGEventType::LeftMouseDragged
+        | CGEventType::RightMouseDragged
+        | CGEventType::OtherMouseDragged => InputEvent::Mouse(MouseEvent::Move {
             dx: event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as f32,
             dy: event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f32,
         }),
@@ -781,6 +901,7 @@ fn new_scroll_event(
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32;
     fn CGEventCreateScrollWheelEvent2(
         source: CGEventSourceRef,
         units: CGScrollEventUnit,
@@ -975,11 +1096,14 @@ fn key_from_mac_keycode(keycode: u16) -> Option<Key> {
 mod tests {
     use super::*;
 
-    const EXPECTED_CAPTURE_EVENT_TYPES: [CGEventType; 11] = [
+    const EXPECTED_CAPTURE_EVENT_TYPES: [CGEventType; 14] = [
         CGEventType::KeyDown,
         CGEventType::KeyUp,
         CGEventType::FlagsChanged,
         CGEventType::MouseMoved,
+        CGEventType::LeftMouseDragged,
+        CGEventType::RightMouseDragged,
+        CGEventType::OtherMouseDragged,
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
         CGEventType::RightMouseDown,
@@ -988,6 +1112,68 @@ mod tests {
         CGEventType::OtherMouseUp,
         CGEventType::ScrollWheel,
     ];
+
+    struct RecordingPointerOps {
+        calls: Vec<String>,
+        display_ids: Vec<CGDirectDisplayID>,
+    }
+
+    impl Default for RecordingPointerOps {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                display_ids: vec![101, 202],
+            }
+        }
+    }
+
+    impl MacosLocalPointerOps for RecordingPointerOps {
+        fn active_display_ids(&mut self) -> Vec<CGDirectDisplayID> {
+            self.calls.push("active_displays".to_string());
+            self.display_ids.clone()
+        }
+
+        fn set_mouse_cursor_associated(&mut self, associated: bool) {
+            self.calls.push(format!("associate:{associated}"));
+        }
+
+        fn hide_cursor(&mut self, display_id: CGDirectDisplayID) {
+            self.calls.push(format!("hide:{display_id}"));
+        }
+
+        fn show_cursor(&mut self, display_id: CGDirectDisplayID) {
+            self.calls.push(format!("show:{display_id}"));
+        }
+
+        fn warp_mouse_cursor_position(&mut self, position: PointerPosition) {
+            self.calls
+                .push(format!("warp:{:.0}:{:.0}", position.x, position.y));
+        }
+    }
+
+    #[test]
+    fn macos_local_pointer_hide_disassociates_hardware_motion_and_restore_reassociates() {
+        let mut ops = RecordingPointerOps::default();
+        let restore_position = PointerPosition { x: 42.0, y: 84.0 };
+
+        hide_local_pointer_with(&mut ops);
+        restore_local_pointer_with(&mut ops, Some(restore_position));
+
+        assert_eq!(
+            ops.calls,
+            vec![
+                "active_displays".to_string(),
+                "associate:false".to_string(),
+                "hide:101".to_string(),
+                "hide:202".to_string(),
+                "active_displays".to_string(),
+                "warp:42:84".to_string(),
+                "show:101".to_string(),
+                "show:202".to_string(),
+                "associate:true".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn macos_clipboard_uses_native_api_backend() {
@@ -1020,6 +1206,7 @@ mod tests {
 
         assert!(error.contains("Input Monitoring"));
         assert!(error.contains("KMSync.app"));
+        assert!(!error.contains("background service"));
     }
 
     #[test]
@@ -1029,6 +1216,7 @@ mod tests {
         assert!(error.contains("Accessibility"));
         assert!(error.contains("Input Monitoring"));
         assert!(error.contains("restart KMSync"));
+        assert!(!error.contains("core service"));
     }
 
     #[test]

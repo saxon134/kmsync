@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -28,6 +28,7 @@ const NATIVE_LAYOUT_GRID_MAX_COL_WIDTH: f32 = 154.0;
 const NATIVE_LAYOUT_GRID_HORIZONTAL_SPACING: f32 = 24.0;
 const NATIVE_DEVICES_GRID_MIN_COL_WIDTH: f32 = 64.0;
 const NATIVE_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const NATIVE_BACKGROUND_REFRESH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const NATIVE_DEVICES_GRID_NAME_MIN_WIDTH: f32 = 60.0;
 #[cfg(test)]
@@ -268,7 +269,54 @@ struct NativeDesktopApp {
     status_message: String,
     lan_ip_popup: Option<NativeLanIpPopup>,
     logo_texture: Option<egui::TextureHandle>,
+    background_refresh: NativeBackgroundRefresh,
+}
+
+struct NativeBackgroundRefresh {
     next_auto_refresh_at: Instant,
+    receiver: Option<mpsc::Receiver<Result<DesktopState, String>>>,
+}
+
+impl NativeBackgroundRefresh {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_auto_refresh_at: now + NATIVE_AUTO_REFRESH_INTERVAL,
+            receiver: None,
+        }
+    }
+
+    fn should_start(&self, now: Instant) -> bool {
+        self.receiver.is_none() && now >= self.next_auto_refresh_at
+    }
+
+    fn is_running(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    fn start(&mut self, receiver: mpsc::Receiver<Result<DesktopState, String>>, now: Instant) {
+        self.receiver = Some(receiver);
+        self.next_auto_refresh_at = now + NATIVE_AUTO_REFRESH_INTERVAL;
+    }
+
+    fn reset(&mut self, now: Instant) {
+        self.receiver = None;
+        self.next_auto_refresh_at = now + NATIVE_AUTO_REFRESH_INTERVAL;
+    }
+
+    fn poll(&mut self) -> Option<Result<DesktopState, String>> {
+        let receiver = self.receiver.as_ref()?;
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.receiver = None;
+                Some(result)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.receiver = None;
+                Some(Err("后台刷新线程已退出".to_string()))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +377,7 @@ impl NativeDesktopApp {
         maybe_request_platform_permissions(&state);
         let view_model = NativeDesktopViewModel::from_state(&state);
         let status_message = status_message_for_state(&state, "就绪");
+        let now = Instant::now();
         Ok(Self {
             config_path,
             state,
@@ -340,7 +389,7 @@ impl NativeDesktopApp {
             status_message,
             lan_ip_popup: None,
             logo_texture: None,
-            next_auto_refresh_at: Instant::now() + NATIVE_AUTO_REFRESH_INTERVAL,
+            background_refresh: NativeBackgroundRefresh::new(now),
         })
     }
 
@@ -356,13 +405,7 @@ impl NativeDesktopApp {
                 self.status_message = format!("刷新失败：{error}");
             }
         }
-        self.next_auto_refresh_at = Instant::now() + NATIVE_AUTO_REFRESH_INTERVAL;
-    }
-
-    fn reload_state_quietly(&mut self) {
-        if let Ok(state) = Self::load_state(&self.config_path) {
-            self.apply_state(state);
-        }
+        self.background_refresh.reset(Instant::now());
     }
 
     fn apply_state(&mut self, state: DesktopState) {
@@ -376,10 +419,23 @@ impl NativeDesktopApp {
     }
 
     fn refresh_if_due(&mut self, now: Instant) {
-        if now >= self.next_auto_refresh_at {
-            self.reload_state_quietly();
-            self.next_auto_refresh_at = now + NATIVE_AUTO_REFRESH_INTERVAL;
+        if let Some(result) = self.background_refresh.poll() {
+            if let Ok(state) = result {
+                self.apply_state(state);
+            }
         }
+        if self.background_refresh.should_start(now) {
+            self.start_background_refresh(now);
+        }
+    }
+
+    fn start_background_refresh(&mut self, now: Instant) {
+        let config_path = self.config_path.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::load_state(&config_path));
+        });
+        self.background_refresh.start(rx, now);
     }
 
     fn request_platform_permissions(&mut self) {
@@ -434,7 +490,7 @@ impl NativeDesktopApp {
             Ok(()) => {
                 match crate::client::ClientConfig::load(&self.config_path).and_then(|config| {
                     crate::client::sync_current_device_name(&config)?;
-                    self.sync_topology_to_server(master_device_id.clone())
+                    self.sync_current_device_topology_to_server(master_device_id.clone())
                 }) {
                     Ok(_) => {
                         self.reload_state("本机配置已保存并同步");
@@ -554,6 +610,21 @@ impl NativeDesktopApp {
             .map(|_| ())
     }
 
+    fn sync_current_device_topology_to_server(
+        &self,
+        master_device_id: Option<String>,
+    ) -> Result<(), String> {
+        let config = crate::client::ClientConfig::load(&self.config_path)?;
+        let client = crate::client::ControlClient::new(config.server_url);
+        let server_topology = client.get_topology().ok();
+        let request = native_current_device_topology_request(
+            master_device_id,
+            &self.layout,
+            server_topology.as_ref(),
+        );
+        client.upsert_topology(&request).map(|_| ())
+    }
+
     fn mark_current_device_offline(&self) {
         let result = crate::client::ClientConfig::load(&self.config_path)
             .and_then(|config| crate::client::mark_current_device_offline(&config).map(|_| ()));
@@ -587,7 +658,12 @@ impl eframe::App for NativeDesktopApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_if_due(Instant::now());
-        ctx.request_repaint_after(NATIVE_AUTO_REFRESH_INTERVAL);
+        let repaint_after = if self.background_refresh.is_running() {
+            NATIVE_BACKGROUND_REFRESH_POLL_INTERVAL
+        } else {
+            NATIVE_AUTO_REFRESH_INTERVAL
+        };
+        ctx.request_repaint_after(repaint_after);
         if self.logo_texture.is_none() {
             self.logo_texture = native_logo_texture(ctx);
         }
@@ -671,13 +747,30 @@ fn native_should_auto_request_platform_permissions(_state: &DesktopState) -> boo
 }
 
 fn native_should_show_permission_request_button(state: &DesktopState) -> bool {
-    state.permissions.iter().any(|permission| {
+    let missing_platform_permission = state.permissions.iter().any(|permission| {
         permission.status == "missing"
             && matches!(
                 permission.key.as_str(),
                 "macos.accessibility" | "macos.input_monitoring"
             )
-    })
+    });
+    missing_platform_permission || native_state_has_permission_runtime_error(state)
+}
+
+fn native_state_has_permission_runtime_error(state: &DesktopState) -> bool {
+    let sync_error = state.sync_runtime.error.as_deref().unwrap_or_default();
+    state
+        .master_error
+        .as_deref()
+        .is_some_and(native_error_mentions_platform_permission)
+        || native_error_mentions_platform_permission(sync_error)
+}
+
+fn native_error_mentions_platform_permission(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("input monitoring")
+        || error.contains("accessibility")
+        || error.contains("event tap")
 }
 
 impl NativeDesktopApp {
@@ -1424,12 +1517,31 @@ fn layout_slot_card(
 
 fn native_layout_device_options(state: &DesktopState) -> Vec<(String, String)> {
     let current_device_id = state.device.id.as_deref();
-    state
-        .devices
-        .iter()
-        .filter(|device| Some(device.id.as_str()) != current_device_id)
-        .map(|device| (device.id.clone(), device.name.clone()))
-        .collect()
+    let mut options = Vec::new();
+    if let Some(current_device_id) = current_device_id {
+        options.push((current_device_id.to_string(), state.device.name.clone()));
+    }
+    options.extend(
+        state
+            .devices
+            .iter()
+            .filter(|device| Some(device.id.as_str()) != current_device_id)
+            .map(|device| (device.id.clone(), device.name.clone())),
+    );
+    options
+}
+
+fn native_current_device_topology_request(
+    master_device_id: Option<String>,
+    local_layout: &DesktopLayout,
+    server_topology: Option<&crate::client::Topology>,
+) -> crate::client::UpsertTopologyRequest {
+    crate::client::UpsertTopologyRequest {
+        master_device_id,
+        layout: server_topology
+            .map(|topology| topology.layout.clone())
+            .unwrap_or_else(|| local_layout.clone()),
+    }
 }
 
 fn native_layout_clear_duplicate_targets(
@@ -1523,6 +1635,24 @@ fn native_layout_section_status(state: &DesktopState) -> (String, NativeStatusTo
     if let Some((label, tone)) = sync_runtime_status_label(state) {
         return (format!("同步通道 {label}"), tone);
     }
+    if master_layout_has_non_relay_target_outside_local_subnet(state) {
+        return (
+            "同步通道 网络不可直连".to_string(),
+            NativeStatusTone::Warning,
+        );
+    }
+    if master_layout_has_unknown_sync_receiver(state) {
+        return (
+            "同步通道 服务器待更新".to_string(),
+            NativeStatusTone::Warning,
+        );
+    }
+    if master_layout_waiting_for_sync_receiver(state) {
+        return (
+            "同步通道 等待从电脑接收端".to_string(),
+            NativeStatusTone::Warning,
+        );
+    }
     (
         format!("同步通道 {}", sync_channel_state_label(&state.master_state)),
         sync_channel_state_tone(&state.master_state),
@@ -1532,18 +1662,23 @@ fn native_layout_section_status(state: &DesktopState) -> (String, NativeStatusTo
 fn sync_runtime_status_label(state: &DesktopState) -> Option<(String, NativeStatusTone)> {
     match state.sync_runtime.state {
         kmsync_core::DesktopSyncRuntimeKind::Unknown => None,
-        kmsync_core::DesktopSyncRuntimeKind::Idle => {
+        kmsync_core::DesktopSyncRuntimeKind::Idle if should_show_master_runtime(state) => {
             Some(("等待设备".to_string(), NativeStatusTone::Muted))
         }
         kmsync_core::DesktopSyncRuntimeKind::Listening
-            if state.device.role == DesktopRole::Client
+            if should_show_client_runtime(state) && client_relay_receiver_not_online(state) =>
+        {
+            Some(("中继未上线".to_string(), NativeStatusTone::Warning))
+        }
+        kmsync_core::DesktopSyncRuntimeKind::Listening
+            if should_show_client_runtime(state)
                 && state.master_state == DesktopConnectionState::Disconnected
                 && state.sync_runtime.relay_connected =>
         {
             Some(("等待主电脑".to_string(), NativeStatusTone::Warning))
         }
         kmsync_core::DesktopSyncRuntimeKind::Listening
-            if state.device.role == DesktopRole::Client
+            if should_show_client_runtime(state)
                 && state.master_state != DesktopConnectionState::Disconnected =>
         {
             if state.sync_runtime.injected_events > 0 {
@@ -1563,7 +1698,7 @@ fn sync_runtime_status_label(state: &DesktopState) -> Option<(String, NativeStat
             }
         }
         kmsync_core::DesktopSyncRuntimeKind::Listening => None,
-        kmsync_core::DesktopSyncRuntimeKind::Armed => {
+        kmsync_core::DesktopSyncRuntimeKind::Armed if should_show_master_runtime(state) => {
             if state.sync_runtime.sent_events > 0 {
                 Some((
                     format!("已转发 {}", state.sync_runtime.sent_events),
@@ -1575,14 +1710,42 @@ fn sync_runtime_status_label(state: &DesktopState) -> Option<(String, NativeStat
                 Some(("服务器待更新".to_string(), NativeStatusTone::Warning))
             } else if master_layout_waiting_for_sync_receiver(state) {
                 Some(("等待从电脑接收端".to_string(), NativeStatusTone::Warning))
+            } else if state.sync_runtime.routed_events > 0 {
+                Some((
+                    format!("已路由 {}", state.sync_runtime.routed_events),
+                    NativeStatusTone::Warning,
+                ))
+            } else if state.sync_runtime.captured_events > 0 {
+                Some((
+                    format!("已捕获 {}", state.sync_runtime.captured_events),
+                    NativeStatusTone::Warning,
+                ))
             } else {
                 Some(("捕获中".to_string(), NativeStatusTone::Warning))
             }
+        }
+        kmsync_core::DesktopSyncRuntimeKind::Idle | kmsync_core::DesktopSyncRuntimeKind::Armed => {
+            None
         }
         kmsync_core::DesktopSyncRuntimeKind::Failed => {
             Some(("需处理".to_string(), NativeStatusTone::Danger))
         }
     }
+}
+
+fn should_show_master_runtime(state: &DesktopState) -> bool {
+    state.device.role == DesktopRole::Master
+        || state.master_state == DesktopConnectionState::SelfDevice
+}
+
+fn should_show_client_runtime(state: &DesktopState) -> bool {
+    state.device.role == DesktopRole::Client
+}
+
+fn client_relay_receiver_not_online(state: &DesktopState) -> bool {
+    state.device.role == DesktopRole::Client
+        && state.device.sync_relay_status_known
+        && !state.device.sync_relay_online
 }
 
 #[cfg(test)]
@@ -2434,6 +2597,8 @@ mod tests {
                 os: "windows".to_string(),
                 app_version: "0.1.0".to_string(),
                 role: DesktopRole::Master,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
             },
             network: DesktopNetworkState {
                 server_url: Some("http://203.0.113.10:24888".to_string()),
@@ -2443,6 +2608,7 @@ mod tests {
                 public_ip: Some("203.0.113.20".to_string()),
                 listen_port: Some(24_800),
                 last_seen_at: Some(123),
+                display: None,
             },
             server_state: DesktopConnectionState::Connecting,
             master_state: DesktopConnectionState::SelfDevice,
@@ -2463,6 +2629,7 @@ mod tests {
                 public_ip: Some("203.0.113.21".to_string()),
                 listen_port: Some(24_800),
                 last_seen_at: Some(124),
+                display: None,
             }],
             ..DesktopState::default()
         };
@@ -2494,6 +2661,37 @@ mod tests {
         assert_eq!(metrics.layout_panel_min_height, 384.0);
         assert!(metrics.devices_grid_min_col_width <= 68.0);
         assert!(!native_persist_window_size());
+    }
+
+    #[test]
+    fn native_background_refresh_starts_only_when_due_and_idle() {
+        let now = Instant::now();
+        let mut refresh = NativeBackgroundRefresh::new(now);
+
+        assert!(!refresh.should_start(now));
+        assert!(refresh.should_start(now + NATIVE_AUTO_REFRESH_INTERVAL));
+
+        let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+        refresh.start(rx, now + NATIVE_AUTO_REFRESH_INTERVAL);
+
+        assert!(!refresh.should_start(now + NATIVE_AUTO_REFRESH_INTERVAL * 2));
+    }
+
+    #[test]
+    fn native_background_refresh_polls_completed_result() {
+        let now = Instant::now();
+        let mut refresh = NativeBackgroundRefresh::new(now);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        refresh.start(rx, now + NATIVE_AUTO_REFRESH_INTERVAL);
+
+        tx.send(Err("network probe timed out".to_string()))
+            .expect("send refresh result");
+
+        match refresh.poll().expect("completed refresh result") {
+            Ok(_) => panic!("expected refresh error"),
+            Err(error) => assert_eq!(error, "network probe timed out"),
+        }
+        assert!(refresh.should_start(now + NATIVE_AUTO_REFRESH_INTERVAL * 2));
     }
 
     #[test]
@@ -2665,6 +2863,46 @@ mod tests {
     }
 
     #[test]
+    fn native_layout_section_status_reports_capture_without_route_progress() {
+        let state = DesktopState {
+            master_state: DesktopConnectionState::SelfDevice,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                captured_events: 4,
+                routed_events: 0,
+                sent_events: 0,
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 已捕获 4".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_reports_route_without_send_progress() {
+        let state = DesktopState {
+            master_state: DesktopConnectionState::SelfDevice,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                captured_events: 6,
+                routed_events: 2,
+                sent_events: 0,
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 已路由 2".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
     fn native_layout_section_status_waits_for_target_sync_receiver() {
         let state = DesktopState {
             device: kmsync_core::DesktopDeviceState {
@@ -2732,6 +2970,39 @@ mod tests {
                 updated_at: Some(123),
                 ..kmsync_core::DesktopSyncRuntimeState::default()
             },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            (
+                "同步通道 服务器待更新".to_string(),
+                NativeStatusTone::Warning
+            )
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_marks_unknown_target_before_runtime_probe() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                id: Some("master-device".to_string()),
+                role: DesktopRole::Master,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::SelfDevice,
+            layout: kmsync_core::DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..kmsync_core::DesktopLayout::default()
+            },
+            devices: vec![kmsync_core::DesktopPeerState {
+                id: "right-device".to_string(),
+                name: "Right PC".to_string(),
+                online: true,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
+                ..kmsync_core::DesktopPeerState::default()
+            }],
             ..DesktopState::default()
         };
 
@@ -2834,6 +3105,55 @@ mod tests {
     }
 
     #[test]
+    fn native_layout_section_status_trusts_server_relay_status_for_client_receiver() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                sync_relay_status_known: true,
+                sync_relay_online: false,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::Connecting,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Listening,
+                error: None,
+                targets: Vec::new(),
+                updated_at: Some(123),
+                relay_connected: true,
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 中继未上线".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_current_device_config_sync_preserves_server_layout() {
+        let server_topology = crate::client::Topology {
+            master_device_id: Some("master-device".to_string()),
+            layout: DesktopLayout {
+                right: Some("right-device".to_string()),
+                ..DesktopLayout::default()
+            },
+            topology_version: 12,
+            updated_at: 34,
+        };
+
+        let request = native_current_device_topology_request(
+            Some("master-device".to_string()),
+            &DesktopLayout::default(),
+            Some(&server_topology),
+        );
+
+        assert_eq!(request.master_device_id.as_deref(), Some("master-device"));
+        assert_eq!(request.layout.right.as_deref(), Some("right-device"));
+    }
+
+    #[test]
     fn native_layout_section_status_waits_for_master_when_client_relay_is_connected() {
         let state = DesktopState {
             device: kmsync_core::DesktopDeviceState {
@@ -2855,6 +3175,30 @@ mod tests {
         assert_eq!(
             native_layout_section_status(&state),
             ("同步通道 等待主电脑".to_string(), NativeStatusTone::Warning)
+        );
+    }
+
+    #[test]
+    fn native_layout_section_status_ignores_stale_master_runtime_on_client() {
+        let state = DesktopState {
+            device: kmsync_core::DesktopDeviceState {
+                role: DesktopRole::Client,
+                ..kmsync_core::DesktopDeviceState::default()
+            },
+            master_state: DesktopConnectionState::Disconnected,
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Armed,
+                targets: vec!["right-device".to_string()],
+                updated_at: Some(123),
+                captured_events: 5,
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert_eq!(
+            native_layout_section_status(&state),
+            ("同步通道 未连接".to_string(), NativeStatusTone::Muted)
         );
     }
 
@@ -2991,6 +3335,30 @@ mod tests {
     }
 
     #[test]
+    fn native_desktop_shows_permission_button_for_background_permission_error() {
+        let state = DesktopState {
+            permissions: vec![DesktopPermissionState {
+                key: "macos.input_monitoring".to_string(),
+                status: "granted".to_string(),
+                label: "macOS Input Monitoring".to_string(),
+                guidance: None,
+            }],
+            sync_runtime: kmsync_core::DesktopSyncRuntimeState {
+                state: kmsync_core::DesktopSyncRuntimeKind::Failed,
+                error: Some(
+                    "macOS Input Monitoring permission is missing for the KMSync background service"
+                        .to_string(),
+                ),
+                ..kmsync_core::DesktopSyncRuntimeState::default()
+            },
+            ..DesktopState::default()
+        };
+
+        assert!(native_should_show_permission_request_button(&state));
+        assert!(!native_should_auto_request_platform_permissions(&state));
+    }
+
+    #[test]
     fn native_header_uses_fixed_height_status_chips_and_logo() {
         let state = DesktopState {
             server_state: DesktopConnectionState::Connected,
@@ -3019,6 +3387,8 @@ mod tests {
                 os: "windows".to_string(),
                 app_version: "0.1.0".to_string(),
                 role: DesktopRole::Client,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
             },
             master_device_id: None,
             ..DesktopState::default()
@@ -3035,6 +3405,8 @@ mod tests {
                 os: "windows".to_string(),
                 app_version: "0.1.0".to_string(),
                 role: DesktopRole::Client,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
             },
             master_device_id: Some("master".to_string()),
             devices: vec![DesktopPeerState {
@@ -3048,6 +3420,7 @@ mod tests {
                 public_ip: None,
                 listen_port: None,
                 last_seen_at: None,
+                display: None,
             }],
             ..DesktopState::default()
         };
@@ -3072,6 +3445,7 @@ mod tests {
                 public_ip: None,
                 listen_port: None,
                 last_seen_at: None,
+                display: None,
             }],
             ..DesktopState::default()
         };
@@ -3097,6 +3471,7 @@ mod tests {
                 public_ip: None,
                 listen_port: None,
                 last_seen_at: None,
+                display: None,
             }],
             ..DesktopState::default()
         };
@@ -3122,6 +3497,7 @@ mod tests {
                     public_ip: None,
                     listen_port: Some(24_800),
                     last_seen_at: None,
+                    display: None,
                 },
                 DesktopPeerState {
                     id: "bottom-device".to_string(),
@@ -3134,6 +3510,7 @@ mod tests {
                     public_ip: None,
                     listen_port: Some(24_800),
                     last_seen_at: None,
+                    display: None,
                 },
             ],
             ..DesktopState::default()
@@ -3187,6 +3564,8 @@ mod tests {
                 os: "windows".to_string(),
                 app_version: "0.1.0".to_string(),
                 role: DesktopRole::Client,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
             },
             master_device_id: Some("master-device".to_string()),
             master_state: DesktopConnectionState::Connected,
@@ -3205,6 +3584,7 @@ mod tests {
                 public_ip: None,
                 listen_port: Some(24_800),
                 last_seen_at: None,
+                display: None,
             }],
             ..DesktopState::default()
         };
@@ -3224,7 +3604,7 @@ mod tests {
     }
 
     #[test]
-    fn native_layout_options_exclude_current_device() {
+    fn native_layout_options_include_current_device() {
         let state = DesktopState {
             device: DesktopDeviceState {
                 id: Some("current".to_string()),
@@ -3232,6 +3612,8 @@ mod tests {
                 os: "windows".to_string(),
                 app_version: "0.1.0".to_string(),
                 role: DesktopRole::Master,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
             },
             devices: vec![
                 DesktopPeerState {
@@ -3245,6 +3627,7 @@ mod tests {
                     public_ip: None,
                     listen_port: None,
                     last_seen_at: None,
+                    display: None,
                 },
                 DesktopPeerState {
                     id: "right-device".to_string(),
@@ -3257,6 +3640,7 @@ mod tests {
                     public_ip: None,
                     listen_port: None,
                     last_seen_at: None,
+                    display: None,
                 },
             ],
             ..DesktopState::default()
@@ -3266,7 +3650,10 @@ mod tests {
 
         assert_eq!(
             options,
-            vec![("right-device".to_string(), "Right PC".to_string())]
+            vec![
+                ("current".to_string(), "This PC".to_string()),
+                ("right-device".to_string(), "Right PC".to_string()),
+            ]
         );
     }
 
@@ -3362,6 +3749,8 @@ mod tests {
                 os: "windows".to_string(),
                 app_version: "0.1.0".to_string(),
                 role: DesktopRole::Master,
+                sync_relay_status_known: false,
+                sync_relay_online: false,
             },
             network: DesktopNetworkState {
                 lan_ips: vec!["192.168.1.20".to_string()],
@@ -3379,6 +3768,7 @@ mod tests {
                 public_ip: None,
                 listen_port: Some(24_800),
                 last_seen_at: Some(124),
+                display: None,
             }],
             ..DesktopState::default()
         };

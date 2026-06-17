@@ -43,11 +43,11 @@ states current limits where production features are still pending.
 The current macOS package is unsigned and not notarized. Gatekeeper may require
 manual approval for local MVP testing.
 
-The package installs a LaunchAgent at
-`/Library/LaunchAgents/com.kmsync.mvp.daemon.plist` for login startup. It runs
-`kmsync-daemon core-service`, which keeps the QUIC data-plane listener,
-heartbeat loop, and local IPC control endpoint alive without involving a UI
-process. The package also installs a permission guide at
+Open `KMSync.app` from `/Applications` to start the desktop Core Service with
+the app's macOS Accessibility and Input Monitoring permissions. The Core
+Service keeps the QUIC data-plane listener, heartbeat loop, and local IPC
+control endpoint alive while the desktop app is in use. The package also
+installs a permission guide at
 `/usr/local/share/kmsync/docs/USER_GUIDE.md` and an uninstall cleanup helper at
 `/usr/local/share/kmsync/uninstall-macos.sh`.
 
@@ -98,6 +98,13 @@ companion launches `kmsync-daemon.exe core-service`, keeping input
 capture/injection in the interactive desktop session. The installer also adds
 Start Menu shortcuts for daemon diagnostics, status, and the permission guide,
 and removes those entries during uninstall.
+
+For the portable Windows zip, unzip the package, then run
+`enable-firewall.cmd` once as administrator. It adds the inbound UDP 24800
+Windows Firewall rule required for direct LAN input sync. Start KMSync from
+`kmsync.exe`; if diagnostics still show the sync receiver offline, run
+`start-core-service.cmd` from the same folder to start the user-mode receiver
+against `configs\daemon.example.json`.
 
 ### Linux
 
@@ -216,11 +223,11 @@ kmsync-daemon target-probe configs/daemon.example.json <target_device_id>
 kmsync-daemon target-input-test configs/daemon.example.json <target_device_id>
 ```
 
-`target-probe` sends a control frame. `target-input-test` sends a zero-distance
-mouse move through the same desktop transport path as real sync; it should not
-move the pointer, but it verifies that input frames can reach the target
-receiver. If it fails with `TargetOffline`, the target's Core Service receiver
-or the server relay is not connected.
+`target-probe` sends a control frame. `target-input-test` sends a reliable
+zero-delta scroll input through the same desktop transport path as real sync; it
+should not move the pointer, but it verifies that reliable input frames can
+reach the target receiver. If it fails with `TargetOffline`, the target's Core
+Service receiver or the server relay is not connected.
 
 Run the resident Core Service when you want one process to keep the network data
 plane, heartbeat, and local IPC control endpoint alive:

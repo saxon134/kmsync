@@ -22,7 +22,7 @@ use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime};
 const QUIC_STREAM_FRAME_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const QUIC_DATAGRAM_FRAME_BYTES: usize = 1200;
 const QUIC_CHANNEL_CAPACITY: usize = 1024;
-const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
+pub(crate) const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
 const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const QUIC_SOCKET_BUFFER_BYTES: usize = 1 << 20;
 const DATA_PLANE_MAGIC: &[u8; 4] = b"SYE1";

@@ -9,7 +9,7 @@ use kmsync_core::{
     ClipboardFormat, ClipboardText, InputEvent, Key, KeyEvent, KeyState, Modifiers, MouseButton,
     MouseEvent, OsKind, ScrollEvent,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
@@ -27,13 +27,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow,
-    GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, RegisterClassW, SetCursorPos,
-    SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, HWND_MESSAGE, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_CLIPBOARDUPDATE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, RegisterClassW,
+    SetCursorPos, SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, HWND_MESSAGE,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
+    SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_CLIPBOARDUPDATE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
 };
 
 const XBUTTON1: u32 = 0x0001;
@@ -43,7 +44,7 @@ const KMSYNC_INJECTED_EVENT_MARKER: usize = 0x4B4D_5359_4E43;
 use super::{
     CaptureDecision, CapturedInput, ClipboardBackend, ClipboardWatchBackend, DisplayBounds,
     DisplayLayout, InputCaptureBackend, InputInjector, PermissionStatus, PlatformAdapter,
-    PlatformCapabilities, PlatformPermissionCheck, PointerPosition,
+    PlatformCapabilities, PlatformPermissionCheck, PointerPosition, RemotePointerState,
 };
 
 type CaptureCallback = Box<dyn FnMut(CapturedInput) -> CaptureDecision + Send>;
@@ -53,12 +54,16 @@ thread_local! {
     static LAST_MOUSE_POS: RefCell<Option<(i32, i32)>> = const { RefCell::new(None) };
 }
 
-pub struct WindowsPlatform;
+pub struct WindowsPlatform {
+    remote_pointer: RemotePointerState,
+}
 
 impl WindowsPlatform {
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self {
+            remote_pointer: RemotePointerState::default(),
+        }
     }
 }
 
@@ -247,9 +252,11 @@ impl InputInjector for WindowsPlatform {
     fn inject(&mut self, event: InputEvent) -> Result<(), String> {
         match event {
             InputEvent::Key(event) => inject_key(event.key, event.state),
-            InputEvent::Mouse(MouseEvent::Move { dx, dy }) => inject_mouse_move(dx, dy),
+            InputEvent::Mouse(MouseEvent::Move { dx, dy }) => {
+                inject_mouse_move(&mut self.remote_pointer, dx, dy)
+            }
             InputEvent::Mouse(MouseEvent::Position { x_ratio, y_ratio }) => {
-                inject_mouse_position(x_ratio, y_ratio)
+                inject_mouse_position(&mut self.remote_pointer, x_ratio, y_ratio)
             }
             InputEvent::Mouse(MouseEvent::Button { button, state }) => {
                 inject_mouse_button(button, state)
@@ -535,34 +542,47 @@ fn keyboard_input(key: Key, state: KeyState) -> Result<INPUT, String> {
     })
 }
 
-fn inject_mouse_move(dx: f32, dy: f32) -> Result<(), String> {
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: dx.round() as i32,
-                dy: dy.round() as i32,
-                mouseData: 0,
-                dwFlags: MOUSEEVENTF_MOVE,
-                time: 0,
-                dwExtraInfo: KMSYNC_INJECTED_EVENT_MARKER,
-            },
+fn inject_mouse_move(pointer: &mut RemotePointerState, dx: f32, dy: f32) -> Result<(), String> {
+    if dx == 0.0 && dy == 0.0 {
+        return Ok(());
+    }
+    let bounds = windows_virtual_display_bounds()
+        .ok_or_else(|| "failed to read Windows virtual display bounds".to_string())?;
+    let current = ensure_remote_pointer(pointer)?;
+    let position = clamp_pointer_to_bounds(
+        PointerPosition {
+            x: current.x + f64::from(dx),
+            y: current.y + f64::from(dy),
         },
-    };
-    send_input(&[input])
+        bounds,
+    );
+    pointer.set(position);
+    send_input(&[absolute_mouse_position_input_for_position(bounds, position)])
 }
 
-fn inject_mouse_position(x_ratio: f32, y_ratio: f32) -> Result<(), String> {
-    send_input(&[absolute_mouse_position_input(x_ratio, y_ratio)])
+fn inject_mouse_position(
+    pointer: &mut RemotePointerState,
+    x_ratio: f32,
+    y_ratio: f32,
+) -> Result<(), String> {
+    let bounds = windows_virtual_display_bounds()
+        .ok_or_else(|| "failed to read Windows virtual display bounds".to_string())?;
+    let position = normalized_pointer_position(bounds, x_ratio, y_ratio);
+    pointer.set(position);
+    send_input(&[absolute_mouse_position_input_for_position(bounds, position)])
 }
 
-fn absolute_mouse_position_input(x_ratio: f32, y_ratio: f32) -> INPUT {
+fn absolute_mouse_position_input_for_position(
+    bounds: DisplayBounds,
+    position: PointerPosition,
+) -> INPUT {
+    let position = clamp_pointer_to_bounds(position, bounds);
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
             mi: MOUSEINPUT {
-                dx: normalized_absolute_coordinate(x_ratio),
-                dy: normalized_absolute_coordinate(y_ratio),
+                dx: normalized_absolute_coordinate_for_axis(position.x, bounds.x, bounds.width),
+                dy: normalized_absolute_coordinate_for_axis(position.y, bounds.y, bounds.height),
                 mouseData: 0,
                 dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 time: 0,
@@ -572,8 +592,69 @@ fn absolute_mouse_position_input(x_ratio: f32, y_ratio: f32) -> INPUT {
     }
 }
 
+fn ensure_remote_pointer(pointer: &mut RemotePointerState) -> Result<PointerPosition, String> {
+    if let Some(position) = pointer.current() {
+        return Ok(position);
+    }
+    let position = current_windows_pointer_position()?;
+    pointer.set(position);
+    Ok(position)
+}
+
+#[allow(unsafe_code)]
+fn current_windows_pointer_position() -> Result<PointerPosition, String> {
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return Err("failed to read Windows cursor position".to_string());
+    }
+    Ok(PointerPosition {
+        x: f64::from(point.x),
+        y: f64::from(point.y),
+    })
+}
+
+#[allow(unsafe_code)]
+fn windows_virtual_display_bounds() -> Option<DisplayBounds> {
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some(DisplayBounds {
+        x: f64::from(unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) }),
+        y: f64::from(unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) }),
+        width: f64::from(width),
+        height: f64::from(height),
+    })
+}
+
+fn normalized_pointer_position(
+    bounds: DisplayBounds,
+    x_ratio: f32,
+    y_ratio: f32,
+) -> PointerPosition {
+    PointerPosition {
+        x: bounds.x + (bounds.width - 1.0).max(0.0) * f64::from(x_ratio.clamp(0.0, 1.0)),
+        y: bounds.y + (bounds.height - 1.0).max(0.0) * f64::from(y_ratio.clamp(0.0, 1.0)),
+    }
+}
+
+fn clamp_pointer_to_bounds(position: PointerPosition, bounds: DisplayBounds) -> PointerPosition {
+    PointerPosition {
+        x: position.x.clamp(bounds.x, bounds.x + bounds.width - 1.0),
+        y: position.y.clamp(bounds.y, bounds.y + bounds.height - 1.0),
+    }
+}
+
 fn normalized_absolute_coordinate(ratio: f32) -> i32 {
     (ratio.clamp(0.0, 1.0) * 65_535.0).round() as i32
+}
+
+fn normalized_absolute_coordinate_for_axis(value: f64, origin: f64, length: f64) -> i32 {
+    if length <= 1.0 {
+        return 0;
+    }
+    normalized_absolute_coordinate(((value - origin) / (length - 1.0)) as f32)
 }
 
 fn inject_mouse_button(button: MouseButton, state: KeyState) -> Result<(), String> {

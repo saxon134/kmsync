@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use kmsync_core::{
-    CompiledProfile, DesktopLayout, DesktopRole, DeviceId, InputEventEnvelope, Profile,
-    ProtocolEvent, ProtocolFrame, ProtocolPayload,
+    CompiledProfile, DesktopDisplayState, DesktopLayout, DesktopRole, DeviceId, InputEventEnvelope,
+    Profile, ProtocolEvent, ProtocolFrame, ProtocolPayload, TransportLane,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Error as WebSocketError, Message, WebSocket};
 
 use crate::local_config;
+use crate::platform::PlatformAdapter;
 use crate::transport::QuicEventSender;
 
 const MDNS_SERVICE_TYPE: &str = "_kmsync._udp.local";
@@ -590,6 +591,8 @@ pub struct HeartbeatRequest {
     pub lan_ips: Vec<String>,
     pub listen_port: u16,
     pub nat_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DesktopDisplayState>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -643,6 +646,8 @@ pub struct Presence {
     pub last_seen_at: u64,
     #[serde(default)]
     pub expires_at: u64,
+    #[serde(default)]
+    pub display: Option<DesktopDisplayState>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -898,7 +903,11 @@ impl RelayFrameSender {
         self.socket
             .send(Message::Binary(payload.into()))
             .map_err(|error| format!("failed to send relay frame: {error}"))?;
-        self.read_send_ack()
+        if relay_frame_requires_send_ack(frame) {
+            self.read_send_ack()
+        } else {
+            Ok(())
+        }
     }
 
     fn read_send_ack(&mut self) -> Result<(), String> {
@@ -934,6 +943,10 @@ impl RelayFrameSender {
             (result, _) => result,
         }
     }
+}
+
+fn relay_frame_requires_send_ack(frame: &ProtocolFrame) -> bool {
+    frame.payload.transport_lane() != TransportLane::InputUnreliable
 }
 
 fn set_relay_socket_read_timeout(
@@ -1393,6 +1406,22 @@ pub fn refresh_target_direct_lan_connection(
     reconnect_state: &mut DirectLanReconnectState,
     current_connection_healthy: bool,
 ) -> Result<Option<DirectLanReconnectOutcome>, String> {
+    refresh_target_direct_lan_connection_with_timeout(
+        config,
+        target_device_id,
+        reconnect_state,
+        current_connection_healthy,
+        crate::transport::QUIC_CONNECT_TIMEOUT,
+    )
+}
+
+pub fn refresh_target_direct_lan_connection_with_timeout(
+    config: ClientConfig,
+    target_device_id: &str,
+    reconnect_state: &mut DirectLanReconnectState,
+    current_connection_healthy: bool,
+    direct_connect_timeout: Duration,
+) -> Result<Option<DirectLanReconnectOutcome>, String> {
     let client = ControlClient::new(config.server_url.clone());
     let devices = client.list_devices()?;
 
@@ -1409,7 +1438,9 @@ pub fn refresh_target_direct_lan_connection(
         &local_lan_ips,
         &verified.candidates,
         current_connection_healthy,
-        |_candidate, address| QuicEventSender::connect(address).map(|_| ()),
+        |_candidate, address| {
+            QuicEventSender::connect_with_timeout(address, direct_connect_timeout).map(|_| ())
+        },
     )
 }
 
@@ -1418,10 +1449,28 @@ pub fn resolve_target_direct_lan_connection(
     config: ClientConfig,
     target_device_id: &str,
 ) -> Result<DirectConnectionAttempt, String> {
+    resolve_target_direct_lan_connection_with_timeout(
+        config,
+        target_device_id,
+        crate::transport::QUIC_CONNECT_TIMEOUT,
+    )
+}
+
+pub fn resolve_target_direct_lan_connection_with_timeout(
+    config: ClientConfig,
+    target_device_id: &str,
+    direct_connect_timeout: Duration,
+) -> Result<DirectConnectionAttempt, String> {
     let mut reconnect_state = DirectLanReconnectState::default();
-    refresh_target_direct_lan_connection(config, target_device_id, &mut reconnect_state, false)?
-        .map(|outcome| outcome.attempt)
-        .ok_or_else(|| "direct LAN connection refresh did not select a candidate".to_string())
+    refresh_target_direct_lan_connection_with_timeout(
+        config,
+        target_device_id,
+        &mut reconnect_state,
+        false,
+        direct_connect_timeout,
+    )?
+    .map(|outcome| outcome.attempt)
+    .ok_or_else(|| "direct LAN connection refresh did not select a candidate".to_string())
 }
 
 fn format_direct_connection_failures(failed_attempts: &[DirectConnectionFailure]) -> String {
@@ -1671,6 +1720,7 @@ pub fn run_heartbeat_loop(config: ClientConfig) -> Result<(), String> {
             lan_ips: discover_lan_ips(),
             listen_port: config.listen_port,
             nat_type: "unknown".to_string(),
+            display: local_display_state(),
         };
         let response = client.heartbeat(&device.device_id, &request)?;
         println!(
@@ -1738,12 +1788,32 @@ fn load_desktop_device_inventory_with_identity(
         lan_ips,
         listen_port: config.listen_port,
         nat_type: "unknown".to_string(),
+        display: local_display_state(),
     };
     client.heartbeat(&device.device_id, &heartbeat)?;
     let devices = client.list_devices()?;
     Ok(DesktopDeviceInventory {
         current_device_id: device.device_id,
         devices,
+    })
+}
+
+fn local_display_state() -> Option<DesktopDisplayState> {
+    let layout = crate::platform::current_platform().display_layout();
+    let bounds = layout.virtual_bounds()?;
+    display_state_from_size(bounds.width, bounds.height)
+}
+
+fn display_state_from_size(width: f64, height: f64) -> Option<DesktopDisplayState> {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    if width > f64::from(u32::MAX) || height > f64::from(u32::MAX) {
+        return None;
+    }
+    Some(DesktopDisplayState {
+        width_px: width.round() as u32,
+        height_px: height.round() as u32,
     })
 }
 
@@ -2406,7 +2476,7 @@ mod tests {
     use super::*;
     use kmsync_core::{
         DesktopLayout, DesktopRole, InputEvent, InputEventEnvelope, Key, KeyEvent, KeyState,
-        Modifiers, ProtocolFrame, ProtocolPayload,
+        Modifiers, MouseEvent, ProtocolFrame, ProtocolPayload,
     };
 
     #[test]
@@ -2584,6 +2654,36 @@ mod tests {
             serde_json::from_str(http_body(&requests[1])).expect("heartbeat json");
         assert_eq!(heartbeat_body["lan_ips"][0], "192.168.1.10");
         assert!(requests[2].starts_with("GET /v1/devices "));
+    }
+
+    #[test]
+    fn heartbeat_request_serializes_display_state_when_present() {
+        let body = serde_json::to_value(HeartbeatRequest {
+            lan_ips: vec!["192.168.1.10".to_string()],
+            listen_port: 24_800,
+            nat_type: "unknown".to_string(),
+            display: Some(DesktopDisplayState {
+                width_px: 1600,
+                height_px: 900,
+            }),
+        })
+        .expect("heartbeat json");
+
+        assert_eq!(body["display"]["width_px"], 1600);
+        assert_eq!(body["display"]["height_px"], 900);
+    }
+
+    #[test]
+    fn display_state_from_size_ignores_invalid_bounds() {
+        assert_eq!(
+            display_state_from_size(1440.4, 899.6),
+            Some(DesktopDisplayState {
+                width_px: 1440,
+                height_px: 900,
+            })
+        );
+        assert_eq!(display_state_from_size(0.0, 900.0), None);
+        assert_eq!(display_state_from_size(f64::NAN, 900.0), None);
     }
 
     #[test]
@@ -2923,6 +3023,7 @@ mod tests {
                     nat_type: "unknown".to_string(),
                     last_seen_at: 10,
                     expires_at: 0,
+                    display: None,
                 }),
                 relay: None,
             },
@@ -3285,6 +3386,7 @@ mod tests {
                 nat_type: "cone".to_string(),
                 last_seen_at: 10,
                 expires_at: 0,
+                display: None,
             }),
             relay: Some(DeviceRelayStatus { rx_online: false }),
         }];
@@ -3345,6 +3447,7 @@ mod tests {
                     nat_type: "unknown".to_string(),
                     last_seen_at: 10,
                     expires_at: 0,
+                    display: None,
                 }),
                 relay: None,
             },
@@ -3366,6 +3469,7 @@ mod tests {
                     nat_type: "unknown".to_string(),
                     last_seen_at: 10,
                     expires_at: 0,
+                    display: None,
                 }),
                 relay: None,
             },
@@ -3404,6 +3508,7 @@ mod tests {
                 nat_type: "unknown".to_string(),
                 last_seen_at: 10,
                 expires_at: 0,
+                display: None,
             }),
             relay: Some(DeviceRelayStatus { rx_online: false }),
         }];
@@ -3436,6 +3541,7 @@ mod tests {
                 nat_type: "unknown".to_string(),
                 last_seen_at: 10,
                 expires_at: 0,
+                display: None,
             }),
             relay: None,
         }];
@@ -3469,6 +3575,7 @@ mod tests {
                 nat_type: "cone".to_string(),
                 last_seen_at: 10,
                 expires_at: 0,
+                display: None,
             }),
             relay: Some(DeviceRelayStatus { rx_online: false }),
         }];
@@ -3517,6 +3624,7 @@ mod tests {
                 nat_type: "cone".to_string(),
                 last_seen_at: 10,
                 expires_at: 0,
+                display: None,
             }),
             relay: None,
         }];
@@ -3549,6 +3657,7 @@ mod tests {
                 nat_type: "unknown".to_string(),
                 last_seen_at: 10,
                 expires_at: 0,
+                display: None,
             }),
             relay: None,
         }];
@@ -3975,6 +4084,42 @@ mod tests {
     }
 
     #[test]
+    fn relay_frame_send_ack_is_skipped_for_unreliable_mouse_moves() {
+        let move_frame = ProtocolFrame {
+            sequence: 7,
+            timestamp_micros: 123,
+            payload: ProtocolPayload::Input(InputEventEnvelope::legacy(InputEvent::Mouse(
+                MouseEvent::Move { dx: 12.0, dy: -6.0 },
+            ))),
+        };
+        let position_frame = ProtocolFrame {
+            sequence: 8,
+            timestamp_micros: 124,
+            payload: ProtocolPayload::Input(InputEventEnvelope::legacy(InputEvent::Mouse(
+                MouseEvent::Position {
+                    x_ratio: 0.98,
+                    y_ratio: 0.5,
+                },
+            ))),
+        };
+        let key_frame = ProtocolFrame {
+            sequence: 9,
+            timestamp_micros: 125,
+            payload: ProtocolPayload::Input(InputEventEnvelope::legacy(InputEvent::Key(
+                KeyEvent {
+                    key: Key::A,
+                    state: KeyState::Pressed,
+                    modifiers: Modifiers::CONTROL,
+                },
+            ))),
+        };
+
+        assert!(!relay_frame_requires_send_ack(&move_frame));
+        assert!(relay_frame_requires_send_ack(&position_frame));
+        assert!(relay_frame_requires_send_ack(&key_frame));
+    }
+
+    #[test]
     fn relay_send_ack_reports_server_route_errors() {
         assert_eq!(relay_send_ack_result("relay_ok"), Ok(()));
         assert_eq!(
@@ -4027,6 +4172,48 @@ mod tests {
             .expect_err("relay route error should fail send");
 
         assert!(error.contains("target device is not connected"));
+        server.join().expect("websocket server should finish");
+    }
+
+    #[test]
+    fn relay_frame_sender_does_not_wait_for_unreliable_mouse_move_ack() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind local websocket test server");
+        let server_addr = listener.local_addr().expect("local websocket server addr");
+        let (frame_seen_tx, frame_seen_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept websocket client");
+            let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+            match socket.read().expect("read relay payload") {
+                Message::Binary(payload) => assert!(payload.starts_with(RELAY_FRAME_MAGIC)),
+                other => panic!("expected relay binary frame, got {other:?}"),
+            }
+            frame_seen_tx.send(()).expect("notify frame read");
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let source_device_id = "11111111-1111-4111-8111-111111111111";
+        let target_device_id = "22222222-2222-4222-8222-222222222222";
+        let server_url = format!("http://{server_addr}");
+        let mut sender =
+            RelayFrameSender::connect(&server_url, source_device_id).expect("connect relay sender");
+        let frame = ProtocolFrame {
+            sequence: 2,
+            timestamp_micros: 124,
+            payload: ProtocolPayload::Input(InputEventEnvelope::legacy(InputEvent::Mouse(
+                MouseEvent::Move { dx: 4.0, dy: 0.5 },
+            ))),
+        };
+
+        let started = std::time::Instant::now();
+        sender
+            .send_frame(target_device_id, &frame)
+            .expect("unreliable relay move should not wait for ack");
+
+        assert!(started.elapsed() < Duration::from_millis(200));
+        frame_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server should receive relay frame");
+        drop(sender);
         server.join().expect("websocket server should finish");
     }
 

@@ -74,7 +74,7 @@ flowchart LR
 
 启动方式：
 
-- macOS: LaunchAgent，必要能力使用辅助权限。
+- macOS: 桌面 App 启动同包 Core Service，必要能力使用 App 的辅助权限。
 - Windows: 用户态 companion，安装器清理旧版 Windows Service。
 - Linux: systemd user service。
 

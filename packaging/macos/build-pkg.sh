@@ -6,11 +6,11 @@ DIST_DIR="${ROOT_DIR}/dist/macos"
 STAGING_DIR="${DIST_DIR}/staging"
 PKG_ROOT="${STAGING_DIR}/pkg-root"
 SCRIPTS_DIR="${STAGING_DIR}/scripts"
+COMPONENT_PLIST="${STAGING_DIR}/components.plist"
 APP_ROOT="${PKG_ROOT}/Applications/KMSync.app"
 IDENTIFIER="com.kmsync.mvp"
 LAUNCH_AGENT_ID="com.kmsync.mvp"
 APP_BUNDLE="/Applications/KMSync.app"
-APP_EXECUTABLE="${APP_BUNDLE}/Contents/MacOS/kmsync"
 VERSION="$(grep -m1 '^version' "${ROOT_DIR}/crates/kmsync/Cargo.toml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 PKG_SIGN_IDENTITY="${PKG_SIGN_IDENTITY:-}"
@@ -98,7 +98,6 @@ mkdir -p \
   "${APP_ROOT}/Contents/MacOS" \
   "${APP_ROOT}/Contents/Resources" \
   "${APP_ROOT}/Contents/configs" \
-  "${PKG_ROOT}/Library/LaunchAgents" \
   "${SCRIPTS_DIR}"
 
 if command -v lipo >/dev/null 2>&1 && rustup target list --installed | grep -q '^x86_64-apple-darwin$'; then
@@ -164,31 +163,6 @@ PLIST
 
 sign_app_bundle_if_configured "${APP_ROOT}"
 
-cat > "${PKG_ROOT}/Library/LaunchAgents/${LAUNCH_AGENT_ID}.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${LAUNCH_AGENT_ID}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${APP_EXECUTABLE}</string>
-    <string>core-service</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/tmp/kmsync.out.log</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/kmsync.err.log</string>
-</dict>
-</plist>
-PLIST
-
 cat > "${PKG_ROOT}/usr/local/share/kmsync/uninstall-macos.sh" <<SCRIPT
 #!/usr/bin/env bash
 set -euo pipefail
@@ -226,25 +200,16 @@ cat > "${SCRIPTS_DIR}/postinstall" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 
-launch_agent="/Library/LaunchAgents/com.kmsync.mvp.plist"
-label="com.kmsync.mvp"
 console_user="$(stat -f %Su /dev/console 2>/dev/null || true)"
 if [[ -n "${console_user}" && "${console_user}" != "root" && "${console_user}" != "loginwindow" ]]; then
   uid="$(id -u "${console_user}" 2>/dev/null || true)"
   if [[ -n "${uid}" ]]; then
-    launchctl bootout "gui/$uid" "${launch_agent}" >/dev/null 2>&1 || true
-    if launchctl bootstrap "gui/$uid" "${launch_agent}" >/dev/null 2>&1; then
-      launchctl enable "gui/$uid/${label}" >/dev/null 2>&1 || true
-      launchctl kickstart -k "gui/$uid/${label}" >/dev/null 2>&1 || true
-      echo "KMSync LaunchAgent started for ${console_user}"
-    else
-      echo "KMSync LaunchAgent installed; log out and back in if it is not running yet."
-    fi
+    launchctl bootout "gui/$uid" "/Library/LaunchAgents/com.kmsync.mvp.plist" >/dev/null 2>&1 || true
   fi
 fi
 
 echo "KMSync installed to /Applications/KMSync.app and /usr/local/bin/kmsync"
-echo "LaunchAgent installed to /Library/LaunchAgents/com.kmsync.mvp.plist for login startup"
+echo "Open KMSync.app to start the desktop core-service with the app's macOS privacy permissions."
 echo "Grant Accessibility and Input Monitoring permissions to KMSync.app, then restart KMSync."
 echo "Runtime config is created in ~/Library/Application Support/KMSync/daemon.example.json"
 echo "Permission guide installed to /usr/local/share/kmsync/docs/USER_GUIDE.md"
@@ -257,9 +222,32 @@ chmod 0755 "${SCRIPTS_DIR}/postinstall"
 
 PKG_PATH="${DIST_DIR}/kmsync-${VERSION}-macos.pkg"
 
-pkgbuild \
+cat > "${COMPONENT_PLIST}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+  <dict>
+    <key>RootRelativeBundlePath</key>
+    <string>Applications/KMSync.app</string>
+    <key>BundleIsRelocatable</key>
+    <false/>
+    <key>BundleOverwriteAction</key>
+    <string>upgrade</string>
+  </dict>
+</array>
+</plist>
+PLIST
+
+if command -v xattr >/dev/null 2>&1; then
+  xattr -cr "${PKG_ROOT}"
+fi
+
+COPYFILE_DISABLE=1 pkgbuild \
   --root "${PKG_ROOT}" \
   --scripts "${SCRIPTS_DIR}" \
+  --component-plist "${COMPONENT_PLIST}" \
   --identifier "${IDENTIFIER}" \
   --version "${VERSION}" \
   --install-location "/" \

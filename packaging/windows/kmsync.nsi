@@ -42,6 +42,8 @@ Section "Install"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KMSync" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KMSync" "UninstallString" "$INSTDIR\Uninstall.exe"
 
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="KMSync Input Sync"'
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="KMSync Input Sync" dir=in action=allow program="$INSTDIR\${APP_EXE}" enable=yes protocol=UDP localport=24800'
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "KMSync" '"$INSTDIR\${APP_EXE}" core-service'
   ExecShell "open" "$INSTDIR\${APP_EXE}" "core-service" SW_HIDE
 SectionEnd
@@ -49,6 +51,7 @@ SectionEnd
 Section "Uninstall"
   nsExec::ExecToLog 'sc.exe stop "KMSyncCoreService"'
   nsExec::ExecToLog 'sc.exe delete "KMSyncCoreService"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="KMSync Input Sync"'
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\configs\mac-to-windows.profile.json"
   Delete "$INSTDIR\configs\windows-to-mac.profile.json"

@@ -71,6 +71,8 @@ pub enum LocalIpcResponse {
         input_hot_path: String,
         platform_transport: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_context: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         config_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,

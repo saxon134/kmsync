@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,15 +30,17 @@ pub(crate) struct DesktopStateBuildInput<'a> {
 
 pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopState {
     let now = now_seconds();
-    let current_presence = input
-        .current_device_id
-        .and_then(|current_device_id| {
-            input
-                .devices
-                .iter()
-                .find(|item| item.device.id == current_device_id)
-        })
-        .and_then(|item| item.presence.as_ref());
+    let current_item = input.current_device_id.and_then(|current_device_id| {
+        input
+            .devices
+            .iter()
+            .find(|item| item.device.id == current_device_id)
+    });
+    let current_presence = current_item.and_then(|item| item.presence.as_ref());
+    let current_sync_relay_status_known = current_item.is_some_and(|item| item.relay.is_some());
+    let current_sync_relay_online = current_item
+        .and_then(|item| item.relay.as_ref())
+        .is_some_and(|relay| relay.rx_online);
 
     let (server_host, server_port) = server_endpoint_parts(input.server_url);
     let network = DesktopNetworkState {
@@ -53,6 +56,7 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
             current_presence.map_or(input.listen_port, |presence| presence.listen_port),
         ),
         last_seen_at: current_presence.map(|presence| presence.last_seen_at),
+        display: current_presence.and_then(|presence| presence.display.clone()),
     };
 
     let effective_role = effective_desktop_role(
@@ -66,22 +70,25 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
         os: std::env::consts::OS.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         role: effective_role.clone(),
+        sync_relay_status_known: current_sync_relay_status_known,
+        sync_relay_online: current_sync_relay_online,
     };
 
+    let peer_index = build_peer_state_index(input.current_device_id, input.devices, now);
+    let layout = canonicalize_layout_targets(
+        &input.desktop_config.layout,
+        input.current_device_id,
+        &peer_index.canonical_device_ids,
+    );
     let master_state = master_connection_state(
         input.current_device_id,
         input.desktop_config.master_device_id.as_deref(),
-        &input.desktop_config.layout,
+        &layout,
         input.devices,
         now,
     );
     let master_error = input.master_error.or_else(|| {
-        desktop_sync_permission_error(
-            &effective_role,
-            &master_state,
-            &input.desktop_config.layout,
-            input.permissions,
-        )
+        desktop_sync_permission_error(&effective_role, &master_state, &layout, input.permissions)
     });
 
     DesktopState {
@@ -93,8 +100,8 @@ pub(crate) fn build_desktop_state(input: DesktopStateBuildInput<'_>) -> DesktopS
         master_state,
         master_device_id: input.desktop_config.master_device_id.clone(),
         master_error,
-        layout: input.desktop_config.layout.clone(),
-        devices: peer_states(input.current_device_id, input.devices, now),
+        layout,
+        devices: peer_index.peers,
         permissions: input
             .permissions
             .iter()
@@ -233,34 +240,182 @@ fn master_connection_state(
     DesktopConnectionState::Connecting
 }
 
-fn peer_states(
+struct PeerStateIndex {
+    peers: Vec<DesktopPeerState>,
+    canonical_device_ids: HashMap<String, String>,
+}
+
+fn build_peer_state_index(
     current_device_id: Option<&str>,
     devices: &[DeviceWithPresence],
     now: u64,
-) -> Vec<DesktopPeerState> {
-    devices
+) -> PeerStateIndex {
+    let mut selected: Vec<(String, &DeviceWithPresence)> = Vec::new();
+    for item in devices
         .iter()
         .filter(|item| Some(item.device.id.as_str()) != current_device_id)
-        .map(|item| {
-            let presence = item.presence.as_ref();
-            let sync_relay_status_known = item.relay.is_some();
-            let sync_relay_online = item.relay.as_ref().is_some_and(|relay| relay.rx_online);
-            DesktopPeerState {
-                id: item.device.id.clone(),
-                name: item.device.name.clone(),
-                os: item.device.os_type.clone(),
-                online: presence.is_some_and(|presence| presence_is_online_at(presence, now)),
-                sync_relay_status_known,
-                sync_relay_online,
-                lan_ips: presence
-                    .map(|presence| presence.lan_ips.clone())
-                    .unwrap_or_default(),
-                public_ip: presence.map(|presence| presence.public_ip.clone()),
-                listen_port: presence.map(|presence| presence.listen_port),
-                last_seen_at: presence.map(|presence| presence.last_seen_at),
+        .filter(|item| !item.device.disabled)
+    {
+        let key = peer_dedup_key(item);
+        if let Some((_, existing)) = selected
+            .iter_mut()
+            .find(|(existing_key, _)| *existing_key == key)
+        {
+            if peer_item_is_better(item, existing, now) {
+                *existing = item;
             }
-        })
-        .collect()
+        } else {
+            selected.push((key, item));
+        }
+    }
+    let mut canonical_device_ids = HashMap::new();
+    for item in devices
+        .iter()
+        .filter(|item| Some(item.device.id.as_str()) != current_device_id)
+        .filter(|item| !item.device.disabled)
+    {
+        let key = peer_dedup_key(item);
+        if let Some((_, selected_item)) = selected
+            .iter()
+            .find(|(selected_key, _)| *selected_key == key)
+        {
+            if item.device.id == selected_item.device.id
+                || peer_item_is_available(selected_item, now)
+            {
+                canonical_device_ids
+                    .insert(item.device.id.clone(), selected_item.device.id.clone());
+            }
+        }
+    }
+    let peers = selected
+        .into_iter()
+        .map(|(_, item)| peer_state_from_item(item, now))
+        .collect();
+
+    PeerStateIndex {
+        peers,
+        canonical_device_ids,
+    }
+}
+
+fn canonicalize_layout_targets(
+    layout: &DesktopLayout,
+    current_device_id: Option<&str>,
+    canonical_device_ids: &HashMap<String, String>,
+) -> DesktopLayout {
+    let mut layout = layout.clone();
+    canonicalize_layout_target(&mut layout.left, current_device_id, canonical_device_ids);
+    canonicalize_layout_target(&mut layout.right, current_device_id, canonical_device_ids);
+    canonicalize_layout_target(&mut layout.top, current_device_id, canonical_device_ids);
+    canonicalize_layout_target(&mut layout.bottom, current_device_id, canonical_device_ids);
+    layout
+}
+
+fn canonicalize_layout_target(
+    target: &mut Option<String>,
+    current_device_id: Option<&str>,
+    canonical_device_ids: &HashMap<String, String>,
+) {
+    let Some(target_id) = target.as_deref() else {
+        return;
+    };
+    if current_device_id == Some(target_id) {
+        return;
+    }
+    if let Some(canonical_device_id) = canonical_device_ids.get(target_id) {
+        *target = Some(canonical_device_id.clone());
+    }
+}
+
+fn peer_state_from_item(item: &DeviceWithPresence, now: u64) -> DesktopPeerState {
+    let presence = item.presence.as_ref();
+    let sync_relay_status_known = item.relay.is_some();
+    let sync_relay_online = item.relay.as_ref().is_some_and(|relay| relay.rx_online);
+    DesktopPeerState {
+        id: item.device.id.clone(),
+        name: item.device.name.clone(),
+        os: item.device.os_type.clone(),
+        online: presence.is_some_and(|presence| presence_is_online_at(presence, now)),
+        sync_relay_status_known,
+        sync_relay_online,
+        lan_ips: presence
+            .map(|presence| presence.lan_ips.clone())
+            .unwrap_or_default(),
+        public_ip: presence.map(|presence| presence.public_ip.clone()),
+        listen_port: presence.map(|presence| presence.listen_port),
+        last_seen_at: presence.map(|presence| presence.last_seen_at),
+        display: presence.and_then(|presence| presence.display.clone()),
+    }
+}
+
+fn peer_dedup_key(item: &DeviceWithPresence) -> String {
+    let name = item.device.name.trim().to_ascii_lowercase();
+    let os = item.device.os_type.trim().to_ascii_lowercase();
+    if let Some(presence) = item.presence.as_ref() {
+        let mut lan_ips = presence.lan_ips.clone();
+        lan_ips.sort();
+        lan_ips.dedup();
+        if !lan_ips.is_empty() {
+            return format!("name:{name}|os:{os}|lan:{}", lan_ips.join(","));
+        }
+        if !presence.public_ip.trim().is_empty() {
+            return format!(
+                "name:{name}|os:{os}|public:{}:{}",
+                presence.public_ip, presence.listen_port
+            );
+        }
+    }
+    if !item.device.public_key.trim().is_empty() {
+        return format!("key:{}", item.device.public_key.trim());
+    }
+    format!("id:{}", item.device.id)
+}
+
+fn peer_item_is_better(
+    candidate: &DeviceWithPresence,
+    existing: &DeviceWithPresence,
+    now: u64,
+) -> bool {
+    let candidate_online = candidate
+        .presence
+        .as_ref()
+        .is_some_and(|presence| presence_is_online_at(presence, now));
+    let existing_online = existing
+        .presence
+        .as_ref()
+        .is_some_and(|presence| presence_is_online_at(presence, now));
+    let candidate_relay = candidate
+        .relay
+        .as_ref()
+        .is_some_and(|relay| relay.rx_online);
+    let existing_relay = existing.relay.as_ref().is_some_and(|relay| relay.rx_online);
+    let candidate_last_seen = candidate
+        .presence
+        .as_ref()
+        .map_or(0, |presence| presence.last_seen_at);
+    let existing_last_seen = existing
+        .presence
+        .as_ref()
+        .map_or(0, |presence| presence.last_seen_at);
+
+    (
+        candidate_online,
+        candidate_relay,
+        candidate_last_seen,
+        &candidate.device.id,
+    ) > (
+        existing_online,
+        existing_relay,
+        existing_last_seen,
+        &existing.device.id,
+    )
+}
+
+fn peer_item_is_available(item: &DeviceWithPresence, now: u64) -> bool {
+    item.presence
+        .as_ref()
+        .is_some_and(|presence| presence_is_online_at(presence, now))
+        || item.relay.as_ref().is_some_and(|relay| relay.rx_online)
 }
 
 fn presence_is_online_at(presence: &crate::client::Presence, now: u64) -> bool {
@@ -312,6 +467,7 @@ mod tests {
                 nat_type: "unknown".to_string(),
                 last_seen_at: now_seconds(),
                 expires_at: 0,
+                display: None,
             }),
             relay: None,
         }
@@ -381,6 +537,177 @@ mod tests {
         assert_eq!(state.devices.len(), 1);
         assert!(!state.devices[0].online);
         assert_eq!(state.permissions[0].status, "granted");
+    }
+
+    #[test]
+    fn desktop_state_deduplicates_stale_peer_rows_by_presented_device() {
+        let config = DesktopConfig {
+            role: DesktopRole::Master,
+            master_device_id: Some("current-device".to_string()),
+            layout: DesktopLayout::default(),
+            profile_path: None,
+        };
+        let mut stale = device_with_presence(
+            "stale-device",
+            "Studio PC",
+            false,
+            &["192.168.1.50"],
+            "203.0.113.50",
+        );
+        stale
+            .presence
+            .as_mut()
+            .expect("stale presence")
+            .last_seen_at = 10;
+        stale.presence.as_mut().expect("stale presence").expires_at = 11;
+        let mut live = device_with_presence(
+            "live-device",
+            "Studio PC",
+            true,
+            &["192.168.1.50"],
+            "203.0.113.50",
+        );
+        live.presence.as_mut().expect("live presence").last_seen_at = now_seconds();
+        live.presence.as_mut().expect("live presence").expires_at = 0;
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "This PC",
+            server_url: "https://203.0.113.10:24888",
+            listen_port: 24_800,
+            current_device_id: Some("current-device"),
+            local_lan_ips: vec!["192.168.1.20".to_string()],
+            desktop_config: &config,
+            devices: &[stale, live],
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert_eq!(state.devices.len(), 1);
+        assert_eq!(state.devices[0].id, "live-device");
+        assert!(state.devices[0].online);
+    }
+
+    #[test]
+    fn desktop_state_canonicalizes_layout_target_to_visible_dedup_peer() {
+        let config = DesktopConfig {
+            role: DesktopRole::Master,
+            master_device_id: Some("current-device".to_string()),
+            layout: DesktopLayout {
+                right: Some("stale-device".to_string()),
+                ..DesktopLayout::default()
+            },
+            profile_path: None,
+        };
+        let mut stale = device_with_presence(
+            "stale-device",
+            "Studio PC",
+            false,
+            &["192.168.1.50"],
+            "203.0.113.50",
+        );
+        stale
+            .presence
+            .as_mut()
+            .expect("stale presence")
+            .last_seen_at = 10;
+        stale.presence.as_mut().expect("stale presence").expires_at = 11;
+        let mut live = device_with_presence(
+            "live-device",
+            "Studio PC",
+            true,
+            &["192.168.1.50"],
+            "203.0.113.50",
+        );
+        live.presence.as_mut().expect("live presence").last_seen_at = now_seconds();
+        live.presence.as_mut().expect("live presence").expires_at = 0;
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "This PC",
+            server_url: "https://203.0.113.10:24888",
+            listen_port: 24_800,
+            current_device_id: Some("current-device"),
+            local_lan_ips: vec!["192.168.1.20".to_string()],
+            desktop_config: &config,
+            devices: &[stale, live],
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert_eq!(state.devices.len(), 1);
+        assert_eq!(state.devices[0].id, "live-device");
+        assert_eq!(state.layout.right.as_deref(), Some("live-device"));
+    }
+
+    #[test]
+    fn desktop_state_preserves_configured_layout_target_when_duplicates_are_offline() {
+        let config = DesktopConfig {
+            role: DesktopRole::Master,
+            master_device_id: Some("current-device".to_string()),
+            layout: DesktopLayout {
+                right: Some("configured-device".to_string()),
+                ..DesktopLayout::default()
+            },
+            profile_path: None,
+        };
+        let mut configured = device_with_presence(
+            "configured-device",
+            "Studio PC",
+            false,
+            &["192.168.1.50"],
+            "203.0.113.50",
+        );
+        configured
+            .presence
+            .as_mut()
+            .expect("configured presence")
+            .last_seen_at = 10;
+        configured
+            .presence
+            .as_mut()
+            .expect("configured presence")
+            .expires_at = 11;
+        let mut duplicate = device_with_presence(
+            "newer-duplicate",
+            "Studio PC",
+            false,
+            &["192.168.1.50"],
+            "203.0.113.50",
+        );
+        duplicate
+            .presence
+            .as_mut()
+            .expect("duplicate presence")
+            .last_seen_at = 20;
+        duplicate
+            .presence
+            .as_mut()
+            .expect("duplicate presence")
+            .expires_at = 21;
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "This PC",
+            server_url: "https://203.0.113.10:24888",
+            listen_port: 24_800,
+            current_device_id: Some("current-device"),
+            local_lan_ips: vec!["192.168.1.20".to_string()],
+            desktop_config: &config,
+            devices: &[configured, duplicate],
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert_eq!(state.devices.len(), 1);
+        assert_eq!(state.devices[0].id, "newer-duplicate");
+        assert_eq!(state.layout.right.as_deref(), Some("configured-device"));
     }
 
     #[test]
@@ -455,6 +782,36 @@ mod tests {
         assert_eq!(state.devices[0].id, "right-device");
         assert!(state.devices[0].sync_relay_status_known);
         assert!(state.devices[0].sync_relay_online);
+    }
+
+    #[test]
+    fn desktop_state_preserves_current_device_relay_receiver_status() {
+        let mut current = device_with_presence(
+            "current-device",
+            "Current PC",
+            true,
+            &["10.0.0.8"],
+            "203.0.113.46",
+        );
+        current.relay = Some(crate::client::DeviceRelayStatus { rx_online: false });
+
+        let state = build_desktop_state(DesktopStateBuildInput {
+            config_path: Path::new("configs/daemon.example.json"),
+            device_name: "Current PC",
+            server_url: "http://kmsync.example.com:24888",
+            listen_port: 24_800,
+            current_device_id: Some("current-device"),
+            local_lan_ips: vec!["10.0.0.8".to_string()],
+            desktop_config: &DesktopConfig::default(),
+            devices: &[current],
+            permissions: &[],
+            server_state: DesktopConnectionState::Connected,
+            server_error: None,
+            master_error: None,
+        });
+
+        assert!(state.device.sync_relay_status_known);
+        assert!(!state.device.sync_relay_online);
     }
 
     #[test]

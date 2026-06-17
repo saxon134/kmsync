@@ -274,6 +274,7 @@ mod tests {
             version: "0.1.0".to_string(),
             input_hot_path: "not_on_local_ipc".to_string(),
             platform_transport: "unix_domain_socket".to_string(),
+            launch_context: None,
             config_path: None,
             device_id: None,
         };

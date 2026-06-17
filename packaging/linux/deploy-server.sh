@@ -48,7 +48,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-tar -xzf "$REMOTE_ARTIFACT" -C "$tmpdir"
+tar -xzf "$REMOTE_ARTIFACT" -C "$tmpdir" --strip-components=1
 server_bin="$tmpdir/bin/kmsync-server"
 server_unit="$tmpdir/systemd/kmsync-server.service"
 server_config="$tmpdir/config/kmsync-server.example.json"
